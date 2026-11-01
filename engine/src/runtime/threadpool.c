@@ -193,15 +193,24 @@ typedef struct {
     float *C;
 } gemm_job;
 
-static void gemm_rows(void *arg, int64_t b, int64_t e) {
+/* Work is split in whole tiles (ROW_TILE rows, COL_TILE columns), so every
+ * element of C goes through the same kernel code path (full micro-tile or
+ * edge) for any thread count. parallel_for chunks are counted in tiles: a
+ * chunk boundary in the middle of a tile would send the columns next to it
+ * through the edge path, which may round differently (seen with gcc). */
+enum { ROW_TILE = 4, COL_TILE = 16 };
+
+static void gemm_rows(void *arg, int64_t tb, int64_t te) {
     const gemm_job *j = (const gemm_job *)arg;
+    int64_t b = tb * ROW_TILE, e = te * ROW_TILE < j->M ? te * ROW_TILE : j->M;
     const float *A = j->ta ? j->A + b : j->A + b * j->lda;
     j->k->gemm_f32(j->ta, j->tb, e - b, j->N, j->K, j->alpha, A, j->lda, j->B, j->ldb, j->beta, j->C + b * j->ldc,
                    j->ldc);
 }
 
-static void gemm_cols(void *arg, int64_t b, int64_t e) {
+static void gemm_cols(void *arg, int64_t tb, int64_t te) {
     const gemm_job *j = (const gemm_job *)arg;
+    int64_t b = tb * COL_TILE, e = te * COL_TILE < j->N ? te * COL_TILE : j->N;
     const float *B = j->tb ? j->B + b * j->ldb : j->B + b;
     j->k->gemm_f32(j->ta, j->tb, j->M, e - b, j->K, j->alpha, j->A, j->lda, B, j->ldb, j->beta, j->C + b, j->ldc);
 }
@@ -213,19 +222,19 @@ void nc__gemm(nc_ctx *ctx, int ta, int tb, int64_t M, int64_t N, int64_t K, floa
     const double min_work = 1 << 18;
     int T = ctx->n_threads;
     gemm_job j = {ctx->k, ta, tb, M, N, K, alpha, beta, A, B, lda, ldb, ldc, C};
-    double work = (double)M * (double)N * (double)(K ? K : 1);
+    double kk = (double)(K ? K : 1);
+    double work = (double)M * (double)N * kk;
     if (T <= 1 || work < 8 * min_work) {
         ctx->k->gemm_f32(ta, tb, M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
         return;
     }
-    double per_row = (double)N * (double)(K ? K : 1);
     if (M >= 4 * (int64_t)T || M >= N) {
-        int64_t grain = (int64_t)(min_work / per_row) + 1;
-        grain = (grain + 3) & ~(int64_t)3; /* whole 4-row micro-tiles */
-        nc__parallel_for(ctx, M, grain, gemm_rows, &j);
+        int64_t tiles = (M + ROW_TILE - 1) / ROW_TILE;
+        int64_t grain = (int64_t)(min_work / ((double)ROW_TILE * (double)N * kk)) + 1;
+        nc__parallel_for(ctx, tiles, grain, gemm_rows, &j);
     } else {
-        int64_t grain = (int64_t)(min_work / ((double)M * (double)(K ? K : 1))) + 1;
-        grain = (grain + 15) & ~(int64_t)15; /* whole 16-column micro-tiles */
-        nc__parallel_for(ctx, N, grain, gemm_cols, &j);
+        int64_t tiles = (N + COL_TILE - 1) / COL_TILE;
+        int64_t grain = (int64_t)(min_work / ((double)COL_TILE * (double)M * kk)) + 1;
+        nc__parallel_for(ctx, tiles, grain, gemm_cols, &j);
     }
 }
