@@ -1,0 +1,8 @@
+newch
+Copyright 2026 The newch authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Third-party algorithms:
+- xoshiro256** and splitmix64 random number generators, by David Blackman
+  and Sebastiano Vigna (public domain, https://prng.di.unimi.it/).

@@ -1,0 +1,6 @@
+graft engine
+include tools/build.py
+include README.md LICENSE NOTICE
+recursive-include docs *.md
+prune build
+global-exclude *.pyc *.dll *.so *.dylib *.exe *.pdb

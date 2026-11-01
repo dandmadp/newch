@@ -1,0 +1,9 @@
+build/
+.venv/
+__pycache__/
+*.pdb
+newch/nc.dll
+newch/libnc.so
+newch/libnc.dylib
+dist/
+*.egg-info/

@@ -1,0 +1,41 @@
+[build-system]
+# ziglang provides a C compiler as a pip package, so installing from source
+# needs no system toolchain on any platform.
+requires = ["setuptools>=64", "wheel", "ziglang>=0.11"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "newch"
+version = "0.2.0"
+description = "A small machine-learning library for low-spec machines: PyTorch-style autograd, Keras-style fit, portable C engine"
+readme = "README.md"
+license = {text = "Apache-2.0"}
+authors = [{name = "The newch authors"}]
+requires-python = ">=3.9"
+dependencies = []
+keywords = ["machine learning", "deep learning", "autograd", "neural network", "embedded", "low-spec"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+]
+
+[project.urls]
+Homepage = "https://github.com/dandmadp/newch"
+Source = "https://github.com/dandmadp/newch"
+Issues = "https://github.com/dandmadp/newch/issues"
+Documentation = "https://github.com/dandmadp/newch/blob/main/docs/PROGRESS.md"
+
+[project.optional-dependencies]
+numpy = ["numpy"]
+
+[tool.setuptools]
+packages = ["newch"]
+license-files = ["LICENSE", "NOTICE"]

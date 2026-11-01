@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  # Engine + Python tests on each desktop OS. macos-latest is Apple Silicon,
+  # so this job also runs the NEON kernels on real ARM hardware.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ziglang numpy
+      - name: Build, C tests, Python tests
+        run: python tools/build.py
+      - name: Debug build with UBSan
+        run: python tools/build.py --debug --no-run
+      - name: C tests (debug)
+        shell: bash
+        run: ./build/host/nc_tests*
+      - name: Python tests without numpy
+        run: |
+          pip uninstall -y numpy
+          python -m unittest discover -s tests
+
+  # ARM / RISC-V correctness under QEMU (static musl binaries, no sysroot needed).
+  emulated:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-static
+            qemu: qemu-aarch64-static
+          - target: armv7-static
+            qemu: qemu-arm-static
+          - target: riscv64-static
+            qemu: qemu-riscv64-static
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      - run: pip install ziglang
+      - run: python tools/build.py --target ${{ matrix.target }} --no-run
+      - run: ${{ matrix.qemu }} ./build/${{ matrix.target }}/nc_tests
+
+  # Every cross target must keep compiling without warnings.
+  cross:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ziglang
+      - name: Build all targets (warnings are errors)
+        run: |
+          python tools/build.py --target all --no-run 2>&1 | tee build.log
+          ! grep -E "warning|error" build.log
+
+  # CMake path used on boards.
+  cmake:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j
+      - run: ctest --test-dir build --output-on-failure
+
+  wheels:
+    needs: test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build --wheel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.os }}
+          path: dist/*.whl
