@@ -63,7 +63,8 @@ filtered pipeline once hid a failing test that then got pushed.
 ## Status (2026-11-01)
 
 - v0.2.0 on GitHub; CI (Windows/Linux/macOS, QEMU aarch64/armv7/riscv64, CMake, wheels) all green.
-- PyPI: name `newch` is free; `dist/` holds a Windows wheel + sdist built from the latest code. **Not uploaded
-  yet** — the user runs `twine upload` themselves (see `docs/PUBLISHING.md`).
+- **Published on PyPI as `newch` 0.2.0** (Windows x86-64 wheel + sdist; https://pypi.org/project/newch/),
+  verified by installing from PyPI into a fresh venv. 0.2.0 can never be re-uploaded: any fix ships as a new
+  version (bump all three version locations). The user runs `twine upload` themselves (`docs/PUBLISHING.md`).
 - Next candidates: manylinux/macOS wheels, scikit-learn-style classic ML, graph compiler (memory planning inside a
   step), Orange Pi measurement and NEON int8 (dotprod) kernels. See `docs/PROGRESS.md` §10.
