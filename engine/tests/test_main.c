@@ -472,6 +472,52 @@ static void test_memory(void) {
     nc_free_ctx(ctx);
 }
 
+static void test_backward_release(void) {
+    nc_ctx *ctx = new_ctx();
+    nc_tensor *w1 = nc_parameter(ctx, nc_randn(ctx, 0.5f, 2, SHAPE(64, 32)), 2, SHAPE(64, 32));
+    nc_tensor *w2 = nc_parameter(ctx, nc_randn(ctx, 0.5f, 2, SHAPE(10, 64)), 2, SHAPE(10, 64));
+    int32_t lab[256];
+    for (int i = 0; i < 256; i++) lab[i] = i % 10;
+    nc_tensor *grads_ref[2] = {NULL, NULL};
+    size_t peak[3];
+    for (int mode = 0; mode < 3; mode++) { /* retain, default, free graph */
+        nc_zero_grad(w1), nc_zero_grad(w2);
+        nc_step_end(ctx);
+        nc_manual_seed(ctx, 5);
+        nc_reset_peak(ctx);
+        nc_tensor *x = nc_randn(ctx, 1.0f, 2, SHAPE(256, 32));
+        nc_tensor *y = nc_from_data(ctx, NC_I32, lab, 1, SHAPE(256));
+        nc_tensor *h = nc_relu(nc_linear_fn(x, w1, NULL));
+        nc_tensor *loss = nc_cross_entropy(nc_linear_fn(nc_tanh(h), w2, NULL), y);
+        int flags = mode == 0 ? NC_BACKWARD_RETAIN : mode == 1 ? 0 : NC_BACKWARD_FREE_GRAPH;
+        CHECK(nc_backward_ex(loss, flags, &h, 1) == NC_OK);
+        peak[mode] = nc_get_mem_stats(ctx).arena_peak_bytes;
+        if (mode == 0) {
+            grads_ref[0] = nc_from_data(ctx, NC_F32, nc_data_f32(nc_grad(w1)), 2, SHAPE(64, 32));
+            nc_persistent_begin(ctx);
+            grads_ref[0] = nc_contiguous(grads_ref[0]);
+            grads_ref[1] = nc_from_data(ctx, NC_F32, nc_data_f32(nc_grad(w2)), 2, SHAPE(10, 64));
+            nc_persistent_end(ctx);
+            CHECK(nc_grad(h) != NULL); /* retained intermediate grad */
+        } else {
+            /* same leaf grads whatever is released */
+            CHECK(memcmp(nc_data_f32(nc_grad(w1)), nc_data_f32(grads_ref[0]), 64 * 32 * 4) == 0);
+            CHECK(memcmp(nc_data_f32(nc_grad(w2)), nc_data_f32(grads_ref[1]), 10 * 64 * 4) == 0);
+            CHECK(nc_grad(h) == NULL); /* intermediate grads are released */
+            CHECK(nc_data_f32(h) != NULL && isfinite(nc_data_f32(h)[0])); /* kept tensor survives */
+            CHECK(isfinite(nc_item(loss)));                                /* so does the loss */
+        }
+        if (mode == 2) { /* a released graph cannot run backward again */
+            CHECK(nc_backward(loss) == NC_ERR_STATE);
+            nc_clear_error(ctx);
+        }
+    }
+    printf("    backward peak: retain %.0f KiB, default %.0f KiB, free graph %.0f KiB\n", peak[0] / 1024.0,
+           peak[1] / 1024.0, peak[2] / 1024.0);
+    CHECK(peak[1] < peak[0] && peak[2] < peak[1]);
+    nc_free_ctx(ctx);
+}
+
 static void test_release(void) {
     nc_ctx *ctx = new_ctx();
     size_t base = nc_get_mem_stats(ctx).persistent_bytes;
@@ -960,6 +1006,7 @@ int main(void) {
         {"autograd_semantics", test_autograd_semantics},
         {"memory", test_memory},
         {"release", test_release},
+        {"backward_release", test_backward_release},
         {"kernel_parity", test_kernel_parity},
         {"conv_pool_bn", test_conv_pool_bn},
         {"dropout", test_dropout},

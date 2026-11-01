@@ -50,7 +50,11 @@ filtered pipeline once hid a failing test that then got pushed.
 ## Rules that are easy to break
 
 - **Memory model:** temporaries live in the step arena until `step_end()`; persistent tensors always own their
-  data (no persistent views), and the owning Python wrapper frees them in `__del__`.
+  data (no persistent views), and the owning Python wrapper frees them in `__del__`. Backward releases memory as
+  it goes (`nc_backward_ex`): node temporaries, intermediate grads, and activations nobody holds. Python passes
+  its live temporaries (`Context._live`, kept by `Tensor._from_ptr` / `_w` / `__del__`) so they survive. Arena
+  allocations >= chunk/4 are separate blocks with a budgeted cache (`ctx.c`). Backward ops must only allocate
+  through `nc__arena_alloc` (logged and freed after the node) or `nc__grad_buf` (kept).
 - **Never pass `make_tensor().ptr` straight into a C call.** CPython drops the temporary after `.ptr` is read,
   before the call runs; a persistent temporary is then freed (use-after-free). Bind it to a name first. Tests run
   with `NC_DEBUG_POISON=1` so this shows up on every platform.

@@ -210,5 +210,56 @@ class TestModules(Base):
             m.to(torch.int32)
 
 
+
+class TestBackwardMemory(Base):
+    def make(self):
+        torch.manual_seed(5)
+        return nn.Sequential(nn.Conv2d(1, 8, 3, padding=1), nn.ReLU(), nn.Flatten(), nn.Linear(8 * 16 * 16, 4))
+
+    def step(self, model, retain):
+        ctx = torch.default_context()
+        ctx.step_end()
+        ctx.reset_peak()
+        torch.manual_seed(9)
+        x, y = torch.randn(32, 1, 16, 16), torch.tensor([i % 4 for i in range(32)])
+        out = model(x)
+        loss = F.cross_entropy(out, y)
+        loss.backward(retain_graph=retain)
+        grads = [p.grad.tolist() for p in model.parameters()]
+        return out, loss, grads, torch.mem_stats()["arena_peak_bytes"]
+
+    def test_release_keeps_results_and_lowers_peak(self):
+        model = self.make()
+        _, _, g_keep, peak_keep = self.step(model, True)
+        model.zero_grad()
+        out, loss, g_free, peak_free = self.step(model, None)
+        self.assertEqual(g_free, g_keep)  # bit-identical gradients
+        self.assertLess(peak_free, peak_keep)
+        self.assertEqual(out.shape, (32, 4))  # tensors still referenced survive backward
+        self.assertTrue(math.isfinite(out.sum().item()) and math.isfinite(loss.item()))
+
+    def test_second_backward_needs_retain_graph(self):
+        model = self.make()
+        x = torch.randn(4, 1, 16, 16)
+        hidden = model[1](model[0](x))
+        loss = model[3](model[2](hidden)).sum()
+        del hidden  # nothing holds the intermediate activations any more
+        loss.backward()
+        with self.assertRaises(torch.NcError):
+            loss.backward()
+        torch.step_end()
+        loss = model(torch.randn(4, 1, 16, 16)).sum()
+        loss.backward(retain_graph=True)
+        loss.backward()  # allowed: the first call kept the graph
+        torch.step_end()
+
+    def test_intermediate_grad_is_none(self):
+        w = torch.parameter([1.0, 2.0])
+        h = w * 3.0
+        h.sum().backward()
+        self.assertIsNone(h.grad)  # non-leaf, as in PyTorch
+        self.assertEqual(w.grad.tolist(), [3.0, 3.0])
+
+
 if __name__ == "__main__":
     unittest.main()

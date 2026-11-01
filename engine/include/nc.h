@@ -300,6 +300,18 @@ NC_API nc_status nc_load(nc_ctx *ctx, const char *path, int n, const char *const
 /* Backpropagates from a scalar (1-element) tensor. Gradients accumulate into
  * nc_grad() of every reachable tensor with requires_grad. */
 NC_API nc_status nc_backward(nc_tensor *loss);
+
+/* Backward with memory release. Always: backward temporaries and the grads of
+ * intermediate (non-leaf) tensors are returned to the step arena as soon as
+ * they are used, so nc_grad() of an intermediate is NULL afterwards (leaf
+ * grads are kept, as in PyTorch). nc_backward() does this too.
+ * NC_BACKWARD_FREE_GRAPH also releases forward activations once no remaining
+ * backward step needs them, except the loss and the tensors in `keep` (and
+ * anything sharing their data). A later backward through a released node
+ * fails with NC_ERR_STATE (PyTorch: retain_graph=False). NC_BACKWARD_RETAIN
+ * keeps everything (no release at all). */
+enum { NC_BACKWARD_FREE_GRAPH = 1, NC_BACKWARD_RETAIN = 2 };
+NC_API nc_status nc_backward_ex(nc_tensor *loss, int flags, nc_tensor *const *keep, int n_keep);
 NC_API void nc_zero_grad(nc_tensor *t);
 /* Marks the grad as absent (torch's zero_grad(set_to_none=True)): nc_grad()
  * returns NULL and optimizers skip t until a backward reaches it again. The

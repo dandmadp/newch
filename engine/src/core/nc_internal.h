@@ -82,6 +82,7 @@ struct nc_node {
     void *saved; /* op-private data, arena-allocated */
     nc_node *prev; /* tape: previously recorded node */
     uint32_t mark;
+    int released; /* backward freed this node's output data: it cannot run again */
 };
 
 /* Every op, in one list. Used to declare op defs and build the registry. */
@@ -139,6 +140,25 @@ struct nc_ctx {
     int persistent_depth;
     int grad_enabled;
     nc_node *tape;
+
+    /* Step-arena reuse within a step: blocks freed during backward go on this
+     * list and are handed out again (best fit) before bumping. */
+    struct nc_free_blk *free_list;
+    /* Large step allocations (>= chunk_bytes / 4) live in their own blocks so
+     * that freeing one makes it reusable whole; freed and step-ended blocks
+     * wait in a size-keyed cache (counted as reserved) until reused or trimmed. */
+    struct nc_large *large_live;
+    struct nc_large *large_cache;
+    size_t large_live_bytes, large_cache_bytes;
+    /* cap on live + cached large bytes: the largest live total seen in this
+     * or the previous step, so reserved memory follows the real peak */
+    size_t large_peak, large_prev_peak;
+    /* Backward temporaries of the node being processed (freed after it). */
+    void *bwd_tmp[64];
+    size_t bwd_tmp_size[64];
+    int bwd_tmp_n;
+    int bwd_logging; /* 1 while a node's backward runs */
+    int grad_alloc;  /* 1 while allocating a gradient buffer (not a temporary) */
     uint32_t mark_epoch;
 
     nc_status status;
@@ -157,6 +177,9 @@ struct nc_ctx {
 };
 
 void *nc__arena_alloc(nc_ctx *ctx, size_t bytes);
+/* Returns a step-arena block for reuse within the step. `bytes` must be the
+ * size it was allocated with. */
+void nc__arena_free(nc_ctx *ctx, void *p, size_t bytes);
 void *nc__persistent_alloc(nc_ctx *ctx, size_t bytes);
 void nc__persistent_free(nc_ctx *ctx, void *p);
 /* Allocates in the arena or persistently, following ctx->persistent_depth. */

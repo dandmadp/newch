@@ -360,7 +360,9 @@ nc_tensor *nc__grad_buf(nc_tensor *t) {
     }
     if (!t->grad) {
         int persistent = (t->flags & NC_TF_PERSISTENT) != 0;
+        t->ctx->grad_alloc = 1; /* not a backward temporary: it outlives the node */
         t->grad = nc__tensor_new(t->ctx, NC_F32, t->ndim, t->shape, persistent);
+        t->ctx->grad_alloc = 0;
         if (t->grad) memset(t->grad->data, 0, (size_t)nc_numel(t) * sizeof(float));
     }
     return t->grad;

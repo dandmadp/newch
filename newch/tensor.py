@@ -42,11 +42,14 @@ class Context:
         if not self._p:
             raise NcError("nc_init failed (out of memory?)")
         self.step_id = 0
+        self._pdepth = 0  # nesting of persistent(): results are persistent while > 0
+        self._live: dict = {}  # this step's temporaries that Python still references: ptr -> count
 
     def step_end(self) -> None:
         """Frees every temporary tensor at once (O(1)) and the autograd tape."""
         lib.nc_step_end(self._p)
         self.step_id += 1
+        self._live = {}
 
     def trim(self) -> None:
         """Returns unused step memory to the OS (after an unusually large step)."""
@@ -66,11 +69,15 @@ class Context:
         lib.nc_clear_error(self._p)
         raise NcError(msg)
 
-    def wrap(self, ptr, base: "Tensor | None" = None) -> "Tensor":
-        """Wraps a fresh engine result. Persistent results are owned (freed on GC)."""
+    def wrap(self, ptr, base: "Tensor | None" = None, persistent: "bool | None" = None) -> "Tensor":
+        """Wraps a fresh engine result. Persistent results are owned (freed on GC).
+
+        Engine results are persistent exactly while persistent() is active, so the
+        flag comes from Python; pass persistent=True for nc_parameter, which always is.
+        """
         if not ptr:
             self.raise_error()
-        t = Tensor._from_ptr(ptr, self, base=base)
+        t = Tensor._from_ptr(ptr, self, base, self._pdepth > 0 if persistent is None else persistent)
         t._owner = t._step is None
         return t
 
@@ -136,9 +143,11 @@ def persistent(ctx: Context | None = None):
     """Tensors created inside survive step_end() (no autograd recording)."""
     ctx = ctx or default_context()
     lib.nc_persistent_begin(ctx._p)
+    ctx._pdepth += 1
     try:
         yield
     finally:
+        ctx._pdepth -= 1
         lib.nc_persistent_end(ctx._p)
 
 
@@ -208,6 +217,7 @@ def _unflatten(flat: Sequence, shape: Sequence[int]):
 
 
 Number = (int, float)
+_new_tensor = object.__new__
 
 
 class Tensor:
@@ -220,11 +230,19 @@ class Tensor:
     __slots__ = ("_p", "_ctx", "_step", "_owner", "_base")
 
     @classmethod
-    def _from_ptr(cls, ptr, ctx: Context, base: "Tensor | None" = None) -> "Tensor":
+    def _from_ptr(cls, ptr, ctx: Context, base: "Tensor | None" = None, persistent: "bool | None" = None) -> "Tensor":
         t = object.__new__(cls)
         t._p = ptr
         t._ctx = ctx
-        t._step = None if lib.nc_is_persistent(ptr) else ctx.step_id
+        if persistent is None:
+            persistent = bool(lib.nc_is_persistent(ptr))
+        if persistent:
+            t._step = None
+        else:
+            # backward() releases graph memory except tensors Python still holds
+            t._step = ctx.step_id
+            live = ctx._live
+            live[ptr] = live.get(ptr, 0) + 1
         t._owner = False  # only Context.wrap hands out ownership
         t._base = base    # keeps the tensor whose memory this one uses alive
         return t
@@ -236,8 +254,17 @@ class Tensor:
         # into a C call. CPython drops the temporary right after `.ptr` is
         # read, before the call runs; bind it to a name first.
         try:
-            if self._owner and self._p and self._ctx._p:
-                lib.nc_release(self._p)
+            step = self._step
+            if step is None:
+                if self._owner and self._p and self._ctx._p:
+                    lib.nc_release(self._p)
+            elif step == self._ctx.step_id:
+                live = self._ctx._live
+                c = live.get(self._p, 0) - 1
+                if c > 0:
+                    live[self._p] = c
+                else:
+                    live.pop(self._p, None)
         except Exception:  # interpreter shutdown
             pass
 
@@ -258,7 +285,23 @@ class Tensor:
         return self._ctx
 
     def _w(self, ptr) -> "Tensor":
-        return self._ctx.wrap(ptr)
+        """Wraps an op result (the hot path: same as Context.wrap, without the extra calls)."""
+        ctx = self._ctx
+        if not ptr:
+            ctx.raise_error()
+        t = _new_tensor(Tensor)
+        t._p = ptr
+        t._ctx = ctx
+        t._base = None
+        if ctx._pdepth:
+            t._step = None
+            t._owner = True
+        else:
+            t._step = ctx.step_id
+            t._owner = False
+            live = ctx._live
+            live[ptr] = live.get(ptr, 0) + 1
+        return t
 
     def _view(self, ptr) -> "Tensor":
         """Result that may alias self's memory: keeps self alive."""
@@ -453,6 +496,8 @@ class Tensor:
 
     # ---- arithmetic ------------------------------------------------------
     def __add__(self, o):
+        if type(o) is Tensor:  # fast path: no conversion needed
+            return self._w(lib.nc_add(self.ptr, o.ptr))
         if isinstance(o, Number):
             return self._w(lib.nc_add_scalar(self.ptr, float(o)))
         o = self._other(o)  # keep the operand alive across the call
@@ -461,6 +506,8 @@ class Tensor:
     __radd__ = __add__
 
     def __sub__(self, o):
+        if type(o) is Tensor:
+            return self._w(lib.nc_sub(self.ptr, o.ptr))
         if isinstance(o, Number):
             return self._w(lib.nc_add_scalar(self.ptr, -float(o)))
         o = self._other(o)  # keep the operand alive across the call
@@ -470,6 +517,8 @@ class Tensor:
         return self._other(o) - self
 
     def __mul__(self, o):
+        if type(o) is Tensor:
+            return self._w(lib.nc_mul(self.ptr, o.ptr))
         if isinstance(o, Number):
             return self._w(lib.nc_scale(self.ptr, float(o)))
         o = self._other(o)  # keep the operand alive across the call
@@ -654,9 +703,22 @@ class Tensor:
         raise TypeError("only axis-0 indexing (int, slice, list, int32 tensor) is supported")
 
     # ---- autograd --------------------------------------------------------
-    def backward(self) -> None:
-        if lib.nc_backward(self.ptr) != 0:
-            self._ctx.raise_error()
+    def backward(self, gradient=None, retain_graph=None, create_graph: bool = False, inputs=None) -> None:
+        """Backpropagates from this scalar. Like PyTorch, the graph's memory is released as
+        it goes (activations nobody holds, intermediate grads), so a second backward through
+        the same graph needs retain_graph=True on the first one. Tensors you still reference
+        are never released."""
+        _unsupported(create_graph=(create_graph, False), inputs=(inputs, None))
+        if gradient is not None:
+            raise NotImplementedError("backward(gradient=...) is not supported; call it on a scalar loss")
+        ctx = self._ctx
+        if retain_graph:
+            st = lib.nc_backward_ex(self.ptr, 2, None, 0)
+        else:
+            live = list(ctx._live)
+            st = lib.nc_backward_ex(self.ptr, 1, L.ptr_array(live), len(live))
+        if st != 0:
+            ctx.raise_error()
 
     def zero_grad(self) -> None:
         lib.nc_zero_grad(self.ptr)
@@ -753,10 +815,10 @@ def parameter(init, ctx: Context | None = None) -> Tensor:
     ctx = _ctx(ctx)
     if isinstance(init, tuple) and all(isinstance(s, int) for s in init):
         n, arr = L.shape_arg(init)
-        return ctx.wrap(lib.nc_parameter(ctx._p, None, n, arr))
+        return ctx.wrap(lib.nc_parameter(ctx._p, None, n, arr), persistent=True)
     src = init if isinstance(init, Tensor) else tensor(init, dtype=float32, ctx=ctx)
     n, arr = L.shape_arg(src.shape)
-    return ctx.wrap(lib.nc_parameter(ctx._p, src.ptr, n, arr))
+    return ctx.wrap(lib.nc_parameter(ctx._p, src.ptr, n, arr), persistent=True)
 
 
 def release(t: Tensor) -> None:
