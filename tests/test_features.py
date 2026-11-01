@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import newch as nc  # noqa: E402
+import newch.net.functional as F  # noqa: E402
 from newch import net  # noqa: E402
 from newch.data import DataLoader, FileArray, TensorDataset  # noqa: E402
 
@@ -96,10 +97,10 @@ class TestSaveLoad(Base):
         model.eval()
         before = model.predict(xs)
         p = self.path("cnn.ncw")
-        model.save_weights(p)
+        nc.save_tensors(model.state_dict(), p)
         other = cnn()
         other.eval()
-        other.load_weights(p)
+        other.load_state_dict(nc.load_tensors(p))
         self.assertEqual(other.predict(xs), before)
         self.assertEqual(list(nc.load_tensors(p)), list(model.state_dict()))
         self.assertEqual(list(model.state_dict())[:2], ["0.weight", "0.bias"])  # torch naming
@@ -149,7 +150,7 @@ class TestQuantize(Base):
         self.assertLess(err / scale, 0.05)
         self.assertLess(after, before * 0.5)  # float weights freed, int8 kept
         p = self.path("q.ncw")
-        model.save_weights(p)
+        nc.save_tensors(model.state_dict(), p)
         self.assertEqual(nc.load_tensors(p)["0.weight"].dtype, nc.int8)
 
 
@@ -227,7 +228,7 @@ class TestMemory(Base):
             added = p + [10.0, 20.0, 30.0]          # list operand temporary
             prod = p * nc.tensor([2.0, 2.0, 2.0])
             rsub = [1.0, 1.0, 1.0] - p
-            mse = nc.mse_loss(p, [1.0, 2.0, 5.0])
+            mse = F.mse_loss(p, [1.0, 2.0, 5.0])
         nc.step_end()
         self.assertEqual(copy.tolist(), base_values)
         self.assertEqual(added.tolist(), [11.0, 22.0, 33.0])

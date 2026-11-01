@@ -28,7 +28,6 @@ from .tensor import (Context, Tensor, _is_numpy, cross_entropy, float32, int32, 
 LOSSES: dict[str, Callable] = {
     "cross_entropy": cross_entropy,
     "mse": mse_loss,
-    "mean_squared_error": mse_loss,
 }
 
 

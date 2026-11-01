@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import newch as nc  # noqa: E402
+import newch.net.functional as F  # noqa: E402
 
 try:
     import numpy as np
@@ -131,7 +132,7 @@ class TestTensor(Base):
         self.assertIn("broadcastable", str(cm.exception))
         self.assertEqual((nc.zeros(2) + 1).tolist(), [1, 1])  # context recovered
         with self.assertRaises(nc.NcError):
-            nc.cross_entropy(nc.zeros(2, 3), [0, 5])
+            F.cross_entropy(nc.zeros(2, 3), [0, 5])
 
     @unittest.skipIf(np is None, "numpy not installed")
     def test_numpy(self):
@@ -168,7 +169,7 @@ class TestModules(Base):
         for got, want in zip(lin(x).tolist(), manual.tolist()):
             for g, w in zip(got, want):
                 self.assertAlmostEqual(g, w, places=5)
-        self.assertEqual(nc.linear(x, lin.weight).shape, (5, 2))
+        self.assertEqual(F.linear(x, lin.weight).shape, (5, 2))
         self.assertIn("in_features=3", repr(lin))
 
     def test_embedding(self):
@@ -188,7 +189,7 @@ class TestModules(Base):
             X, Y = nc.tensor(xs), nc.tensor(ys)
         first = None
         for _ in range(200):
-            loss = nc.cross_entropy(model(X), Y)
+            loss = F.cross_entropy(model(X), Y)
             opt.zero_grad()
             loss.backward()
             opt.step()

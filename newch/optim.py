@@ -52,9 +52,6 @@ class Optimizer:
         self._lr = float(value)
         lib.nc_optim_set_lr(self._p, self._lr)
 
-    # Keras' name for the same value (used by Keras-style callbacks)
-    learning_rate = lr
-
 
 class SGD(Optimizer):
     def __init__(self, params, lr: float = 1e-3, momentum: float = 0.0, dampening: float = 0.0,
@@ -90,41 +87,30 @@ class AdamW(Optimizer):
 class RMSprop(Optimizer):
     """torch.optim.RMSprop: v = alpha v + (1 - alpha) g^2, w -= lr g / (sqrt(v) + eps)."""
 
-    _eps_inside_sqrt = 0
-
     def __init__(self, params, lr: float = 1e-2, alpha: float = 0.99, eps: float = 1e-8,
                  weight_decay: float = 0.0, momentum: float = 0.0, centered: bool = False, *,
                  maximize: bool = False, gradient_accumulation_steps: int | None = None):
         _unsupported(centered=(centered, False), maximize=(maximize, False))
-        inside = self._eps_inside_sqrt
-        super().__init__(params, lambda c, p, n, o: lib.nc_rmsprop(c, p, n, o, inside),
+        super().__init__(params, lambda c, p, n, o: lib.nc_rmsprop(c, p, n, o, 0),
                          L.OptimOpts(lr, momentum, weight_decay, 0.0, alpha, eps), gradient_accumulation_steps)
 
 
-class _KerasRMSprop(RMSprop):
-    """compile(optimizer="rmsprop"): Keras' variant, w -= lr g / sqrt(v + epsilon)."""
-
-    _eps_inside_sqrt = 1
-
-
-# compile() names with Keras' default hyperparameters for each.
-_BY_NAME = {
-    "rmsprop": lambda p, lr: _KerasRMSprop(p, lr=1e-3 if lr is None else lr, alpha=0.9, eps=1e-7),
-    "adam": lambda p, lr: Adam(p, lr=1e-3 if lr is None else lr, eps=1e-7),
-    "adamw": lambda p, lr: AdamW(p, lr=1e-3 if lr is None else lr, eps=1e-7, weight_decay=0.004),
-    "sgd": lambda p, lr: SGD(p, lr=1e-2 if lr is None else lr),
-}
+# Names accepted by compile(): the same classes, with their own defaults.
+_BY_NAME = {"sgd": SGD, "adam": Adam, "adamw": AdamW, "rmsprop": RMSprop}
 
 
 def get(optimizer, params, lr: float | None = None) -> Optimizer:
-    """Optimizer from a compile() name ("rmsprop", "adam", "adamw", "sgd") or an instance."""
+    """Optimizer from a compile() name ("adam", "adamw", "sgd", "rmsprop") or an instance.
+
+    A name builds the same class as nc.optim.<Name>(params) with its defaults; lr overrides the rate.
+    """
     if isinstance(optimizer, Optimizer):
         return optimizer
     try:
-        make = _BY_NAME[optimizer.lower()]
+        cls = _BY_NAME[optimizer.lower()]
     except (KeyError, AttributeError):
         raise ValueError(f"unknown optimizer {optimizer!r}; use one of {sorted(_BY_NAME)} or an instance")
-    return make(params, lr)
+    return cls(params) if lr is None else cls(params, lr=lr)
 
 
 # --------------------------------------------------------------------------
@@ -197,6 +183,53 @@ class CosineAnnealingLR(LRScheduler):
         return self.eta_min + (self.base_lr - self.eta_min) * (1 + math.cos(math.pi * self.last_epoch / self.T_max)) / 2
 
 
+class ReduceLROnPlateau:
+    """Multiplies the rate by ``factor`` once ``metrics`` (passed to step) stops improving for
+    more than ``patience`` epochs (torch.optim.lr_scheduler.ReduceLROnPlateau)."""
+
+    def __init__(self, optimizer: Optimizer, mode: str = "min", factor: float = 0.1, patience: int = 10,
+                 threshold: float = 1e-4, threshold_mode: str = "rel", cooldown: int = 0, min_lr: float = 0.0,
+                 eps: float = 1e-8):
+        if factor >= 1.0:
+            raise ValueError("factor should be < 1.0")
+        if mode not in ("min", "max") or threshold_mode not in ("rel", "abs"):
+            raise ValueError("mode must be 'min'/'max' and threshold_mode 'rel'/'abs'")
+        self.optimizer, self.mode, self.factor, self.patience = optimizer, mode, factor, patience
+        self.threshold, self.threshold_mode, self.cooldown, self.min_lr, self.eps = (threshold, threshold_mode,
+                                                                                    cooldown, min_lr, eps)
+        self.best = math.inf if mode == "min" else -math.inf
+        self.num_bad_epochs = 0
+        self.cooldown_counter = 0
+        self.last_epoch = 0
+
+    def _better(self, a: float) -> bool:
+        t, best = self.threshold, self.best
+        if self.mode == "min":
+            return a < (best * (1.0 - t) if self.threshold_mode == "rel" else best - t)
+        return a > (best * (1.0 + t) if self.threshold_mode == "rel" else best + t)
+
+    def step(self, metrics) -> None:
+        current = float(metrics)
+        self.last_epoch += 1
+        if self._better(current):
+            self.best, self.num_bad_epochs = current, 0
+        else:
+            self.num_bad_epochs += 1
+        if self.cooldown_counter > 0:
+            self.cooldown_counter -= 1
+            self.num_bad_epochs = 0
+        if self.num_bad_epochs > self.patience:
+            old = self.optimizer.lr
+            new = max(old * self.factor, self.min_lr)
+            if old - new > self.eps:
+                self.optimizer.lr = new
+            self.cooldown_counter = self.cooldown
+            self.num_bad_epochs = 0
+
+    def get_last_lr(self) -> list:
+        return [self.optimizer.lr]
+
+
 class _SchedulerNamespace:
     """``nc.optim.lr_scheduler.StepLR`` etc., the same path as in PyTorch."""
 
@@ -205,6 +238,7 @@ class _SchedulerNamespace:
     StepLR = StepLR
     ExponentialLR = ExponentialLR
     CosineAnnealingLR = CosineAnnealingLR
+    ReduceLROnPlateau = ReduceLROnPlateau
 
 
 lr_scheduler = _SchedulerNamespace()

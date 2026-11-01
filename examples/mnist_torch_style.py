@@ -92,7 +92,7 @@ def main() -> int:
         print(f"epoch {epoch}: {time.perf_counter() - t0:.1f}s")
         test(model, test_loader)
         scheduler.step()
-    model.save_weights(data_dir / "mnist_torch_style.ncw")
+    torch.save_tensors(model.state_dict(), data_dir / "mnist_torch_style.ncw")
     return 0
 
 

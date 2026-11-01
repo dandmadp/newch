@@ -1,11 +1,12 @@
 # newch
 
 저사양 기기에서도 **학습**까지 할 수 있는 작은 머신러닝 라이브러리입니다. 엔진은 C11이고, Python에서는
-PyTorch 스타일 텐서와 autograd, Keras 스타일 `compile`/`fit`을 씁니다. Python 의존성은 없습니다
+PyTorch 스타일의 텐서·autograd·모듈을 쓰며, 짧은 학습 루프 `fit()`을 함께 제공합니다. Python 의존성은 없습니다
 (numpy가 있으면 사용합니다). 싱글보드 컴퓨터는 호환 대상 중 하나입니다.
 
-- 네이티브 라이브러리 약 200KB (Windows), aarch64 리눅스용 약 90KB
-- MNIST CNN: 1 에포크 18초, 테스트 정확도 98.1% (x86 PC, 디스크에서 스트리밍)
+- 네이티브 라이브러리 약 220KB (Windows), aarch64 리눅스용 약 110KB
+- MNIST CNN: 1 에포크 14초, 테스트 정확도 97~98% (x86 PC, 디스크에서 스트리밍)
+- 학습 스텝의 메모리: 역전파가 다 쓴 값을 바로 돌려줘서 MNIST CNN 배치 64 기준 29MiB → 15MiB
 - 행렬곱: 멀티스레드 + AVX2로 numpy(BLAS)의 0.9~1.5배 시간
 
 ## 설치
@@ -21,30 +22,12 @@ pip install "newch[numpy]"   # numpy 연동까지
 
 ## Python 사용 예
 
-```python
-import newch as nc
-from newch import net
-
-# Keras 스타일
-model = nc.Sequential([
-    net.Conv2d(1, 16, 3, padding=1), net.BatchNorm2d(16), net.ReLU(), net.MaxPool2d(2),
-    net.Flatten(), net.Dropout(0.25), net.Linear(16 * 14 * 14, 10),
-])
-model.compile(optimizer="adam", loss="cross_entropy", metrics=["accuracy"])
-model.summary()
-history = model.fit(x, y, epochs=5, validation_split=0.1,
-                    callbacks=[nc.callbacks.EarlyStopping(patience=2)])
-loss, acc = model.evaluate(x_test, y_test)
-model.save_weights("model.ncw")          # 다른 기기에서 model.load_weights(...)
-
-```
-
-**PyTorch 스타일:** import만 바꾸면 일반적인 PyTorch 모델 코드가 그대로 돕니다 (모든 연산은 C 엔진에서 실행).
+PyTorch 모델 코드가 import만 바꾸면 그대로 돕니다. 모든 연산은 C 엔진에서 실행됩니다.
 
 ```python
-import newch as torch
-import newch.net as nn
-import newch.net.functional as F
+import newch as torch                 # 텐서, 수학, 메모리
+import newch.net as nn                # 모듈 (torch.nn)
+import newch.net.functional as F      # 활성화, 합성곱, 손실 등 신경망 함수 (torch.nn.functional)
 
 class Net(nn.Module):
     def __init__(self):
@@ -56,7 +39,7 @@ class Net(nn.Module):
         x = F.max_pool2d(F.relu(self.conv1(x)), 2)
         return F.log_softmax(self.fc(torch.flatten(x, 1)), dim=1)
 
-model = Net().to("cpu")
+model = Net()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
 for data, target in loader:
     optimizer.zero_grad()
@@ -64,9 +47,25 @@ for data, target in loader:
     loss.backward()
     optimizer.step()
     torch.step_end()                      # newch만의 한 줄: 이 스텝의 임시 텐서를 한 번에 해제
+
+torch.save_tensors(model.state_dict(), "model.ncw")       # 다른 기기에서
+model.load_state_dict(torch.load_tensors("model.ncw"))    # 이렇게 불러옵니다
 ```
 
 전체 학습·평가 루프는 [examples/mnist_torch_style.py](https://github.com/dandmadp/newch/blob/main/examples/mnist_torch_style.py)에 있습니다.
+
+**짧게 쓰고 싶을 때 (`fit`):** 같은 모델에 학습 루프를 맡깁니다.
+
+```python
+model = nn.Sequential(
+    nn.Conv2d(1, 16, 3, padding=1), nn.BatchNorm2d(16), nn.ReLU(), nn.MaxPool2d(2),
+    nn.Flatten(), nn.Dropout(0.25), nn.Linear(16 * 14 * 14, 10),
+)
+model.compile(optimizer="adam", loss="cross_entropy", metrics=["accuracy"])   # "adam" = nc.optim.Adam 그대로
+history = model.fit(x, y, batch_size=64, epochs=5, validation_split=0.1,
+                    callbacks=[torch.callbacks.EarlyStopping(patience=2)])
+loss, acc = model.evaluate(x_test, y_test)
+```
 
 **RAM보다 큰 데이터셋:** 샘플을 디스크 파일에 저장하고 `FileArray`로 열면 배치 단위로만 읽습니다.
 
@@ -74,7 +73,7 @@ for data, target in loader:
 from newch.data import DataLoader, FileArray, TensorDataset
 
 x = FileArray.create("x.bin", rows, row_shape=(1, 28, 28))   # 한 행씩 기록
-y = FileArray.create("y.bin", labels, row_shape=(), dtype=nc.int32)
+y = FileArray.create("y.bin", labels, row_shape=(), dtype=torch.int32)
 model.fit(DataLoader(TensorDataset(x, y), batch_size=64, shuffle=True), epochs=3)
 ```
 
@@ -84,34 +83,24 @@ model.fit(DataLoader(TensorDataset(x, y), batch_size=64, shuffle=True), epochs=3
 model.load_state_dict({k: v.numpy() for k, v in torch_model.state_dict().items()})
 ```
 
-**메모리가 작을 때:** `gradient_accumulation_steps`로 작은 배치를 여러 번 모아 한 번에 갱신합니다 (Keras 3과 같은 의미).
+**메모리가 작을 때:** `gradient_accumulation_steps`로 작은 배치를 여러 번 모아 한 번에 갱신합니다.
 
 ```python
-opt = nc.optim.AdamW(model.parameters(), lr=1e-3, gradient_accumulation_steps=4)   # 배치 16 x 4 = 64처럼 학습
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3, gradient_accumulation_steps=4)   # 배치 16 x 4 = 64처럼 학습
+sched = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=2)
 model.compile(optimizer=opt, loss="cross_entropy", metrics=["accuracy"])
-model.fit(x, y, batch_size=16, callbacks=[nc.callbacks.ReduceLROnPlateau(patience=2),
-                                          nc.callbacks.ModelCheckpoint("best.ncw", save_best_only=True,
-                                                                       save_weights_only=True)])
-```
-
-**고전 ML (scikit-learn 스타일):** 전처리, 선형 회귀, k-means를 같은 엔진으로 실행합니다.
-
-```python
-from newch import ml
-X_tr, X_te, y_tr, y_te = ml.train_test_split(X, y, test_size=0.2, random_state=0)
-scaler = ml.StandardScaler().fit(X_tr)
-reg = ml.Ridge(alpha=1.0).fit(scaler.transform(X_tr), y_tr)
-print(reg.score(scaler.transform(X_te), y_te))
-labels = ml.KMeans(n_clusters=3, random_state=0).fit_predict(X)
+model.fit(x, y, batch_size=16, validation_split=0.1, callbacks=[
+    torch.callbacks.LambdaCallback(on_epoch_end=lambda epoch, logs: sched.step(logs["val_loss"])),
+    torch.callbacks.ModelCheckpoint("best.ncw", save_best_only=True, save_weights_only=True)])
 ```
 
 **활성화 함수:** `ReLU`, `LeakyReLU`, `ReLU6`, `Hardsigmoid`, `Hardswish`, `SiLU`, `GELU`, `Sigmoid`, `Tanh` (PyTorch와 같은 정의).
 exp가 필요한 함수도 AVX2·NEON 벡터 커널로 ReLU와 비슷한 속도로 학습합니다. 비교 결과는
 [docs/PROGRESS.md](https://github.com/dandmadp/newch/blob/main/docs/PROGRESS.md)의 "활성화 함수 비교"에 있습니다.
 
-**int8 양자화 (추론):** `nc.quantize_(model)`은 모든 `Linear`를 int8 가중치로 바꿉니다 (가중치 메모리 1/4).
+**int8 양자화 (추론):** `newch.quantize_(model)`은 모든 `Linear`를 int8 가중치로 바꿉니다 (가중치 메모리 1/4).
 
-**스레드:** 기본값은 모든 코어입니다. `nc.set_default_context(nc.Context(threads=2))`로 바꿀 수 있습니다.
+**스레드:** 기본값은 모든 코어입니다. `newch.set_default_context(newch.Context(threads=2))`로 바꿀 수 있습니다.
 
 전체 예제는 [examples/mnist_cnn.py](https://github.com/dandmadp/newch/blob/main/examples/mnist_cnn.py)에 있습니다 (다운로드 → 디스크 변환 → 스트리밍 학습 → 저장 → 양자화).
 
@@ -177,7 +166,7 @@ engine/src/ops/            elementwise, linalg, reduce, shape, nn, conv, quant
 engine/src/kernels/        디스패치, ref/, neon/, x86/(AVX2)
 engine/src/runtime/        CPU 감지, 스레드 풀
 engine/tests/              C 테스트
-newch/                     Python 패키지 (tensor, net/{functional,init}, optim, data, training, callbacks, ml)
+newch/                     Python 패키지 (tensor, net/{functional,init}, optim, data, training, callbacks)
 tests/                     Python 테스트
 examples/                  train_spiral.c, mnist_cnn.py (Keras식), mnist_torch_style.py (PyTorch식)
 docs/                      PROGRESS.md (작업 요약), FORMAT.md (가중치 파일 포맷)

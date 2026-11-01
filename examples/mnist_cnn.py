@@ -79,9 +79,11 @@ def main() -> int:
     xte, yte = prepare(data_dir, "test")
     train = TensorDataset(xtr, ytr)
     if args.limit:
+        full = train  # bind the full dataset now: `train` is rebound just below
+
         class Head(nc.data.Dataset):  # first N samples, still streamed
             def __len__(self): return args.limit
-            def get_batch(self, idx, ctx): return train.get_batch(idx, ctx)
+            def get_batch(self, idx, ctx): return full.get_batch(idx, ctx)
         train = Head()
 
     ctx = nc.default_context()
@@ -98,12 +100,12 @@ def main() -> int:
           f"arena peak {nc.mem_stats()['arena_peak_bytes'] / 2**20:.1f} MiB")
 
     weights = data_dir / "mnist_cnn.ncw"
-    model.save_weights(weights)
+    nc.save_tensors(model.state_dict(), weights)
     float_size = os.path.getsize(weights)
     nc.quantize_(model)
     loss, acc = model.evaluate(test_loader)
     q_path = data_dir / "mnist_cnn_int8.ncw"
-    model.save_weights(q_path)
+    nc.save_tensors(model.state_dict(), q_path)
     print(f"int8 Linear: test accuracy {acc:.4f}, weights {float_size / 1024:.0f} KiB -> "
           f"{os.path.getsize(q_path) / 1024:.0f} KiB")
     return 0

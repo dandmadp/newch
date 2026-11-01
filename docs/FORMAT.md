@@ -1,6 +1,6 @@
 # NCW1 텐서 파일 포맷
 
-`nc_save` / `nc_load` (C), `save_tensors` / `load_tensors`, `save_weights` / `load_weights` (Python)가 쓰는 포맷입니다.
+`nc_save` / `nc_load` (C), `save_tensors` / `load_tensors` (Python, 보통 `state_dict()`와 함께)가 쓰는 포맷입니다.
 모든 정수는 리틀 엔디언입니다.
 
 ```
@@ -22,5 +22,5 @@ offset  크기        내용
 
 - 이름은 `state_dict()` 키입니다 (`0.weight`, `1.running_mean` 등, PyTorch와 같은 규칙)
 - 읽는 쪽은 요청하지 않은 엔트리를 건너뛰므로, 파일에 추가 텐서가 있어도 됩니다
-- `nc_load`는 이름이 없거나 dtype/shape가 다르면 에러를 냅니다. Python `load_weights`는 `load_state_dict(strict=True)`와 같은 규칙입니다
+- `nc_load`는 이름이 없거나 dtype/shape가 다르면 에러를 냅니다. Python에서는 `model.load_state_dict(load_tensors(path))`가 같은 규칙(strict)으로 검사합니다
 - 양자화된 `Linear`는 `weight`(i8 `[out, in]`), `scale`(f32 `[out]`), `bias`(f32 `[out]`)로 저장됩니다

@@ -21,16 +21,17 @@ sys.path.insert(0, str(ROOT / "examples"))
 
 import newch as nc  # noqa: E402
 from newch import net  # noqa: E402
+import newch.net.functional as F  # noqa: E402
 
 ACTS = {
-    "relu": (nc.relu, net.ReLU),
-    "leaky_relu": (nc.leaky_relu, net.LeakyReLU),
-    "relu6": (nc.relu6, net.ReLU6),
-    "hardswish": (nc.hardswish, net.Hardswish),
-    "hardsigmoid": (nc.hardsigmoid, net.Hardsigmoid),
-    "silu": (nc.silu, net.SiLU),
-    "gelu": (nc.gelu, net.GELU),
-    "gelu_tanh": (lambda x: nc.gelu(x, approximate="tanh"), lambda: net.GELU("tanh")),
+    "relu": (F.relu, net.ReLU),
+    "leaky_relu": (F.leaky_relu, net.LeakyReLU),
+    "relu6": (F.relu6, net.ReLU6),
+    "hardswish": (F.hardswish, net.Hardswish),
+    "hardsigmoid": (F.hardsigmoid, net.Hardsigmoid),
+    "silu": (F.silu, net.SiLU),
+    "gelu": (F.gelu, net.GELU),
+    "gelu_tanh": (lambda x: F.gelu(x, approximate="tanh"), lambda: net.GELU("tanh")),
     "tanh": (nc.tanh, net.Tanh),
     "sigmoid": (nc.sigmoid, net.Sigmoid),
 }

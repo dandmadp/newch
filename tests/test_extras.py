@@ -1,5 +1,5 @@
 """Tests for training extras (AdamW, gradient accumulation, clipping, schedulers,
-Keras callbacks), numpy interop and the scikit-learn style newch.ml module."""
+callbacks), numpy interop and argument compatibility."""
 
 import math
 import os
@@ -12,7 +12,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import newch as nc  # noqa: E402
-from newch import ml, net  # noqa: E402
+import newch.net.functional as F  # noqa: E402
+from newch import net  # noqa: E402
 
 try:
     import numpy as np
@@ -47,7 +48,7 @@ class TestOptimExtras(Base):
             model = nc.Sequential(net.Linear(3, 1))
             opt = nc.optim.SGD(model.parameters(), lr=0.1, gradient_accumulation_steps=accum)
             for s in range(0, 8, batch):
-                loss = nc.mse_loss(model(nc.tensor(xs[s:s + batch])), nc.tensor([[y] for y in ys[s:s + batch]]))
+                loss = F.mse_loss(model(nc.tensor(xs[s:s + batch])), nc.tensor([[y] for y in ys[s:s + batch]]))
                 opt.zero_grad()
                 loss.backward()
                 opt.step()
@@ -85,7 +86,7 @@ class TestOptimExtras(Base):
         self.assertAlmostEqual(opt2.lr, 0.5, places=6)
         opt3 = nc.optim.SGD([nc.parameter((1,))], lr=2.0)
         nc.optim.lr_scheduler.LambdaLR(opt3, lambda e: 0.1).step()
-        self.assertAlmostEqual(opt3.learning_rate, 0.2, places=6)
+        self.assertAlmostEqual(opt3.lr, 0.2, places=6)
 
 
 class TestCallbacks(Base):
@@ -94,21 +95,26 @@ class TestCallbacks(Base):
         xs = [[rng.uniform(-1, 1)] for _ in range(64)]
         return xs, [2 * x[0] for x in xs]
 
-    def test_lr_scheduler_and_plateau(self):
+    def test_schedulers_from_fit(self):
+        # one mechanism for the learning rate: nc.optim.lr_scheduler, stepped from a LambdaCallback
         xs, ys = self.data()
         model = nc.Sequential(net.Linear(1, 1)).compile(optimizer="sgd", loss="mse", lr=0.1)
+        sched = nc.optim.lr_scheduler.StepLR(model.optimizer, step_size=1, gamma=0.5)
         seen = []
-        model.fit(xs, ys, epochs=3, verbose=0, callbacks=[
-            nc.callbacks.LearningRateScheduler(lambda epoch, lr: 0.1 / (epoch + 1)),
-            nc.callbacks.LambdaCallback(on_epoch_end=lambda e, logs: seen.append(model.optimizer.lr))])
-        for got, want in zip(seen, [0.1, 0.05, 0.1 / 3]):
+        model.fit(xs, ys, epochs=3, verbose=0, callbacks=[nc.callbacks.LambdaCallback(
+            on_epoch_end=lambda e, logs: (seen.append(model.optimizer.lr), sched.step()))])
+        for got, want in zip(seen, [0.1, 0.05, 0.025]):
             self.assertAlmostEqual(got, want, places=6)
 
-        model.optimizer.lr = 0.1
-        plateau = nc.callbacks.ReduceLROnPlateau(monitor="loss", factor=0.5, patience=1, min_delta=100.0)
-        model.fit(xs, ys, epochs=3, verbose=0, callbacks=[plateau])
-        # first epoch sets the best value; the next two never improve by 100 -> two halvings
-        self.assertAlmostEqual(model.optimizer.lr, 0.025, places=6)
+    def test_reduce_lr_on_plateau(self):
+        opt = nc.optim.SGD([nc.parameter((1,))], lr=1.0)
+        sched = nc.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=0.5, patience=1)
+        for loss in [1.0, 1.0, 1.0, 1.0, 1.0, 0.5]:  # bad epochs: 1, 2 -> cut; 1, 2 -> cut
+            sched.step(loss)
+        self.assertAlmostEqual(opt.lr, 0.25)
+        self.assertEqual(sched.get_last_lr(), [0.25])
+        with self.assertRaises(ValueError):
+            nc.optim.lr_scheduler.ReduceLROnPlateau(opt, factor=1.5)
 
     def test_model_checkpoint(self):
         xs, ys = self.data()
@@ -122,7 +128,7 @@ class TestCallbacks(Base):
         model.fit(xs, ys, epochs=2, verbose=0, callbacks=[
             nc.callbacks.ModelCheckpoint(best, monitor="loss", save_best_only=True, save_weights_only=True)])
         other = nc.Sequential(net.Linear(1, 1))
-        other.load_weights(best)
+        other.load_state_dict(nc.load_tensors(best))
         with self.assertRaises(NotImplementedError):
             nc.callbacks.ModelCheckpoint(best)  # Keras default save_weights_only=False: whole-model save
 
@@ -141,16 +147,18 @@ class TestApiCompat(Base):
         with self.assertRaises(NotImplementedError):
             model.fit(xs, ys, verbose=0, sample_weight=[1.0] * 12)
 
-    def test_compile_defaults(self):
+    def test_compile_names_build_the_same_classes(self):
         model = nc.Sequential(net.Linear(1, 1)).compile()
-        self.assertEqual(type(model.optimizer).__name__, "_KerasRMSprop")
+        self.assertIsInstance(model.optimizer, nc.optim.Adam)  # one Adam, one set of defaults
         self.assertAlmostEqual(model.optimizer.lr, 1e-3)
+        self.assertIsInstance(model.compile("rmsprop", "mse").optimizer, nc.optim.RMSprop)
+        self.assertAlmostEqual(model.compile("sgd", "mse", lr=0.2).optimizer.lr, 0.2)
         with self.assertRaises(ValueError):  # no loss configured
-            model.fit([[0.0]], [0.0], verbose=0)
-        with self.assertRaises(NotImplementedError):
-            model.compile(loss="mse", loss_weights=[1.0])
+            nc.Sequential(net.Linear(1, 1)).compile().fit([[0.0]], [0.0], verbose=0)
+        with self.assertRaises(ValueError):
+            model.compile(loss="mean_squared_error")
 
-    def test_rmsprop_variants(self):
+    def test_rmsprop(self):
         def first_step(opt_factory):
             w = nc.parameter([1.0])
             opt = opt_factory([w])
@@ -160,10 +168,8 @@ class TestApiCompat(Base):
 
         a = 0.9
         torch_form = first_step(lambda p: nc.optim.RMSprop(p, lr=0.1, alpha=a, eps=0.5))
-        keras_form = first_step(lambda p: nc.optim._KerasRMSprop(p, lr=0.1, alpha=a, eps=0.5))
         v = (1 - a) * 4.0
         self.assertAlmostEqual(torch_form, 1.0 - 0.1 * 2.0 / (math.sqrt(v) + 0.5), places=5)
-        self.assertAlmostEqual(keras_form, 1.0 - 0.1 * 2.0 / math.sqrt(v + 0.5), places=5)
 
     def test_optimizer_positional_order_is_torch(self):
         p = [nc.parameter((2,))]
@@ -207,18 +213,18 @@ class TestApiCompat(Base):
 
     def test_functional_losses(self):
         logits = nc.tensor([[2.0, 0.0, -1.0], [0.0, 1.0, 0.0]])
-        mean = nc.cross_entropy(logits, [0, 1]).item()
-        self.assertAlmostEqual(nc.cross_entropy(logits, [0, 1], reduction="sum").item(), 2 * mean, places=5)
-        smooth = nc.cross_entropy(logits, [0, 1], label_smoothing=0.1).item()
+        mean = F.cross_entropy(logits, [0, 1]).item()
+        self.assertAlmostEqual(F.cross_entropy(logits, [0, 1], reduction="sum").item(), 2 * mean, places=5)
+        smooth = F.cross_entropy(logits, [0, 1], label_smoothing=0.1).item()
         uniform = -sum(sum(r) / 3 for r in logits.log_softmax(-1).tolist()) / 2
         self.assertAlmostEqual(smooth, 0.9 * mean + 0.1 * uniform, places=5)
         with self.assertRaises(NotImplementedError):
-            nc.cross_entropy(logits, [0, 1], ignore_index=0)
+            F.cross_entropy(logits, [0, 1], ignore_index=0)
         with self.assertRaises(NotImplementedError):
-            nc.cross_entropy(logits, [0, 1], reduction="none")
+            F.cross_entropy(logits, [0, 1], reduction="none")
         a, b = nc.tensor([1.0, 2.0]), nc.tensor([0.0, 0.0])
-        self.assertEqual(nc.mse_loss(a, b, reduction="none").tolist(), [1.0, 4.0])
-        self.assertAlmostEqual(nc.mse_loss(a, b, reduction="sum").item(), 5.0)
+        self.assertEqual(F.mse_loss(a, b, reduction="none").tolist(), [1.0, 4.0])
+        self.assertAlmostEqual(F.mse_loss(a, b, reduction="sum").item(), 5.0)
 
     def test_creation_and_reductions(self):
         self.assertEqual(nc.full((2,), 3).dtype, nc.int32)  # dtype follows the value
@@ -227,7 +233,7 @@ class TestApiCompat(Base):
         t = nc.tensor([[1.0, 5.0], [7.0, 2.0]])
         self.assertEqual(t.argmax(1, keepdim=True).shape, (2, 1))
         with self.assertWarns(UserWarning):
-            self.assertEqual(nc.softmax(t).shape, (2, 2))  # implicit dim 1 for 2-D
+            self.assertEqual(F.softmax(t).shape, (2, 2))  # implicit dim 1 for 2-D
         with self.assertRaises(TypeError):
             t.softmax()  # Tensor.softmax needs dim, as in torch
 
@@ -248,14 +254,14 @@ class TestApiCompat(Base):
         for layer, values in want.items():
             for got, w in zip(layer(x).tolist(), values):
                 self.assertAlmostEqual(got, w, places=5, msg=repr(layer))
-        approx = nc.gelu(x, approximate="tanh").tolist()[1]
+        approx = F.gelu(x, approximate="tanh").tolist()[1]
         self.assertAlmostEqual(approx, -0.158808, places=5)
         with self.assertRaises(ValueError):
             net.GELU("fast")
         with self.assertRaises(NotImplementedError):
-            nc.silu(x, inplace=True)
+            F.silu(x, inplace=True)
         p = nc.parameter([0.5, -2.0])
-        nc.silu(p).sum().backward()  # d/dx x sigmoid(x) = s (1 + x (1 - s))
+        F.silu(p).sum().backward()  # d/dx x sigmoid(x) = s (1 + x (1 - s))
         s = 1 / (1 + math.exp(-0.5))
         self.assertAlmostEqual(p.grad.tolist()[0], s * (1 + 0.5 * (1 - s)), places=5)
 
@@ -285,89 +291,6 @@ class TestNumpyInterop(Base):
         self.assertEqual(a.shape, (2, 2))
         self.assertAlmostEqual(float(np.asarray(t).mean()), 2.5)
         self.assertEqual(np.asarray(t, dtype=np.float64).dtype, np.float64)
-
-
-class TestML(Base):
-    def test_standard_scaler(self):
-        X = [[1.0, 10.0, 5.0], [3.0, 30.0, 5.0]]
-        sc = ml.StandardScaler().fit(X)
-        self.assertEqual(sc.mean_, [2.0, 20.0, 5.0])
-        self.assertEqual(sc.scale_, [1.0, 10.0, 1.0])  # constant feature: scale 1
-        self.assertEqual(sc.transform(X), [[-1.0, -1.0, 0.0], [1.0, 1.0, 0.0]])
-        back = sc.inverse_transform(sc.transform(X))
-        for r, w in zip(back, X):
-            for a, b in zip(r, w):
-                self.assertAlmostEqual(a, b, places=4)
-        with self.assertRaises(ValueError):
-            sc.transform([[1.0, 2.0]])
-        with self.assertRaises(ml.NotFittedError):
-            ml.StandardScaler().transform(X)
-
-    def test_minmax_scaler(self):
-        X = [[0.0, -1.0], [5.0, 1.0], [10.0, 3.0]]
-        sc = ml.MinMaxScaler(feature_range=(-1, 1)).fit(X)
-        out = sc.transform(X)
-        self.assertEqual([r[0] for r in out], [-1.0, 0.0, 1.0])
-        self.assertEqual(sc.data_range_, [10.0, 4.0])
-
-    def test_train_test_split(self):
-        X, y = list(range(10)), [v * 2 for v in range(10)]
-        xtr, xte, ytr, yte = ml.train_test_split(X, y, test_size=0.3, random_state=0)
-        self.assertEqual((len(xtr), len(xte)), (7, 3))
-        self.assertEqual(sorted(xtr + xte), X)
-        self.assertEqual(ytr, [v * 2 for v in xtr])
-        a, b = ml.train_test_split(X, shuffle=False)
-        self.assertEqual((a, b), (list(range(7)), [7, 8, 9]))  # ceil(0.25 * 10) = 3 test samples
-
-    def test_linear_and_ridge(self):
-        rng = random.Random(1)
-        X = [[rng.uniform(-1, 1), rng.uniform(-1, 1)] for _ in range(200)]
-        y = [3 * a - 2 * b + 0.5 for a, b in X]
-        lr = ml.LinearRegression().fit(X, y)
-        self.assertAlmostEqual(lr.coef_[0], 3.0, places=3)
-        self.assertAlmostEqual(lr.coef_[1], -2.0, places=3)
-        self.assertAlmostEqual(lr.intercept_, 0.5, places=3)
-        self.assertGreater(lr.score(X, y), 0.9999)
-        with self.assertRaises(ValueError):  # collinear columns
-            ml.LinearRegression().fit([[a, 2 * a] for a, _ in X], y)
-        # ridge on centered data: w = (Xc^T Xc + alpha)^-1 Xc^T yc, for one feature a closed form
-        X1 = [[1.0], [2.0], [3.0]]
-        y1 = [1.0, 2.0, 3.0]
-        r = ml.Ridge(alpha=2.0).fit(X1, y1)
-        self.assertAlmostEqual(r.coef_[0], 2.0 / (2.0 + 2.0), places=5)
-        self.assertAlmostEqual(r.intercept_, 2.0 - 0.5 * 2.0, places=5)
-        multi = ml.Ridge(alpha=0.0).fit(X1, [[1.0, -1.0], [2.0, -2.0], [3.0, -3.0]])
-        self.assertEqual(len(multi.coef_), 2)  # (n_targets, n_features)
-        self.assertAlmostEqual(multi.predict([[4.0]])[0][1], -4.0, places=4)
-
-    def test_kmeans(self):
-        rng = random.Random(3)
-        blobs = [(0.0, 0.0), (5.0, 5.0), (0.0, 6.0)]
-        X = [[cx + rng.gauss(0, 0.3), cy + rng.gauss(0, 0.3)] for cx, cy in blobs for _ in range(50)]
-        km = ml.KMeans(n_clusters=3, random_state=0).fit(X)
-        centers = sorted((round(a), round(b)) for a, b in km.cluster_centers_)
-        self.assertEqual(centers, [(0, 0), (0, 6), (5, 5)])
-        self.assertEqual(len(set(km.labels_[:50])), 1)
-        self.assertEqual(km.predict([[5.1, 4.9]])[0], km.labels_[60])
-        self.assertAlmostEqual(km.score(X), -km.inertia_, places=2)
-        rnd = ml.KMeans(n_clusters=3, init="random", random_state=1).fit(X)
-        self.assertLess(rnd.inertia_, 100.0)
-
-    def test_metrics(self):
-        self.assertEqual(ml.accuracy_score([0, 1, 1, 0], [0, 1, 0, 0]), 0.75)
-        self.assertAlmostEqual(ml.mean_squared_error([1.0, 2.0], [1.0, 4.0]), 2.0)
-        self.assertAlmostEqual(ml.r2_score([1.0, 2.0, 3.0], [1.0, 2.0, 3.0]), 1.0)
-
-    @unittest.skipIf(np is None, "numpy not installed")
-    def test_numpy_in_numpy_out(self):
-        X = np.array([[1.0, 2.0], [3.0, 6.0], [5.0, 10.0]])
-        sc = ml.StandardScaler().fit(X)
-        self.assertIsInstance(sc.mean_, np.ndarray)
-        out = sc.transform(X)
-        self.assertIsInstance(out, np.ndarray)
-        np.testing.assert_allclose(out.mean(axis=0), [0.0, 0.0], atol=1e-6)
-        t = nc.tensor(X)
-        self.assertIsInstance(sc.transform(t), nc.Tensor)
 
 
 if __name__ == "__main__":

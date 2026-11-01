@@ -155,14 +155,6 @@ class Module:
             t.copy_(src)
         return IncompatibleKeys(missing, unexpected)
 
-    def save_weights(self, path) -> None:
-        """Writes ``state_dict()`` to an NCW1 file (Keras' save_weights)."""
-        save_tensors(self.state_dict(), path)
-
-    def load_weights(self, path) -> None:
-        """Loads a file written by save_weights (strict: names and shapes must match)."""
-        self.load_state_dict(load_tensors(path, ctx=self._context()))
-
     def _context(self) -> Context:
         sd = self.state_dict()
         return next(iter(sd.values())).ctx if sd else default_context()
@@ -542,12 +534,12 @@ class Model(Module):
         """The optimizer set by compile() (Keras' model.optimizer), else None."""
         return self._compiled.optimizer if self._compiled is not None else None
 
-    def compile(self, optimizer="rmsprop", loss=None, loss_weights=None, metrics=None, *, lr: float | None = None):
-        """Keras' compile. ``optimizer`` is a name ("rmsprop", "adam", "adamw", "sgd" with Keras' default
-        hyperparameters) or an optimizer instance; ``lr`` overrides the learning rate of a named optimizer."""
+    def compile(self, optimizer="adam", loss=None, metrics=None, *, lr: float | None = None):
+        """Sets up fit()/evaluate(). ``optimizer`` is an nc.optim instance or a name ("adam", "adamw",
+        "sgd", "rmsprop") that builds that class with its defaults; ``lr`` overrides the rate of a name.
+        ``loss`` is "cross_entropy", "mse" or any callable(output, target)."""
         from ..training import compile_model
 
-        _unsupported(loss_weights=(loss_weights, None))
         compile_model(self, optimizer, loss, metrics, lr)
         return self
 
