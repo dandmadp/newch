@@ -516,6 +516,8 @@ def quantize_(model: Module) -> Module:
                 setattr(m, name, [convert(i) for i in v])
             elif isinstance(v, tuple) and any(isinstance(i, Linear) for i in v):
                 setattr(m, name, tuple(convert(i) for i in v))
+            elif isinstance(v, dict) and any(isinstance(i, Linear) for i in v.values()):  # ModuleDict
+                setattr(m, name, {k: convert(i) for k, i in v.items()})
     model.eval()
     return model
 

@@ -379,6 +379,11 @@ static void test_gradcheck(void) {
         float tv[3] = {-1.7f, 2.9f, 0.4f};
         nc_tensor *ti = nc_to_dtype(nc_from_data(ctx, NC_F32, tv, 1, SHAPE(3)), NC_I32);
         CHECK(ti && nc_data_i32(ti)[0] == -1 && nc_data_i32(ti)[1] == 2);
+        float big[4] = {3e9f, -3e9f, NAN, 300.0f};
+        nc_tensor *bt = nc_from_data(ctx, NC_F32, big, 1, SHAPE(4));
+        nc_tensor *b32 = nc_to_dtype(bt, NC_I32), *b8 = nc_to_dtype(bt, NC_I8);
+        CHECK(nc_data_i32(b32)[0] == INT32_MAX && nc_data_i32(b32)[1] == INT32_MIN && nc_data_i32(b32)[2] == 0);
+        CHECK(b8 && ((int8_t *)b8->data)[3] == 127 && ((int8_t *)b8->data)[1] == -128);
         CHECK(!nc_requires_grad(nc_to_dtype(lg, NC_I32)));
         CHECK_NEAR(nc_data_f32(nc_to_dtype(i, NC_F32))[3], 4.0, 0);
         /* cat of int tensors and the input-count limit */

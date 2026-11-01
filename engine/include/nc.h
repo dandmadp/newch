@@ -268,7 +268,8 @@ NC_API nc_tensor *nc_compare(nc_tensor *a, nc_tensor *b, nc_cmp op);
 /* Concatenates n tensors (1..6, same dtype, equal shapes except `axis`).
  * Differentiable for f32. */
 NC_API nc_tensor *nc_cat(int n, nc_tensor *const *xs, int axis);
-/* Converts dtype (f32 <-> i32 <-> i8; float to int truncates toward zero).
+/* Converts dtype (f32 <-> i32 <-> i8; float to int truncates toward zero,
+ * saturates out-of-range values and maps NaN to 0, the same on every CPU).
  * Converting to an integer type detaches: integer tensors carry no grad. */
 NC_API nc_tensor *nc_to_dtype(nc_tensor *x, nc_dtype dt);
 

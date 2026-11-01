@@ -120,6 +120,15 @@ class TestTensorMethods(Base):
         self.assertIs(t.to("cpu"), t)
         with self.assertRaises(NotImplementedError):
             t.to("cuda")
+        self.assertEqual(torch.tensor([3e9, -3e9, float("nan")]).int().tolist(), [2 ** 31 - 1, -2 ** 31, 0])
+
+    def test_truth_value(self):
+        a, b = torch.tensor([1.0, 2.0]), torch.tensor([3.0, 4.0])
+        with self.assertRaises(RuntimeError):
+            bool(a)
+        with self.assertRaises(RuntimeError):
+            b in [a, b]  # elementwise ==, as in PyTorch
+        self.assertTrue(torch.tensor([2.0]) > 1)
 
     def test_view_rules(self):
         x = torch.randn(3, 4)
@@ -153,6 +162,9 @@ class TestModules(Base):
         self.assertEqual(m.scale.tolist(), [1.0] * 4)  # registered buffers survive step_end
         self.assertEqual([n for n, _ in m.named_modules()][:3], ["", "layers", "layers.0"])
         self.assertEqual(len(m.layers), 2)
+        torch.quantize_(m)  # Linear inside ModuleList and ModuleDict
+        self.assertIsInstance(m.layers[0], nn.QuantizedLinear)
+        self.assertIsInstance(m.heads["b"], nn.QuantizedLinear)
         self.assertEqual(len(nn.Sequential(nn.ReLU(), nn.Tanh(), nn.ReLU())[1:]), 2)
 
     def test_losses(self):

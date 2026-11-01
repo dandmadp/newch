@@ -369,6 +369,14 @@ static double load_as_double(const void *p, nc_dtype dt, int64_t i) {
                                                                        : (double)((const int8_t *)p)[i];
 }
 
+/* Float to int truncates toward zero. Out-of-range values saturate and NaN
+ * becomes 0: a plain C cast is undefined there and differs between x86 and
+ * ARM, which would break cross-platform reproducibility. */
+static double saturate(double v, double lo, double hi) {
+    if (v != v) return 0.0;
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
 static nc_status to_dtype_fwd(nc_node *n) {
     nc_tensor *x = n->in[0], *o = n->out;
     void *src = nc__arena_alloc(o->ctx, (size_t)nc_numel(x) * nc__dtype_size(x->dtype) + 1);
@@ -377,8 +385,8 @@ static nc_status to_dtype_fwd(nc_node *n) {
     for (int64_t i = 0, N = nc_numel(x); i < N; i++) {
         double v = load_as_double(src, x->dtype, i);
         if (o->dtype == NC_F32) ((float *)o->data)[i] = (float)v;
-        else if (o->dtype == NC_I32) ((int32_t *)o->data)[i] = (int32_t)v; /* truncates toward zero */
-        else ((int8_t *)o->data)[i] = (int8_t)(int32_t)v;
+        else if (o->dtype == NC_I32) ((int32_t *)o->data)[i] = (int32_t)saturate(v, -2147483648.0, 2147483647.0);
+        else ((int8_t *)o->data)[i] = (int8_t)saturate(v, -128.0, 127.0);
     }
     return NC_OK;
 }

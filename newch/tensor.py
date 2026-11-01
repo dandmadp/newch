@@ -381,6 +381,10 @@ class Tensor:
         return float(self.item())
 
     def __bool__(self) -> bool:
+        n = self.numel()
+        if n != 1:  # also what `t in [a, b]` and `if t:` hit, as in PyTorch
+            raise RuntimeError(f"the truth value of a tensor with {n} elements is ambiguous; "
+                               "reduce it first, e.g. (t != 0).sum().item() > 0")
         return bool(self.item())
 
     # ---- comparison (elementwise, int32 0/1: there is no bool dtype) -----
