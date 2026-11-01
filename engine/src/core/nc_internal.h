@@ -19,7 +19,11 @@
 enum {
     NC_TF_REQUIRES_GRAD = 1u << 0,
     NC_TF_PERSISTENT = 1u << 1,
-    NC_TF_OWNS_DATA = 1u << 2 /* false for views */
+    NC_TF_OWNS_DATA = 1u << 2, /* false for views */
+    /* grad buffer is kept for reuse but counts as absent (nc_clear_grad):
+     * nc_grad() returns NULL and optimizers skip the tensor until backward
+     * writes a fresh gradient into it */
+    NC_TF_GRAD_CLEARED = 1u << 3
 };
 
 typedef struct nc_node nc_node;
@@ -85,10 +89,14 @@ struct nc_node {
     X(add) X(sub) X(mul) X(div)                                                \
     X(neg) X(exp) X(log) X(sqrt) X(relu) X(sigmoid) X(tanh)                    \
     X(scale) X(add_scalar) X(pow_scalar)                                       \
+    X(leaky_relu) X(relu6) X(hardsigmoid) X(hardswish) X(silu) X(gelu)         \
+    X(gelu_tanh)                                                               \
     X(matmul) X(linear)                                                        \
     X(sum) X(mean) X(max) X(argmax)                                            \
     X(reshape) X(transpose) X(contiguous) X(detach) X(index_select)            \
-    X(log_softmax) X(softmax) X(cross_entropy)                                     X(conv2d) X(max_pool2d) X(avg_pool2d) X(dropout) X(batch_norm)                 X(linear_int8)
+    X(log_softmax) X(softmax) X(cross_entropy)                                 \
+    X(conv2d) X(max_pool2d) X(avg_pool2d) X(dropout) X(batch_norm)             \
+    X(linear_int8)
 
 #define NC_DECLARE_OP(name) extern const nc_op_def nc_op_##name;
 NC_OP_LIST(NC_DECLARE_OP)

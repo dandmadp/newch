@@ -21,6 +21,14 @@ typedef struct nc_kernels {
     void (*scale_f32)(int64_t n, float s, const float *x, float *o);
     void (*relu_f32)(int64_t n, const float *x, float *o);
     float (*sum_f32)(int64_t n, const float *x);
+    /* transcendental maps, y may alias x. SIMD tiers use a polynomial exp
+     * (relative error ~1e-7), the reference uses libm. */
+    void (*exp_f32)(int64_t n, const float *x, float *y);
+    void (*sigmoid_f32)(int64_t n, const float *x, float *y);
+    void (*tanh_f32)(int64_t n, const float *x, float *y);
+    /* erf for GELU: SIMD tiers have absolute error <= 5e-7 (fine next to the
+     * 1 in Phi(x) = (1 + erf(x / sqrt 2)) / 2, not for tiny erf values) */
+    void (*erf_f32)(int64_t n, const float *x, float *y);
 
     /* C = alpha * op(A) * op(B) + beta * C, row-major.
      * op(A) is M x K, op(B) is K x N. ta/tb = 1 means the stored matrix is

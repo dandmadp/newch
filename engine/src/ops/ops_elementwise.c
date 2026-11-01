@@ -161,7 +161,16 @@ nc_tensor *nc_div(nc_tensor *a, nc_tensor *b) { return binary(&nc_op_div, a, b);
 /* Unary                                                                     */
 /* ------------------------------------------------------------------------ */
 
-enum { UN_NEG, UN_EXP, UN_LOG, UN_SQRT, UN_RELU, UN_SIGMOID, UN_TANH, UN_SCALE, UN_ADD_SCALAR, UN_POW };
+enum {
+    UN_NEG, UN_EXP, UN_LOG, UN_SQRT, UN_RELU, UN_SIGMOID, UN_TANH, UN_SCALE, UN_ADD_SCALAR, UN_POW,
+    UN_LEAKY_RELU, UN_RELU6, UN_HARDSIGMOID, UN_HARDSWISH, UN_SILU, UN_GELU, UN_GELU_TANH
+};
+
+/* GELU: exact form uses erf, the approximation tanh (as PyTorch's approximate="tanh"). */
+#define NC_SQRT1_2 0.70710678118654752f
+#define NC_INV_SQRT_2PI 0.39894228040143268f
+#define NC_SQRT_2_PI 0.79788456080286536f
+#define NC_GELU_C 0.044715f
 
 static nc_status unary_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
     if (!nc__expect_f32(n, 0)) return NC_ERR_DTYPE;
@@ -180,15 +189,39 @@ static nc_status unary_fwd(nc_node *n) {
     float s = n->p.f[0];
     switch (n->op->kind) {
     case UN_NEG: k->scale_f32(N, -1.0f, x, y); break;
-    case UN_EXP: for (int64_t i = 0; i < N; i++) y[i] = expf(x[i]); break;
+    case UN_EXP: k->exp_f32(N, x, y); break;
     case UN_LOG: for (int64_t i = 0; i < N; i++) y[i] = logf(x[i]); break;
     case UN_SQRT: for (int64_t i = 0; i < N; i++) y[i] = sqrtf(x[i]); break;
     case UN_RELU: k->relu_f32(N, x, y); break;
-    case UN_SIGMOID: for (int64_t i = 0; i < N; i++) y[i] = 1.0f / (1.0f + expf(-x[i])); break;
-    case UN_TANH: for (int64_t i = 0; i < N; i++) y[i] = tanhf(x[i]); break;
+    case UN_SIGMOID: k->sigmoid_f32(N, x, y); break;
+    case UN_TANH: k->tanh_f32(N, x, y); break;
     case UN_SCALE: k->scale_f32(N, s, x, y); break;
     case UN_ADD_SCALAR: for (int64_t i = 0; i < N; i++) y[i] = x[i] + s; break;
     case UN_POW: for (int64_t i = 0; i < N; i++) y[i] = powf(x[i], s); break;
+    /* Piecewise-linear activations: only compares and multiplies, so they stay
+     * cheap on small cores and keep a bounded range for int8. */
+    case UN_LEAKY_RELU: for (int64_t i = 0; i < N; i++) y[i] = x[i] > 0.0f ? x[i] : s * x[i]; break;
+    case UN_RELU6: for (int64_t i = 0; i < N; i++) y[i] = fminf(fmaxf(x[i], 0.0f), 6.0f); break;
+    case UN_HARDSIGMOID:
+        for (int64_t i = 0; i < N; i++) y[i] = fminf(fmaxf(x[i] * (1.0f / 6.0f) + 0.5f, 0.0f), 1.0f);
+        break;
+    case UN_HARDSWISH:
+        for (int64_t i = 0; i < N; i++) y[i] = x[i] * fminf(fmaxf(x[i] + 3.0f, 0.0f), 6.0f) * (1.0f / 6.0f);
+        break;
+    case UN_SILU:
+        k->sigmoid_f32(N, x, y);
+        for (int64_t i = 0; i < N; i++) y[i] *= x[i];
+        break;
+    case UN_GELU:
+        k->scale_f32(N, NC_SQRT1_2, x, y);
+        k->erf_f32(N, y, y);
+        for (int64_t i = 0; i < N; i++) y[i] = 0.5f * x[i] * (1.0f + y[i]);
+        break;
+    case UN_GELU_TANH:
+        for (int64_t i = 0; i < N; i++) y[i] = NC_SQRT_2_PI * (x[i] + NC_GELU_C * x[i] * x[i] * x[i]);
+        k->tanh_f32(N, y, y);
+        for (int64_t i = 0; i < N; i++) y[i] = 0.5f * x[i] * (1.0f + y[i]);
+        break;
     }
     return NC_OK;
 }
@@ -204,6 +237,25 @@ static void unary_bwd(nc_node *n) {
     float *gi = (float *)gt->data;
     int64_t N = nc_numel(in);
     float s = n->p.f[0];
+    float *tmp = NULL, *tmp2 = NULL; /* sigmoid / erf / tanh values recomputed for SiLU and GELU */
+    int kind = n->op->kind;
+    if (kind == UN_SILU || kind == UN_GELU || kind == UN_GELU_TANH) {
+        tmp = (float *)nc__arena_alloc(in->ctx, (size_t)(N ? N : 1) * sizeof(float));
+        if (!tmp) return;
+        if (kind == UN_SILU) {
+            k->sigmoid_f32(N, x, tmp);
+        } else if (kind == UN_GELU) {
+            tmp2 = (float *)nc__arena_alloc(in->ctx, (size_t)(N ? N : 1) * sizeof(float));
+            if (!tmp2) return;
+            k->scale_f32(N, NC_SQRT1_2, x, tmp);
+            k->erf_f32(N, tmp, tmp);
+            for (int64_t i = 0; i < N; i++) tmp2[i] = -0.5f * x[i] * x[i];
+            k->exp_f32(N, tmp2, tmp2);
+        } else {
+            for (int64_t i = 0; i < N; i++) tmp[i] = NC_SQRT_2_PI * (x[i] + NC_GELU_C * x[i] * x[i] * x[i]);
+            k->tanh_f32(N, tmp, tmp);
+        }
+    }
     switch (n->op->kind) {
     case UN_NEG: k->axpy_f32(N, -1.0f, g, gi); break;
     case UN_EXP: for (int64_t i = 0; i < N; i++) gi[i] += g[i] * y[i]; break;
@@ -215,6 +267,30 @@ static void unary_bwd(nc_node *n) {
     case UN_SCALE: k->axpy_f32(N, s, g, gi); break;
     case UN_ADD_SCALAR: k->axpy_f32(N, 1.0f, g, gi); break;
     case UN_POW: for (int64_t i = 0; i < N; i++) gi[i] += g[i] * s * powf(x[i], s - 1.0f); break;
+    /* kinks take the PyTorch convention (open intervals) */
+    case UN_LEAKY_RELU: for (int64_t i = 0; i < N; i++) gi[i] += x[i] > 0.0f ? g[i] : s * g[i]; break;
+    case UN_RELU6: for (int64_t i = 0; i < N; i++) gi[i] += (x[i] > 0.0f && x[i] < 6.0f) ? g[i] : 0.0f; break;
+    case UN_HARDSIGMOID:
+        for (int64_t i = 0; i < N; i++) gi[i] += (x[i] > -3.0f && x[i] < 3.0f) ? g[i] * (1.0f / 6.0f) : 0.0f;
+        break;
+    case UN_HARDSWISH:
+        for (int64_t i = 0; i < N; i++)
+            gi[i] += x[i] < -3.0f ? 0.0f : x[i] <= 3.0f ? g[i] * (x[i] * (1.0f / 3.0f) + 0.5f) : g[i];
+        break;
+    case UN_SILU:
+        for (int64_t i = 0; i < N; i++) gi[i] += g[i] * tmp[i] * (1.0f + x[i] * (1.0f - tmp[i]));
+        break;
+    case UN_GELU:
+        for (int64_t i = 0; i < N; i++) gi[i] += g[i] * (0.5f * (1.0f + tmp[i]) + x[i] * NC_INV_SQRT_2PI * tmp2[i]);
+        break;
+    case UN_GELU_TANH:
+        for (int64_t i = 0; i < N; i++) {
+            float v = x[i];
+            float t = tmp[i];
+            float dt = (1.0f - t * t) * NC_SQRT_2_PI * (1.0f + 3.0f * NC_GELU_C * v * v);
+            gi[i] += g[i] * (0.5f * (1.0f + t) + 0.5f * v * dt);
+        }
+        break;
     }
 }
 
@@ -230,6 +306,13 @@ UNARY_OP(tanh, UN_TANH)
 UNARY_OP(scale, UN_SCALE)
 UNARY_OP(add_scalar, UN_ADD_SCALAR)
 UNARY_OP(pow_scalar, UN_POW)
+UNARY_OP(leaky_relu, UN_LEAKY_RELU)
+UNARY_OP(relu6, UN_RELU6)
+UNARY_OP(hardsigmoid, UN_HARDSIGMOID)
+UNARY_OP(hardswish, UN_HARDSWISH)
+UNARY_OP(silu, UN_SILU)
+UNARY_OP(gelu, UN_GELU)
+UNARY_OP(gelu_tanh, UN_GELU_TANH)
 #undef UNARY_OP
 
 static nc_tensor *unary(const nc_op_def *op, nc_tensor *x, float s) {
@@ -248,3 +331,11 @@ nc_tensor *nc_tanh(nc_tensor *x) { return unary(&nc_op_tanh, x, 0); }
 nc_tensor *nc_scale(nc_tensor *x, float s) { return unary(&nc_op_scale, x, s); }
 nc_tensor *nc_add_scalar(nc_tensor *x, float s) { return unary(&nc_op_add_scalar, x, s); }
 nc_tensor *nc_pow_scalar(nc_tensor *x, float p) { return unary(&nc_op_pow_scalar, x, p); }
+nc_tensor *nc_leaky_relu(nc_tensor *x, float negative_slope) { return unary(&nc_op_leaky_relu, x, negative_slope); }
+nc_tensor *nc_relu6(nc_tensor *x) { return unary(&nc_op_relu6, x, 0); }
+nc_tensor *nc_hardsigmoid(nc_tensor *x) { return unary(&nc_op_hardsigmoid, x, 0); }
+nc_tensor *nc_hardswish(nc_tensor *x) { return unary(&nc_op_hardswish, x, 0); }
+nc_tensor *nc_silu(nc_tensor *x) { return unary(&nc_op_silu, x, 0); }
+nc_tensor *nc_gelu(nc_tensor *x, int approximate_tanh) {
+    return unary(approximate_tanh ? &nc_op_gelu_tanh : &nc_op_gelu, x, 0);
+}

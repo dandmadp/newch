@@ -5,6 +5,7 @@
 
 #if (defined(__x86_64__) || defined(_M_X64)) && (defined(__GNUC__) || defined(__clang__))
 #include <immintrin.h>
+#include <string.h>
 
 #define NC_AVX2 __attribute__((target("avx2,fma")))
 
@@ -68,6 +69,104 @@ NC_AVX2 static float sum_f32(int64_t n, const float *x) {
     for (; i < n; i++) s += x[i];
     return s;
 }
+
+
+/* exp: x = n ln2 + r, e^r by a degree-6 polynomial, 2^n built in the exponent
+ * bits. Inputs are clamped to the finite float range. */
+#define NC_EXP_HI 88.3762626f
+#define NC_EXP_LO -87.3365448f
+#define NC_LOG2E 1.44269504088896341f
+#define NC_LN2_HI 0.693359375f
+#define NC_LN2_LO -2.12194440e-4f
+#define NC_EXP_P0 1.9875691500e-4f
+#define NC_EXP_P1 1.3981999507e-3f
+#define NC_EXP_P2 8.3334519073e-3f
+#define NC_EXP_P3 4.1665795894e-2f
+#define NC_EXP_P4 1.6666665459e-1f
+#define NC_EXP_P5 5.0000001201e-1f
+/* tanh: odd Taylor polynomial below |x| < 0.25 (no cancellation), else
+ * (1 - e) / (1 + e) with e = exp(-2|x|) */
+#define NC_TANH_SMALL 0.25f
+#define NC_TANH_T3 -0.333333333f
+#define NC_TANH_T5 0.133333333f
+#define NC_TANH_T7 -0.053968254f
+#define NC_TANH_T9 0.021869489f
+
+NC_AVX2 static inline __m256 exp8(__m256 x) {
+    x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(NC_EXP_LO)), _mm256_set1_ps(NC_EXP_HI));
+    __m256 fx = _mm256_floor_ps(_mm256_fmadd_ps(x, _mm256_set1_ps(NC_LOG2E), _mm256_set1_ps(0.5f)));
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(NC_LN2_HI), x);
+    x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(NC_LN2_LO), x);
+    __m256 y = _mm256_set1_ps(NC_EXP_P0);
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(NC_EXP_P1));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(NC_EXP_P2));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(NC_EXP_P3));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(NC_EXP_P4));
+    y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(NC_EXP_P5));
+    y = _mm256_fmadd_ps(y, _mm256_mul_ps(x, x), _mm256_add_ps(x, _mm256_set1_ps(1.0f)));
+    __m256i n = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127)), 23);
+    return _mm256_mul_ps(y, _mm256_castsi256_ps(n));
+}
+
+NC_AVX2 static inline __m256 sigmoid8(__m256 x) {
+    __m256 one = _mm256_set1_ps(1.0f);
+    return _mm256_div_ps(one, _mm256_add_ps(one, exp8(_mm256_sub_ps(_mm256_setzero_ps(), x))));
+}
+
+NC_AVX2 static inline __m256 tanh8(__m256 x) {
+    __m256 sign = _mm256_set1_ps(-0.0f), one = _mm256_set1_ps(1.0f);
+    __m256 ax = _mm256_andnot_ps(sign, x);
+    __m256 e = exp8(_mm256_mul_ps(ax, _mm256_set1_ps(-2.0f)));
+    __m256 big = _mm256_div_ps(_mm256_sub_ps(one, e), _mm256_add_ps(one, e));
+    big = _mm256_or_ps(big, _mm256_and_ps(sign, x)); /* copy the sign of x */
+    __m256 z = _mm256_mul_ps(x, x);
+    __m256 p = _mm256_fmadd_ps(_mm256_set1_ps(NC_TANH_T9), z, _mm256_set1_ps(NC_TANH_T7));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps(NC_TANH_T5));
+    p = _mm256_fmadd_ps(p, z, _mm256_set1_ps(NC_TANH_T3));
+    p = _mm256_fmadd_ps(_mm256_mul_ps(p, z), x, x);
+    return _mm256_blendv_ps(big, p, _mm256_cmp_ps(ax, _mm256_set1_ps(NC_TANH_SMALL), _CMP_LT_OQ));
+}
+
+/* erf: rational approximation in t = 1 / (1 + p|x|) times exp(-x^2)
+ * (1.5e-7 in exact arithmetic, <= 5e-7 in float), sign restored afterwards */
+#define NC_ERF_P 0.3275911f
+#define NC_ERF_A1 0.254829592f
+#define NC_ERF_A2 -0.284496736f
+#define NC_ERF_A3 1.421413741f
+#define NC_ERF_A4 -1.453152027f
+#define NC_ERF_A5 1.061405429f
+
+NC_AVX2 static inline __m256 erf8(__m256 x) {
+    __m256 sign = _mm256_set1_ps(-0.0f), one = _mm256_set1_ps(1.0f);
+    __m256 ax = _mm256_andnot_ps(sign, x);
+    __m256 t = _mm256_div_ps(one, _mm256_fmadd_ps(ax, _mm256_set1_ps(NC_ERF_P), one));
+    __m256 p = _mm256_fmadd_ps(_mm256_set1_ps(NC_ERF_A5), t, _mm256_set1_ps(NC_ERF_A4));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(NC_ERF_A3));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(NC_ERF_A2));
+    p = _mm256_fmadd_ps(p, t, _mm256_set1_ps(NC_ERF_A1));
+    __m256 e = exp8(_mm256_sub_ps(_mm256_setzero_ps(), _mm256_mul_ps(ax, ax)));
+    __m256 r = _mm256_fnmadd_ps(_mm256_mul_ps(p, t), e, one);
+    return _mm256_or_ps(r, _mm256_and_ps(sign, x));
+}
+
+/* The tail goes through the same vector code (padded), so every element gets
+ * the same arithmetic regardless of its position. */
+#define MAP8(nm, fn)                                                       \
+    NC_AVX2 static void nm(int64_t n, const float *x, float *y) {          \
+        int64_t i = 0;                                                     \
+        for (; i + 8 <= n; i += 8) _mm256_storeu_ps(y + i, fn(_mm256_loadu_ps(x + i))); \
+        if (i < n) {                                                       \
+            float buf[8] = {0};                                            \
+            memcpy(buf, x + i, (size_t)(n - i) * sizeof(float));           \
+            _mm256_storeu_ps(buf, fn(_mm256_loadu_ps(buf)));               \
+            memcpy(y + i, buf, (size_t)(n - i) * sizeof(float));           \
+        }                                                                  \
+    }
+MAP8(exp_f32, exp8)
+MAP8(sigmoid_f32, sigmoid8)
+MAP8(tanh_f32, tanh8)
+MAP8(erf_f32, erf8)
+#undef MAP8
 
 /* ------------------------------------------------------------------------ */
 /* GEMM, B not transposed: register-blocked R x 16 micro-tiles (R <= 4) over */
@@ -249,6 +348,10 @@ static const nc_kernels avx2_table = {
     .scale_f32 = scale_f32,
     .relu_f32 = relu_f32,
     .sum_f32 = sum_f32,
+    .exp_f32 = exp_f32,
+    .sigmoid_f32 = sigmoid_f32,
+    .tanh_f32 = tanh_f32,
+    .erf_f32 = erf_f32,
     .gemm_f32 = gemm_f32,
     .gemm_s8_nt = gemm_s8_nt,
 };

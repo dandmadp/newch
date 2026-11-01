@@ -4,6 +4,7 @@
 
 #if defined(__ARM_NEON) || defined(__ARM_NEON__)
 #include <arm_neon.h>
+#include <string.h>
 
 #if defined(__aarch64__)
 #define NC_FMA_N(acc, b, s) vfmaq_n_f32((acc), (b), (s))
@@ -65,6 +66,117 @@ static float sum_f32(int64_t n, const float *x) {
     for (; i < n; i++) s += x[i];
     return s;
 }
+
+
+/* exp: x = n ln2 + r, e^r by a degree-6 polynomial, 2^n built in the exponent
+ * bits. Inputs are clamped to the finite float range. */
+#define NC_EXP_HI 88.3762626f
+#define NC_EXP_LO -87.3365448f
+#define NC_LOG2E 1.44269504088896341f
+#define NC_LN2_HI 0.693359375f
+#define NC_LN2_LO -2.12194440e-4f
+#define NC_EXP_P0 1.9875691500e-4f
+#define NC_EXP_P1 1.3981999507e-3f
+#define NC_EXP_P2 8.3334519073e-3f
+#define NC_EXP_P3 4.1665795894e-2f
+#define NC_EXP_P4 1.6666665459e-1f
+#define NC_EXP_P5 5.0000001201e-1f
+/* tanh: odd Taylor polynomial below |x| < 0.25 (no cancellation), else
+ * (1 - e) / (1 + e) with e = exp(-2|x|) */
+#define NC_TANH_SMALL 0.25f
+#define NC_TANH_T3 -0.333333333f
+#define NC_TANH_T5 0.133333333f
+#define NC_TANH_T7 -0.053968254f
+#define NC_TANH_T9 0.021869489f
+
+static inline float32x4_t exp4(float32x4_t x) {
+    x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(NC_EXP_LO)), vdupq_n_f32(NC_EXP_HI));
+    float32x4_t fx = vmlaq_n_f32(vdupq_n_f32(0.5f), x, NC_LOG2E);
+    /* floor without vrndm (ARMv7): truncate, then step down where that rounded up */
+    float32x4_t t = vcvtq_f32_s32(vcvtq_s32_f32(fx));
+    uint32x4_t up = vcgtq_f32(t, fx);
+    fx = vsubq_f32(t, vreinterpretq_f32_u32(vandq_u32(up, vreinterpretq_u32_f32(vdupq_n_f32(1.0f)))));
+    x = vmlsq_n_f32(x, fx, NC_LN2_HI);
+    x = vmlsq_n_f32(x, fx, NC_LN2_LO);
+    float32x4_t y = vdupq_n_f32(NC_EXP_P0);
+    y = NC_FMA(vdupq_n_f32(NC_EXP_P1), y, x);
+    y = NC_FMA(vdupq_n_f32(NC_EXP_P2), y, x);
+    y = NC_FMA(vdupq_n_f32(NC_EXP_P3), y, x);
+    y = NC_FMA(vdupq_n_f32(NC_EXP_P4), y, x);
+    y = NC_FMA(vdupq_n_f32(NC_EXP_P5), y, x);
+    y = NC_FMA(vaddq_f32(x, vdupq_n_f32(1.0f)), y, vmulq_f32(x, x));
+    int32x4_t n = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(fx), vdupq_n_s32(127)), 23);
+    return vmulq_f32(y, vreinterpretq_f32_s32(n));
+}
+
+static inline float32x4_t div4(float32x4_t a, float32x4_t b) {
+#if defined(__aarch64__)
+    return vdivq_f32(a, b);
+#else
+    float32x4_t r = vrecpeq_f32(b); /* estimate + two Newton steps */
+    r = vmulq_f32(r, vrecpsq_f32(b, r));
+    r = vmulq_f32(r, vrecpsq_f32(b, r));
+    return vmulq_f32(a, r);
+#endif
+}
+
+static inline float32x4_t sigmoid4(float32x4_t x) {
+    float32x4_t one = vdupq_n_f32(1.0f);
+    return div4(one, vaddq_f32(one, exp4(vnegq_f32(x))));
+}
+
+static inline float32x4_t tanh4(float32x4_t x) {
+    float32x4_t one = vdupq_n_f32(1.0f), ax = vabsq_f32(x);
+    float32x4_t e = exp4(vmulq_n_f32(ax, -2.0f));
+    float32x4_t big = div4(vsubq_f32(one, e), vaddq_f32(one, e));
+    uint32x4_t sign = vandq_u32(vreinterpretq_u32_f32(x), vdupq_n_u32(0x80000000u));
+    big = vreinterpretq_f32_u32(vorrq_u32(vreinterpretq_u32_f32(big), sign));
+    float32x4_t z = vmulq_f32(x, x);
+    float32x4_t p = NC_FMA(vdupq_n_f32(NC_TANH_T7), vdupq_n_f32(NC_TANH_T9), z);
+    p = NC_FMA(vdupq_n_f32(NC_TANH_T5), p, z);
+    p = NC_FMA(vdupq_n_f32(NC_TANH_T3), p, z);
+    p = NC_FMA(x, vmulq_f32(p, z), x);
+    return vbslq_f32(vcltq_f32(ax, vdupq_n_f32(NC_TANH_SMALL)), p, big);
+}
+
+/* erf: rational approximation in t = 1 / (1 + p|x|) times exp(-x^2)
+ * (1.5e-7 in exact arithmetic, <= 5e-7 in float), sign restored afterwards */
+#define NC_ERF_P 0.3275911f
+#define NC_ERF_A1 0.254829592f
+#define NC_ERF_A2 -0.284496736f
+#define NC_ERF_A3 1.421413741f
+#define NC_ERF_A4 -1.453152027f
+#define NC_ERF_A5 1.061405429f
+
+static inline float32x4_t erf4(float32x4_t x) {
+    float32x4_t one = vdupq_n_f32(1.0f), ax = vabsq_f32(x);
+    float32x4_t t = div4(one, NC_FMA(one, ax, vdupq_n_f32(NC_ERF_P)));
+    float32x4_t p = NC_FMA(vdupq_n_f32(NC_ERF_A4), vdupq_n_f32(NC_ERF_A5), t);
+    p = NC_FMA(vdupq_n_f32(NC_ERF_A3), p, t);
+    p = NC_FMA(vdupq_n_f32(NC_ERF_A2), p, t);
+    p = NC_FMA(vdupq_n_f32(NC_ERF_A1), p, t);
+    float32x4_t e = exp4(vnegq_f32(vmulq_f32(ax, ax)));
+    float32x4_t r = vsubq_f32(one, vmulq_f32(vmulq_f32(p, t), e));
+    uint32x4_t sign = vandq_u32(vreinterpretq_u32_f32(x), vdupq_n_u32(0x80000000u));
+    return vreinterpretq_f32_u32(vorrq_u32(vreinterpretq_u32_f32(r), sign));
+}
+
+#define MAP4(nm, fn)                                                        \
+    static void nm(int64_t n, const float *x, float *y) {                   \
+        int64_t i = 0;                                                      \
+        for (; i + 4 <= n; i += 4) vst1q_f32(y + i, fn(vld1q_f32(x + i)));  \
+        if (i < n) {                                                        \
+            float buf[4] = {0};                                             \
+            memcpy(buf, x + i, (size_t)(n - i) * sizeof(float));            \
+            vst1q_f32(buf, fn(vld1q_f32(buf)));                             \
+            memcpy(y + i, buf, (size_t)(n - i) * sizeof(float));            \
+        }                                                                   \
+    }
+MAP4(exp_f32, exp4)
+MAP4(sigmoid_f32, sigmoid4)
+MAP4(tanh_f32, tanh4)
+MAP4(erf_f32, erf4)
+#undef MAP4
 
 static inline void store4(float *c, float32x4_t acc, float alpha, float beta) {
     float32x4_t r = vmulq_n_f32(acc, alpha);
@@ -183,6 +295,10 @@ static const nc_kernels neon_table = {
     .scale_f32 = scale_f32,
     .relu_f32 = relu_f32,
     .sum_f32 = sum_f32,
+    .exp_f32 = exp_f32,
+    .sigmoid_f32 = sigmoid_f32,
+    .tanh_f32 = tanh_f32,
+    .erf_f32 = erf_f32,
     .gemm_f32 = gemm_f32,
 };
 

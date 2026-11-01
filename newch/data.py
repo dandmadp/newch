@@ -17,8 +17,8 @@ import random
 from pathlib import Path
 
 from . import _lib as L
-from .tensor import (Context, Tensor, _flatten, _is_numpy, default_context, float32, int8, int32, tensor,
-                     tensor_from_bytes)
+from .tensor import (Context, Tensor, _flatten, _is_numpy, _unsupported, default_context, float32, int8, int32,
+                     tensor, tensor_from_bytes)
 
 
 class Dataset:
@@ -185,11 +185,15 @@ class DataLoader:
     datasets are collated from ``__getitem__``.
     """
 
-    def __init__(self, dataset, batch_size: int = 1, shuffle: bool = False, drop_last: bool = False,
+    def __init__(self, dataset, batch_size: int = 1, shuffle: bool | None = None, sampler=None, batch_sampler=None,
+                 num_workers: int = 0, collate_fn=None, pin_memory: bool = False, drop_last: bool = False, *,
                  generator: random.Random | None = None, ctx: Context | None = None):
-        if batch_size < 1:
-            raise ValueError("batch_size must be >= 1")
-        self.dataset, self.batch_size, self.shuffle, self.drop_last = dataset, batch_size, shuffle, drop_last
+        _unsupported(sampler=(sampler, None), batch_sampler=(batch_sampler, None), num_workers=(num_workers, 0),
+                     pin_memory=(pin_memory, False))
+        if batch_size is None or batch_size < 1:
+            raise ValueError("batch_size must be a positive integer")
+        self.dataset, self.batch_size, self.shuffle, self.drop_last = dataset, batch_size, bool(shuffle), drop_last
+        self.collate_fn = collate_fn
         self.generator = generator or random.Random()
         self._ctx = ctx
 
@@ -206,7 +210,9 @@ class DataLoader:
         stop = len(order) - (len(order) % bs if self.drop_last else 0)
         for s in range(0, stop, bs):
             idx = order[s:s + bs]
-            if hasattr(self.dataset, "get_batch"):
+            if self.collate_fn is not None:
+                yield self.collate_fn([self.dataset[i] for i in idx])
+            elif hasattr(self.dataset, "get_batch"):
                 yield self.dataset.get_batch(idx, ctx)
             else:
                 yield _collate([self.dataset[i] for i in idx], ctx)

@@ -3,6 +3,8 @@
  * simple enough for compilers to auto-vectorize. */
 #include "../kernels.h"
 
+#include <math.h>
+
 static void add_f32(int64_t n, const float *a, const float *b, float *o) {
     for (int64_t i = 0; i < n; i++) o[i] = a[i] + b[i];
 }
@@ -36,6 +38,20 @@ static float sum_f32(int64_t n, const float *x) {
     }
     for (; i < n; i++) s0 += x[i];
     return (s0 + s1) + (s2 + s3);
+}
+
+static void exp_f32(int64_t n, const float *x, float *y) {
+    for (int64_t i = 0; i < n; i++) y[i] = expf(x[i]);
+}
+static void sigmoid_f32(int64_t n, const float *x, float *y) {
+    for (int64_t i = 0; i < n; i++) y[i] = 1.0f / (1.0f + expf(-x[i]));
+}
+static void tanh_f32(int64_t n, const float *x, float *y) {
+    for (int64_t i = 0; i < n; i++) y[i] = tanhf(x[i]);
+}
+
+static void erf_f32(int64_t n, const float *x, float *y) {
+    for (int64_t i = 0; i < n; i++) y[i] = erff(x[i]);
 }
 
 static void gemm_f32(int ta, int tb, int64_t M, int64_t N, int64_t K, float alpha,
@@ -121,6 +137,10 @@ static const nc_kernels ref_table = {
     .scale_f32 = scale_f32,
     .relu_f32 = relu_f32,
     .sum_f32 = sum_f32,
+    .exp_f32 = exp_f32,
+    .sigmoid_f32 = sigmoid_f32,
+    .tanh_f32 = tanh_f32,
+    .erf_f32 = erf_f32,
     .gemm_f32 = gemm_f32,
     .gemm_s8_nt = gemm_s8_nt,
 };

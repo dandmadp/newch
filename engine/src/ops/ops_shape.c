@@ -11,8 +11,9 @@ static void row_acc1(int64_t n, float *const *p, const int64_t *s, const void *u
 
 static nc_tensor *alias_with(nc_node *n, int ndim, const int64_t *shape, const int64_t *stride) {
     nc_tensor *src = n->in[0];
-    /* nc__apply only allows views in persistent mode of persistent inputs */
-    nc_tensor *t = nc__tensor_alias(src, nc__is_persistent_mode(src->ctx));
+    /* nc__apply never calls view() in persistent mode, so views are always
+     * temporaries (persistent tensors own their data) */
+    nc_tensor *t = nc__tensor_alias(src, 0);
     if (!t) return NULL;
     t->ndim = ndim;
     memcpy(t->shape, shape, sizeof(int64_t) * (size_t)ndim);

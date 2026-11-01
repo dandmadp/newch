@@ -5,6 +5,7 @@ from __future__ import annotations
 import array
 import contextlib
 import ctypes
+import warnings
 from typing import Sequence
 
 from . import _lib as L
@@ -357,6 +358,13 @@ class Tensor:
         np_dtype = {float32: np.float32, int32: np.int32, int8: np.int8}[self.dtype]
         return np.frombuffer(self._flat(), dtype=np_dtype).reshape(self.shape).copy()
 
+    def __array__(self, dtype=None, copy=None):
+        """numpy interop: np.asarray(t), np.array(t), np.stack([...]) (always a copy)."""
+        if copy is False:
+            raise ValueError("newch tensors cannot be shared with numpy without a copy")
+        arr = self.numpy()
+        return arr if dtype is None else arr.astype(dtype, copy=False)
+
     def __repr__(self) -> str:
         try:
             shape = self.shape
@@ -436,11 +444,11 @@ class Tensor:
         if dim not in (-1, self.ndim - 1):
             raise NotImplementedError(f"{what} is only implemented over the last dimension (dim=-1)")
 
-    def softmax(self, dim: int = -1):
+    def softmax(self, dim: int):
         self._last_dim(dim, "softmax")
         return self._w(lib.nc_softmax(self.ptr))
 
-    def log_softmax(self, dim: int = -1):
+    def log_softmax(self, dim: int):
         self._last_dim(dim, "log_softmax")
         return self._w(lib.nc_log_softmax(self.ptr))
 
@@ -456,10 +464,17 @@ class Tensor:
         """Maximum values (torch.amax). The gradient goes to the first maximum."""
         return self._reduce(lib.nc_max, dim, keepdim, axis)
 
-    def argmax(self, dim=None, *, axis=None):
+    def argmax(self, dim=None, keepdim: bool = False, *, axis=None):
         """Index of the maximum; flattened index when dim is None (as in PyTorch)."""
         dim = axis if dim is None else dim
-        return self._w(lib.nc_argmax(self.ptr, L.ALL_AXES if dim is None else int(dim)))
+        if keepdim and dim is None:
+            raise NotImplementedError("argmax(keepdim=True) needs a dim")
+        out = self._w(lib.nc_argmax(self.ptr, L.ALL_AXES if dim is None else int(dim)))
+        if keepdim:
+            shape = list(self.shape)
+            shape[int(dim) % len(shape)] = 1
+            out = out.reshape(*shape)
+        return out
 
     # ---- shape -----------------------------------------------------------
     def reshape(self, *shape):
@@ -551,7 +566,7 @@ def tensor(data, dtype: str | None = None, requires_grad: bool = False, ctx: Con
     Integer data becomes int32, anything with floats becomes float32.
     """
     if isinstance(data, Tensor):
-        if data.dtype == float32 and dtype in (None, float32):
+        if data.dtype == float32 and dtype in (None, float32) and ctx in (None, data.ctx):
             src = data.detach()  # must outlive the call: a persistent temp is freed on GC
             t = data.ctx.wrap(lib.nc_add_scalar(src.ptr, 0.0))  # engine-side copy
             if requires_grad:
@@ -582,14 +597,26 @@ def zeros(*shape, dtype: str = float32, ctx: Context | None = None) -> Tensor:
     return ctx.wrap(lib.nc_zeros(ctx._p, L.DTYPE_CODES[dtype], n, arr))
 
 
-def full(shape, value: float, ctx: Context | None = None) -> Tensor:
+def full(size, fill_value, *, dtype: str | None = None, ctx: Context | None = None) -> Tensor:
+    """Tensor filled with fill_value. dtype follows the value when not given (int -> int32)."""
+    if isinstance(fill_value, bool):
+        raise TypeError("bool tensors are not supported; use 0 / 1")
     ctx = _ctx(ctx)
-    n, arr = L.shape_arg(shape if isinstance(shape, (list, tuple)) else (shape,))
-    return ctx.wrap(lib.nc_full(ctx._p, float(value), n, arr))
+    size = tuple(size) if isinstance(size, (list, tuple)) else (size,)
+    if dtype is None:
+        dtype = int32 if isinstance(fill_value, int) else float32
+    if dtype == float32:
+        n, arr = L.shape_arg(size)
+        return ctx.wrap(lib.nc_full(ctx._p, float(fill_value), n, arr))
+    count = 1
+    for d in size:
+        count *= int(d)
+    buf = array.array(L.ARRAY_CODE[dtype], [int(fill_value)]) * count
+    return tensor_from_bytes(buf.tobytes(), size, dtype, ctx)
 
 
-def ones(*shape, ctx: Context | None = None) -> Tensor:
-    return full(_shape(shape), 1.0, ctx)
+def ones(*size, dtype: str = float32, ctx: Context | None = None) -> Tensor:
+    return full(_shape(size), 1, dtype=dtype, ctx=ctx)
 
 
 def randn(*shape, std: float = 1.0, ctx: Context | None = None) -> Tensor:
@@ -644,8 +671,58 @@ def tanh(x: Tensor) -> Tensor: return x.tanh()
 def exp(x: Tensor) -> Tensor: return x.exp()
 def log(x: Tensor) -> Tensor: return x.log()
 def sqrt(x: Tensor) -> Tensor: return x.sqrt()
-def softmax(x: Tensor, dim: int = -1) -> Tensor: return x.softmax(dim)
-def log_softmax(x: Tensor, dim: int = -1) -> Tensor: return x.log_softmax(dim)
+# Activations (torch.nn.functional names and arguments). Piecewise-linear ones
+# (leaky_relu, relu6, hardsigmoid, hardswish) need no exp, which matters on
+# small cores; silu and gelu cost one exp / erf / tanh per element.
+def leaky_relu(input: Tensor, negative_slope: float = 0.01, inplace: bool = False) -> Tensor:
+    _unsupported(inplace=(inplace, False))
+    return input._w(lib.nc_leaky_relu(input.ptr, float(negative_slope)))
+
+
+def relu6(input: Tensor, inplace: bool = False) -> Tensor:
+    _unsupported(inplace=(inplace, False))
+    return input._w(lib.nc_relu6(input.ptr))
+
+
+def hardsigmoid(input: Tensor, inplace: bool = False) -> Tensor:
+    _unsupported(inplace=(inplace, False))
+    return input._w(lib.nc_hardsigmoid(input.ptr))
+
+
+def hardswish(input: Tensor, inplace: bool = False) -> Tensor:
+    _unsupported(inplace=(inplace, False))
+    return input._w(lib.nc_hardswish(input.ptr))
+
+
+def silu(input: Tensor, inplace: bool = False) -> Tensor:
+    _unsupported(inplace=(inplace, False))
+    return input._w(lib.nc_silu(input.ptr))
+
+
+def gelu(input: Tensor, approximate: str = "none") -> Tensor:
+    """x * Phi(x): exact (erf) by default, approximate="tanh" for the tanh form."""
+    if approximate not in ("none", "tanh"):
+        raise ValueError(f"approximate must be 'none' or 'tanh', got {approximate!r}")
+    return input._w(lib.nc_gelu(input.ptr, int(approximate == "tanh")))
+
+
+def _implicit_dim(x: Tensor, dim, name: str) -> int:
+    if dim is not None:
+        return dim
+    # PyTorch's legacy rule when dim is omitted (it warns as well)
+    warnings.warn(f"{name}() without dim picks an axis implicitly; pass dim explicitly", stacklevel=3)
+    return 0 if x.ndim in (0, 1, 3) else 1
+
+
+def softmax(input: Tensor, dim=None) -> Tensor: return input.softmax(_implicit_dim(input, dim, "softmax"))
+def log_softmax(input: Tensor, dim=None) -> Tensor: return input.log_softmax(_implicit_dim(input, dim, "log_softmax"))
+
+
+def _unsupported(**kwargs) -> None:
+    """Raises for arguments that exist in the original API but are not implemented here."""
+    for name, (value, default) in kwargs.items():
+        if value != default:
+            raise NotImplementedError(f"{name}={value!r} is not supported (only {default!r})")
 
 
 def _pair(v, name: str) -> tuple:
@@ -659,31 +736,41 @@ def _pair(v, name: str) -> tuple:
     return v
 
 
-def conv2d(x: Tensor, weight: Tensor, bias: Tensor | None = None, stride=1, padding=0) -> Tensor:
-    """NCHW convolution (torch.nn.functional.conv2d without dilation/groups)."""
+def conv2d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride=1, padding=0, dilation=1,
+           groups: int = 1) -> Tensor:
+    """NCHW convolution (torch.nn.functional.conv2d); dilation and groups must be 1."""
+    _unsupported(dilation=(_pair(dilation, "dilation"), (1, 1)), groups=(groups, 1))
     (sh, sw), (ph, pw) = _pair(stride, "stride"), _pair(padding, "padding")
-    return x._w(lib.nc_conv2d(x.ptr, weight.ptr, bias.ptr if bias is not None else None, sh, sw, ph, pw))
+    return input._w(lib.nc_conv2d(input.ptr, weight.ptr, bias.ptr if bias is not None else None, sh, sw, ph, pw))
 
 
-def max_pool2d(x: Tensor, kernel_size, stride=None, padding=0) -> Tensor:
+def _window(kernel_size, stride, padding):
     (kh, kw) = _pair(kernel_size, "kernel_size")
-    (sh, sw) = _pair(stride if stride is not None else kernel_size, "stride")
+    (sh, sw) = _pair(stride if stride not in (None, (), []) else kernel_size, "stride")
     (ph, pw) = _pair(padding, "padding")
-    return x._w(lib.nc_max_pool2d(x.ptr, kh, kw, sh, sw, ph, pw))
+    return kh, kw, sh, sw, ph, pw
 
 
-def avg_pool2d(x: Tensor, kernel_size, stride=None, padding=0) -> Tensor:
+def max_pool2d(input: Tensor, kernel_size, stride=None, padding=0, dilation=1, ceil_mode: bool = False,
+               return_indices: bool = False) -> Tensor:
+    _unsupported(dilation=(_pair(dilation, "dilation"), (1, 1)), ceil_mode=(ceil_mode, False),
+                 return_indices=(return_indices, False))
+    return input._w(lib.nc_max_pool2d(input.ptr, *_window(kernel_size, stride, padding)))
+
+
+def avg_pool2d(input: Tensor, kernel_size, stride=None, padding=0, ceil_mode: bool = False,
+               count_include_pad: bool = True, divisor_override=None) -> Tensor:
     """Average pooling; padded cells count toward the average (count_include_pad=True)."""
-    (kh, kw) = _pair(kernel_size, "kernel_size")
-    (sh, sw) = _pair(stride if stride is not None else kernel_size, "stride")
-    (ph, pw) = _pair(padding, "padding")
-    return x._w(lib.nc_avg_pool2d(x.ptr, kh, kw, sh, sw, ph, pw))
+    _unsupported(ceil_mode=(ceil_mode, False), count_include_pad=(count_include_pad, True),
+                 divisor_override=(divisor_override, None))
+    return input._w(lib.nc_avg_pool2d(input.ptr, *_window(kernel_size, stride, padding)))
 
 
-def dropout(x: Tensor, p: float = 0.5, training: bool = True) -> Tensor:
+def dropout(input: Tensor, p: float = 0.5, training: bool = True, inplace: bool = False) -> Tensor:
+    _unsupported(inplace=(inplace, False))
     if not training:
-        return x
-    return x._w(lib.nc_dropout(x.ptr, float(p)))
+        return input
+    return input._w(lib.nc_dropout(input.ptr, float(p)))
 
 
 def batch_norm(x: Tensor, running_mean: Tensor, running_var: Tensor, weight: Tensor | None = None,
@@ -704,16 +791,40 @@ def linear(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
     return x._w(lib.nc_linear_fn(x.ptr, weight.ptr, bias.ptr if bias is not None else None))
 
 
-def cross_entropy(logits: Tensor, labels) -> Tensor:
-    """Mean cross-entropy; logits [N, C] float32, labels [N] int32."""
-    if not isinstance(labels, Tensor):
-        labels = tensor(labels, dtype=int32, ctx=logits.ctx)
-    return logits._w(lib.nc_cross_entropy(logits.ptr, labels.ptr))
+def cross_entropy(input: Tensor, target, weight=None, size_average=None, ignore_index: int = -100, reduce=None,
+                  reduction: str = "mean", label_smoothing: float = 0.0) -> Tensor:
+    """Cross-entropy of logits input [N, C] and int32 class indices target [N].
+
+    reduction "mean" or "sum"; label_smoothing mixes in the uniform distribution.
+    Labels outside [0, C) raise (so ignore_index only works as the default -100).
+    """
+    _unsupported(weight=(weight, None), size_average=(size_average, None), reduce=(reduce, None),
+                 ignore_index=(ignore_index, -100))
+    if reduction not in ("mean", "sum"):
+        raise NotImplementedError(f"reduction={reduction!r} is not supported (use 'mean' or 'sum')")
+    if not isinstance(target, Tensor):
+        target = tensor(target, dtype=int32, ctx=input.ctx)
+    loss = input._w(lib.nc_cross_entropy(input.ptr, target.ptr))
+    if label_smoothing:
+        if not 0.0 <= label_smoothing <= 1.0:
+            raise ValueError("label_smoothing must be in [0, 1]")
+        uniform = (input.log_softmax(-1).mean(-1)).mean() * -1.0  # mean over classes and rows
+        loss = loss * (1.0 - label_smoothing) + uniform * label_smoothing
+    return loss * float(target.shape[0]) if reduction == "sum" else loss
 
 
-def mse_loss(pred: Tensor, target) -> Tensor:
-    target = pred._other(target)
-    return pred._w(lib.nc_mse_loss(pred.ptr, target.ptr))
+def mse_loss(input: Tensor, target, size_average=None, reduce=None, reduction: str = "mean") -> Tensor:
+    """Squared error with reduction "mean", "sum" or "none"."""
+    _unsupported(size_average=(size_average, None), reduce=(reduce, None))
+    target = input._other(target)
+    if reduction == "mean":
+        return input._w(lib.nc_mse_loss(input.ptr, target.ptr))
+    d = input - target
+    if reduction == "sum":
+        return (d * d).sum()
+    if reduction == "none":
+        return d * d
+    raise ValueError(f"unknown reduction {reduction!r}")
 
 
 # --------------------------------------------------------------------------

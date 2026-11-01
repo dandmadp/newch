@@ -186,6 +186,13 @@ static nc_tensor *f_tanh(nc_tensor **x, nc_tensor *a) { (void)a; return nc_tanh(
 static nc_tensor *f_scale(nc_tensor **x, nc_tensor *a) { (void)a; return nc_scale(x[0], -1.5f); }
 static nc_tensor *f_adds(nc_tensor **x, nc_tensor *a) { (void)a; return nc_add_scalar(x[0], 0.7f); }
 static nc_tensor *f_pow(nc_tensor **x, nc_tensor *a) { (void)a; return nc_pow_scalar(x[0], 1.5f); }
+static nc_tensor *f_leaky(nc_tensor **x, nc_tensor *a) { (void)a; return nc_leaky_relu(x[0], 0.1f); }
+static nc_tensor *f_relu6(nc_tensor **x, nc_tensor *a) { (void)a; return nc_relu6(x[0]); }
+static nc_tensor *f_hsig(nc_tensor **x, nc_tensor *a) { (void)a; return nc_hardsigmoid(x[0]); }
+static nc_tensor *f_hswish(nc_tensor **x, nc_tensor *a) { (void)a; return nc_hardswish(x[0]); }
+static nc_tensor *f_silu(nc_tensor **x, nc_tensor *a) { (void)a; return nc_silu(x[0]); }
+static nc_tensor *f_gelu(nc_tensor **x, nc_tensor *a) { (void)a; return nc_gelu(x[0], 0); }
+static nc_tensor *f_gelu_t(nc_tensor **x, nc_tensor *a) { (void)a; return nc_gelu(x[0], 1); }
 static nc_tensor *f_matmul(nc_tensor **x, nc_tensor *a) { (void)a; return nc_matmul(x[0], x[1]); }
 static nc_tensor *f_matmul_tt(nc_tensor **x, nc_tensor *a) {
     (void)a; /* both operands as transposed views */
@@ -279,6 +286,27 @@ static void test_gradcheck(void) {
     GC1("scale", f_scale, 0, 2, 3);
     GC1("add_scalar", f_adds, 0, 2, 3);
     GC1("pow", f_pow, 1, 2, 3);
+    {
+        /* every linear piece of the activations, but no value within 0.05 of a kink */
+        static const float act_in[12] = {-7.1f, -4.2f, -3.3f, -2.6f, -1.1f, -0.4f, 0.3f, 1.4f, 2.7f, 3.4f, 5.2f, 7.3f};
+        nc_tensor *ai[1] = {nc_parameter(ctx, nc_from_data(ctx, NC_F32, act_in, 1, SHAPE(12)), 1, SHAPE(12))};
+        gradcheck_case(ctx, "leaky_relu", f_leaky, NULL, 1, ai);
+        gradcheck_case(ctx, "relu6", f_relu6, NULL, 1, ai);
+        gradcheck_case(ctx, "hardsigmoid", f_hsig, NULL, 1, ai);
+        gradcheck_case(ctx, "hardswish", f_hswish, NULL, 1, ai);
+        gradcheck_case(ctx, "silu", f_silu, NULL, 1, ai);
+        gradcheck_case(ctx, "gelu", f_gelu, NULL, 1, ai);
+        gradcheck_case(ctx, "gelu tanh", f_gelu_t, NULL, 1, ai);
+        /* known values */
+        float v[3] = {-1.0f, 0.5f, 4.0f};
+        nc_tensor *t = nc_from_data(ctx, NC_F32, v, 1, SHAPE(3));
+        CHECK_NEAR(nc_get(nc_hardswish(t), SHAPE(1)), 0.5 * 3.5 / 6.0, 1e-6);
+        CHECK_NEAR(nc_get(nc_relu6(t), SHAPE(2)), 4.0, 0);
+        CHECK_NEAR(nc_get(nc_gelu(t, 0), SHAPE(0)), -0.15865525, 1e-6);
+        CHECK_NEAR(nc_get(nc_gelu(t, 1), SHAPE(0)), -0.15880801, 1e-6);
+        CHECK_NEAR(nc_get(nc_silu(t), SHAPE(1)), 0.5 / (1.0 + exp(-0.5)), 1e-6);
+        nc_step_end(ctx);
+    }
 
     in[0] = gparam(ctx, 0, 2, SHAPE(4, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(3, 5));
     gradcheck_case(ctx, "matmul", f_matmul, NULL, 2, in);
@@ -404,10 +432,11 @@ static void test_release(void) {
     nc_backward(nc_sum(p, NC_ALL_AXES, 0)); /* creates a persistent grad */
     nc_step_end(ctx);
     nc_persistent_begin(ctx);
-    nc_tensor *v = nc_reshape(p, 1, SHAPE(256)); /* persistent view */
+    nc_tensor *v = nc_reshape(p, 1, SHAPE(256)); /* persistent mode: a copy, never a view */
     nc_persistent_end(ctx);
     CHECK(nc_is_persistent(p) && nc_is_persistent(v) && nc_grad(p));
-    nc_release(v); /* view: frees only its header */
+    CHECK(nc_data_f32(v) != nc_data_f32(p));
+    nc_release(v); /* frees the copy only */
     CHECK_NEAR(nc_get(p, SHAPE(3, 3)), 0, 0);
     nc_release(p);
     CHECK(nc_get_mem_stats(ctx).persistent_bytes == base);
@@ -429,7 +458,7 @@ static void test_kernel_parity(void) {
     const nc_kernels *ref = nc__kernels_ref(), *k = ctx->k;
     printf("    backend: %s (arch %s, neon %d, dotprod %d, fp16 %d, cores %d/%d big)\n", k->name,
            nc_cpu(ctx)->arch, nc_cpu(ctx)->has_neon, nc_cpu(ctx)->has_dotprod, nc_cpu(ctx)->has_fp16,
-           nc_cpu(ctx)->n_big_cores, nc_cpu(ctx)->n_cores);
+           nc_cpu(ctx)->n_cores, nc_cpu(ctx)->n_big_cores);
     enum { M = 13, N = 19, K = 11 };
     float A[M * K], B[K * N], C0[M * N], C1[M * N], x[37], y0[37], y1[37];
     for (int i = 0; i < M * K; i++) A[i] = nc__rand_normal(ctx);
@@ -452,6 +481,42 @@ static void test_kernel_parity(void) {
     CHECK_NEAR(ref->sum_f32(37, x), k->sum_f32(37, x), 1e-4);
     k->relu_f32(37, x, y1);
     for (int i = 0; i < 37; i++) CHECK_NEAR(y1[i], x[i] > 0 ? x[i] : 0, 0);
+
+    /* transcendental kernels over a wide range, including the clamp edges
+     * and the small-|x| branch of tanh */
+    enum { NT = 203 };
+    float tx[NT], r0[NT], r1[NT];
+    for (int i = 0; i < NT; i++) tx[i] = -100.0f + 200.0f * (float)i / (NT - 1);
+    tx[0] = 0.0f, tx[1] = 1e-6f, tx[2] = -0.2f, tx[3] = 0.249f, tx[4] = 0.251f;
+    float worst[3] = {0, 0, 0};
+    for (int f = 0; f < 3; f++) {
+        void (*rf)(int64_t, const float *, float *) = f == 0 ? ref->exp_f32 : f == 1 ? ref->sigmoid_f32 : ref->tanh_f32;
+        void (*kf)(int64_t, const float *, float *) = f == 0 ? k->exp_f32 : f == 1 ? k->sigmoid_f32 : k->tanh_f32;
+        rf(NT, tx, r0);
+        kf(NT, tx, r1);
+        for (int i = 0; i < NT; i++) {
+            if (f < 2 && (tx[i] > 88.0f || tx[i] < -87.0f)) continue; /* exp argument outside the float range */
+            float err = fabsf(r0[i] - r1[i]) / fmaxf(fabsf(r0[i]), 1e-30f);
+            if (!(err <= worst[f])) worst[f] = err;
+            CHECK(isfinite(r1[i]));
+        }
+    }
+    printf("    exp/sigmoid/tanh max rel err vs libm: %.2g %.2g %.2g\n", worst[0], worst[1], worst[2]);
+    CHECK(worst[0] < 1e-6f && worst[1] < 1e-6f && worst[2] < 1e-5f);
+    ref->erf_f32(NT, tx, r0);
+    k->erf_f32(NT, tx, r1);
+    float erf_abs = 0;
+    for (int i = 0; i < NT; i++) erf_abs = fmaxf(erf_abs, fabsf(r0[i] - r1[i]));
+    for (int i = 0; i < 40; i++) { /* dense around the curved part */
+        float v = -4.0f + 0.2f * (float)i, a, b;
+        ref->erf_f32(1, &v, &a);
+        k->erf_f32(1, &v, &b);
+        erf_abs = fmaxf(erf_abs, fabsf(a - b));
+    }
+    printf("    erf max abs err vs libm: %.2g\n", erf_abs);
+    CHECK(erf_abs < 5e-7f);
+    k->tanh_f32(1, (float[]){1e-6f}, r1); /* no cancellation near zero */
+    CHECK_NEAR(r1[0], 1e-6, 1e-12);
     nc_free_ctx(ctx);
 }
 
@@ -644,7 +709,9 @@ static void test_save_load(void) {
 static void test_threads(void) {
     /* every output element is computed by one thread: bit-identical results */
     float *r[2] = {NULL, NULL};
-    enum { M = 129, K = 300, N = 257 };
+    /* SN: wide enough that 3 x K x SN crosses the parallel threshold with M < N,
+     * so nc__gemm splits columns, in chunks that are not multiples of 16. */
+    enum { M = 129, K = 300, N = 257, SN = 4099 };
     for (int pass = 0; pass < 2; pass++) {
         nc_config cfg = {0};
         cfg.seed = 99;
@@ -653,15 +720,16 @@ static void test_threads(void) {
         CHECK(nc_num_threads(ctx) == cfg.threads);
         nc_tensor *a = nc_randn(ctx, 1.0f, 2, SHAPE(M, K)), *b = nc_randn(ctx, 1.0f, 2, SHAPE(K, N));
         nc_tensor *c = nc_matmul(a, b), *ct = nc_matmul(nc_transpose(b, 0, 1), nc_transpose(a, 0, 1));
-        nc_tensor *small = nc_matmul(nc_randn(ctx, 1.0f, 2, SHAPE(2, K)), b); /* column split path */
-        r[pass] = (float *)malloc(sizeof(float) * (M * N * 2 + 2 * N));
+        nc_tensor *wide = nc_randn(ctx, 1.0f, 2, SHAPE(K, SN));
+        nc_tensor *small = nc_matmul(nc_randn(ctx, 1.0f, 2, SHAPE(3, K)), wide); /* column split path */
+        r[pass] = (float *)malloc(sizeof(float) * (M * N * 2 + 3 * SN));
         memcpy(r[pass], nc_data_f32(c), sizeof(float) * M * N);
         memcpy(r[pass] + M * N, nc_data_f32(nc_contiguous(ct)), sizeof(float) * M * N);
-        memcpy(r[pass] + 2 * M * N, nc_data_f32(small), sizeof(float) * 2 * N);
+        memcpy(r[pass] + 2 * M * N, nc_data_f32(small), sizeof(float) * 3 * SN);
         CHECK(nc_ok(ctx));
         nc_free_ctx(ctx);
     }
-    CHECK(memcmp(r[0], r[1], sizeof(float) * (M * N * 2 + 2 * N)) == 0);
+    CHECK(memcmp(r[0], r[1], sizeof(float) * (M * N * 2 + 3 * SN)) == 0);
     free(r[0]);
     free(r[1]);
 }
@@ -675,6 +743,75 @@ static void test_arena_trim(void) {
     CHECK(nc_get_mem_stats(ctx).arena_bytes_reserved == 0);
     nc_tensor *t = nc_full(ctx, 3.0f, 1, SHAPE(8)); /* arena re-grows */
     CHECK(t && nc_data_f32(t)[7] == 3.0f);
+    nc_free_ctx(ctx);
+}
+
+static void test_optim_extras(void) {
+    nc_ctx *ctx = new_ctx();
+    float wv[3] = {1.0f, -2.0f, 0.5f};
+
+    /* AdamW step 1: w * (1 - lr*wd) - lr * sign(g) (m/sqrt(v) = sign(g) at t=1) */
+    nc_tensor *w = nc_parameter(ctx, T(ctx, wv, 3), 1, SHAPE(3));
+    nc_optim *aw = nc_adamw(ctx, &w, 1, (nc_optim_opts){.lr = 0.1f, .weight_decay = 0.5f});
+    nc_backward(nc_sum(nc_scale(w, 2.0f), NC_ALL_AXES, 0)); /* g = 2 */
+    nc_optim_step(aw);
+    for (int i = 0; i < 3; i++) CHECK_NEAR(nc_data_f32(w)[i], wv[i] * 0.95f - 0.1f, 1e-5);
+    nc_step_end(ctx);
+
+    /* accumulation over 2 steps == one step on the averaged gradient */
+    nc_tensor *a = nc_parameter(ctx, T(ctx, wv, 3), 1, SHAPE(3));
+    nc_tensor *b = nc_parameter(ctx, T(ctx, wv, 3), 1, SHAPE(3));
+    nc_optim *oa = nc_sgd(ctx, &a, 1, (nc_optim_opts){.lr = 0.1f});
+    nc_optim *ob = nc_sgd(ctx, &b, 1, (nc_optim_opts){.lr = 0.1f});
+    nc_optim_set_accumulation(oa, 2);
+    float k[2] = {1.0f, 3.0f};
+    for (int s = 0; s < 2; s++) {
+        nc_optim_zero_grad(oa);
+        nc_backward(nc_sum(nc_scale(a, k[s]), NC_ALL_AXES, 0));
+        nc_optim_step(oa);
+        if (s == 0) CHECK_NEAR(nc_data_f32(a)[0], wv[0], 0); /* no update yet */
+        nc_step_end(ctx);
+    }
+    nc_optim_zero_grad(ob);
+    nc_backward(nc_sum(nc_scale(b, 2.0f), NC_ALL_AXES, 0)); /* mean of 1 and 3 */
+    nc_optim_step(ob);
+    for (int i = 0; i < 3; i++) CHECK_NEAR(nc_data_f32(a)[i], nc_data_f32(b)[i], 1e-6);
+    nc_optim_zero_grad(oa); /* after an update, zero_grad clears again */
+    CHECK_NEAR(nc_data_f32(nc_grad(a))[0], 0, 0);
+    nc_step_end(ctx);
+    nc_optim_set_accumulation(oa, 0);
+    CHECK(nc_status_code(ctx) == NC_ERR_ARG);
+    nc_clear_error(ctx);
+
+    /* clear_grad: reads as absent, optimizer skips it, next backward starts at 0 */
+    nc_tensor *z = nc_parameter(ctx, T(ctx, wv, 3), 1, SHAPE(3));
+    nc_optim *oz = nc_sgd(ctx, &z, 1, (nc_optim_opts){.lr = 1.0f, .weight_decay = 1.0f});
+    nc_backward(nc_sum(z, NC_ALL_AXES, 0));
+    nc_optim_clear_grad(oz);
+    CHECK(nc_grad(z) == NULL);
+    nc_optim_step(oz); /* skipped: weight decay must not touch z */
+    CHECK_NEAR(nc_data_f32(z)[0], wv[0], 0);
+    nc_backward(nc_sum(nc_scale(z, 2.0f), NC_ALL_AXES, 0));
+    CHECK(nc_grad(z) && nc_data_f32(nc_grad(z))[1] == 2.0f); /* not 1 + 2 */
+    nc_step_end(ctx);
+
+    /* RMSprop step 1 from v = 0: g / (sqrt((1-a) g^2) + eps) = 1 / sqrt(1-a) */
+    nc_tensor *r = nc_parameter(ctx, T(ctx, wv, 3), 1, SHAPE(3));
+    nc_optim *orms = nc_rmsprop(ctx, &r, 1, (nc_optim_opts){.lr = 0.01f}, 0);
+    nc_backward(nc_sum(nc_scale(r, 3.0f), NC_ALL_AXES, 0));
+    nc_optim_step(orms);
+    CHECK_NEAR(nc_data_f32(r)[0], wv[0] - 0.01 / sqrt(0.01), 1e-4);
+    nc_step_end(ctx);
+
+    /* clip_grad_norm: grads (3, 4) -> norm 5, clipped to norm 1 */
+    float cv[2] = {0.0f, 0.0f}, gv[2] = {3.0f, 4.0f};
+    nc_tensor *c = nc_parameter(ctx, T(ctx, cv, 2), 1, SHAPE(2));
+    nc_backward(nc_sum(nc_mul(c, T(ctx, gv, 2)), NC_ALL_AXES, 0));
+    CHECK_NEAR(nc_clip_grad_norm(&c, 1, 1.0f), 5.0, 1e-5);
+    CHECK_NEAR(nc_data_f32(nc_grad(c))[1], 0.8, 1e-5);
+    CHECK_NEAR(nc_clip_grad_norm(&c, 1, 10.0f), 1.0, 1e-5); /* below max: unchanged */
+    CHECK_NEAR(nc_data_f32(nc_grad(c))[0], 0.6, 1e-5);
+    CHECK(nc_ok(ctx));
     nc_free_ctx(ctx);
 }
 
@@ -783,6 +920,7 @@ int main(void) {
         {"save_load", test_save_load},
         {"threads", test_threads},
         {"arena_trim", test_arena_trim},
+        {"optim_extras", test_optim_extras},
         {"registry", test_registry},
         {"train_spiral", test_train_spiral},
         {"train_regression_sgd", test_train_regression_sgd},
