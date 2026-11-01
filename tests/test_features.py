@@ -220,6 +220,7 @@ class TestMemory(Base):
         # must stay alive until the C call that uses them returns. Run with
         # NC_DEBUG_POISON=1 (tools/build.py does) so a regression reads garbage.
         base = nc.randn(3)
+        base_values = base.tolist()
         with nc.persistent():
             p = nc.tensor([1.0, 2.0, 3.0])
             copy = nc.tensor(base)                  # detach() temporary
@@ -228,7 +229,7 @@ class TestMemory(Base):
             rsub = [1.0, 1.0, 1.0] - p
             mse = nc.mse_loss(p, [1.0, 2.0, 5.0])
         nc.step_end()
-        self.assertEqual(copy.tolist(), [round(v, 7) for v in copy.tolist()])
+        self.assertEqual(copy.tolist(), base_values)
         self.assertEqual(added.tolist(), [11.0, 22.0, 33.0])
         self.assertEqual(prod.tolist(), [2.0, 4.0, 6.0])
         self.assertEqual(rsub.tolist(), [0.0, -1.0, -2.0])
