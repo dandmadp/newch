@@ -13,7 +13,8 @@ by a portable C engine. No Python dependencies (numpy is used if present).
 from . import callbacks, data, ml, net, optim
 from .net import Model, Module, Sequential, quantize_
 from .tensor import (Context, NcError, Tensor, avg_pool2d, batch_norm, conv2d, cross_entropy, default_context,
-                     gelu, hardsigmoid, hardswish, leaky_relu, relu6, silu,
+                     gelu, hardsigmoid, hardswish, leaky_relu, relu6, silu, argmax, cat, flatten, nll_loss,
+                     stack,
                      dropout, exp, float32, full, int8, int32, linear, load_tensors, log, log_softmax, manual_seed,
                      matmul, max_pool2d, mem_stats, mse_loss, no_grad, ones, parameter, persistent, rand, randn,
                      release, relu, save_tensors, set_default_context, sigmoid, softmax, sqrt, step_end, tanh, tensor,
@@ -23,6 +24,7 @@ __version__ = "0.3.0"
 
 __all__ = [
     "gelu", "hardsigmoid", "hardswish", "leaky_relu", "relu6", "silu",
+    "argmax", "cat", "flatten", "nll_loss", "stack",
     "Context", "Model", "Module", "NcError", "Sequential", "Tensor", "avg_pool2d", "batch_norm", "callbacks",
     "conv2d", "cross_entropy", "data", "default_context", "dropout", "exp", "float32", "full", "int8", "int32",
     "linear", "load_tensors", "log", "log_softmax", "manual_seed", "matmul", "max_pool2d", "mem_stats", "ml", "mse_loss",

@@ -217,7 +217,7 @@ NC_API nc_tensor *nc_matmul(nc_tensor *a, nc_tensor *b);
 NC_API nc_tensor *nc_linear_fn(nc_tensor *x, nc_tensor *weight, nc_tensor *bias);
 
 /* Reductions. axis may be NC_ALL_AXES. */
-NC_API nc_tensor *nc_sum(nc_tensor *x, int axis, int keepdim);
+NC_API nc_tensor *nc_sum(nc_tensor *x, int axis, int keepdim); /* f32, or i32 -> i32 (no grad) */
 NC_API nc_tensor *nc_mean(nc_tensor *x, int axis, int keepdim);
 NC_API nc_tensor *nc_max(nc_tensor *x, int axis, int keepdim); /* grad to first argmax */
 
@@ -253,10 +253,24 @@ NC_API nc_tensor *nc_softmax(nc_tensor *x);     /* over the last axis */
 /* logits: [N, C] f32, labels: [N] i32. Returns mean loss, shape []. */
 NC_API nc_tensor *nc_cross_entropy(nc_tensor *logits, nc_tensor *labels);
 NC_API nc_tensor *nc_mse_loss(nc_tensor *pred, nc_tensor *target);
+/* Negative log-likelihood of log-probabilities: logp [N, C] f32, labels [N]
+ * i32. sum = 0: mean over rows, 1: sum. Shape []. */
+NC_API nc_tensor *nc_nll_loss(nc_tensor *logp, nc_tensor *labels, int sum);
 
 /* Non-differentiable helpers. */
 NC_API nc_tensor *nc_argmax(nc_tensor *x, int axis); /* i32, axis removed */
 NC_API nc_tensor *nc_detach(nc_tensor *x);           /* shares data, no grad */
+
+/* Elementwise comparison with broadcasting; f32 or i32 inputs (mixed allowed,
+ * compared exactly). Result i32 0/1 (no bool dtype). */
+typedef enum { NC_CMP_EQ, NC_CMP_NE, NC_CMP_LT, NC_CMP_LE, NC_CMP_GT, NC_CMP_GE } nc_cmp;
+NC_API nc_tensor *nc_compare(nc_tensor *a, nc_tensor *b, nc_cmp op);
+/* Concatenates n tensors (1..6, same dtype, equal shapes except `axis`).
+ * Differentiable for f32. */
+NC_API nc_tensor *nc_cat(int n, nc_tensor *const *xs, int axis);
+/* Converts dtype (f32 <-> i32 <-> i8; float to int truncates toward zero).
+ * Converting to an integer type detaches: integer tensors carry no grad. */
+NC_API nc_tensor *nc_to_dtype(nc_tensor *x, nc_dtype dt);
 
 /* ------------------------------------------------------------------------ */
 /* Quantization (inference only)                                             */

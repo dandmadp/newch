@@ -37,13 +37,36 @@ history = model.fit(x, y, epochs=5, validation_split=0.1,
 loss, acc = model.evaluate(x_test, y_test)
 model.save_weights("model.ncw")          # 다른 기기에서 model.load_weights(...)
 
-# PyTorch 스타일
-opt = nc.optim.Adam(model.parameters(), lr=1e-3)
-for xb, yb in loader:
-    loss = nc.cross_entropy(model(xb), yb)
-    opt.zero_grad(); loss.backward(); opt.step()
-    nc.step_end()                         # 이 스텝의 임시 텐서를 한 번에 해제
 ```
+
+**PyTorch 스타일:** import만 바꾸면 일반적인 PyTorch 모델 코드가 그대로 돕니다 (모든 연산은 C 엔진에서 실행).
+
+```python
+import newch as torch
+import newch.net as nn
+import newch.net.functional as F
+
+class Net(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, 16, 3, 1, 1)
+        self.fc = nn.Linear(16 * 14 * 14, 10)
+
+    def forward(self, x):
+        x = F.max_pool2d(F.relu(self.conv1(x)), 2)
+        return F.log_softmax(self.fc(torch.flatten(x, 1)), dim=1)
+
+model = Net().to("cpu")
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+for data, target in loader:
+    optimizer.zero_grad()
+    loss = F.nll_loss(model(data), target)
+    loss.backward()
+    optimizer.step()
+    torch.step_end()                      # newch만의 한 줄: 이 스텝의 임시 텐서를 한 번에 해제
+```
+
+전체 학습·평가 루프는 [examples/mnist_torch_style.py](https://github.com/dandmadp/newch/blob/main/examples/mnist_torch_style.py)에 있습니다.
 
 **RAM보다 큰 데이터셋:** 샘플을 디스크 파일에 저장하고 `FileArray`로 열면 배치 단위로만 읽습니다.
 
@@ -153,9 +176,9 @@ engine/src/ops/            elementwise, linalg, reduce, shape, nn, conv, quant
 engine/src/kernels/        디스패치, ref/, neon/, x86/(AVX2)
 engine/src/runtime/        CPU 감지, 스레드 풀
 engine/tests/              C 테스트
-newch/                     Python 패키지 (tensor, net, optim, data, training, callbacks, ml)
+newch/                     Python 패키지 (tensor, net/{functional,init}, optim, data, training, callbacks, ml)
 tests/                     Python 테스트
-examples/                  train_spiral.c, mnist_cnn.py
+examples/                  train_spiral.c, mnist_cnn.py (Keras식), mnist_torch_style.py (PyTorch식)
 docs/                      PROGRESS.md (작업 요약), FORMAT.md (가중치 파일 포맷)
 tools/build.py             zig cc 기반 멀티 타깃 빌드
 .github/workflows/ci.yml   CI (Windows/Linux/macOS, QEMU ARM·RISC-V, 휠)

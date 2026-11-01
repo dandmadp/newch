@@ -252,3 +252,144 @@ nc_tensor *nc_index_select(nc_tensor *x, nc_tensor *idx) {
     nc_tensor *in[2] = {x, idx};
     return nc__apply(&nc_op_index_select, in, 2, NULL);
 }
+
+/* ------------------------------------------------------------------------ */
+/* cat: inputs viewed as [outer, len_k * inner]; output rows interleave them  */
+/* ------------------------------------------------------------------------ */
+
+static nc_status cat_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
+    nc_tensor *x0 = n->in[0];
+    int axis = nc__norm_axis((int)n->p.i[0], x0->ndim);
+    if (axis < 0) {
+        nc__error(x0->ctx, NC_ERR_ARG, "cat: dim %d out of range for %d-d tensors", (int)n->p.i[0], x0->ndim);
+        return NC_ERR_ARG;
+    }
+    n->p.i[0] = axis;
+    memcpy(shape, x0->shape, sizeof(int64_t) * (size_t)x0->ndim);
+    for (int k = 1; k < n->n_in; k++) {
+        nc_tensor *x = n->in[k];
+        int same = x->dtype == x0->dtype && x->ndim == x0->ndim;
+        for (int i = 0; same && i < x0->ndim; i++) same = i == axis || x->shape[i] == x0->shape[i];
+        if (!same) {
+            char sa[96], sb[96];
+            nc__error(x0->ctx, NC_ERR_SHAPE, "cat: %s %s and %s %s differ outside dim %d", nc__dtype_name(x0->dtype),
+                      nc__shape_str(x0->ndim, x0->shape, sa, sizeof sa), nc__dtype_name(x->dtype),
+                      nc__shape_str(x->ndim, x->shape, sb, sizeof sb), axis);
+            return NC_ERR_SHAPE;
+        }
+        shape[axis] += x->shape[axis];
+    }
+    *dt = x0->dtype;
+    *nd = x0->ndim;
+    return NC_OK;
+}
+
+static void cat_dims(const nc_node *n, int64_t *outer, int64_t *inner) {
+    const nc_tensor *x0 = n->in[0];
+    int axis = (int)n->p.i[0];
+    *outer = 1, *inner = 1;
+    for (int i = 0; i < axis; i++) *outer *= x0->shape[i];
+    for (int i = axis + 1; i < x0->ndim; i++) *inner *= x0->shape[i];
+}
+
+static nc_status cat_fwd(nc_node *n) {
+    nc_ctx *ctx = n->out->ctx;
+    int axis = (int)n->p.i[0];
+    size_t es = nc__dtype_size(n->out->dtype);
+    int64_t outer, inner;
+    cat_dims(n, &outer, &inner);
+    int64_t row_out = n->out->shape[axis] * inner, off = 0;
+    for (int k = 0; k < n->n_in; k++) {
+        nc_tensor *x = n->in[k];
+        const unsigned char *src = (const unsigned char *)x->data;
+        if (!nc_is_contiguous(x)) {
+            unsigned char *buf = (unsigned char *)nc__arena_alloc(ctx, (size_t)nc_numel(x) * es + 1);
+            if (!buf) return NC_ERR_OOM;
+            nc__copy_strided(x, buf);
+            src = buf;
+        }
+        int64_t row = x->shape[axis] * inner;
+        for (int64_t o = 0; o < outer; o++)
+            memcpy((unsigned char *)n->out->data + (size_t)(o * row_out + off) * es, src + (size_t)(o * row) * es,
+                   (size_t)row * es);
+        off += row;
+    }
+    return NC_OK;
+}
+
+static void cat_bwd(nc_node *n) {
+    int axis = (int)n->p.i[0];
+    int64_t outer, inner;
+    cat_dims(n, &outer, &inner);
+    int64_t row_out = n->out->shape[axis] * inner, off = 0;
+    const float *g = (const float *)n->out->grad->data;
+    for (int k = 0; k < n->n_in; k++) {
+        nc_tensor *x = n->in[k];
+        int64_t row = x->shape[axis] * inner;
+        nc_tensor *gx = nc__needs_grad(x) ? nc__grad_buf(x) : NULL;
+        if (gx)
+            for (int64_t o = 0; o < outer; o++)
+                x->ctx->k->axpy_f32(row, 1.0f, g + o * row_out + off, (float *)gx->data + o * row);
+        off += row;
+    }
+}
+
+const nc_op_def nc_op_cat = {"cat", 0, 0, cat_infer, NULL, cat_fwd, cat_bwd};
+
+nc_tensor *nc_cat(int n, nc_tensor *const *xs, int axis) {
+    if (n < 1 || n > NC_MAX_INPUTS) {
+        if (n > 0 && xs[0]) nc__error(xs[0]->ctx, NC_ERR_ARG, "cat: takes 1 to %d tensors, got %d", NC_MAX_INPUTS, n);
+        return NULL;
+    }
+    nc_op_params p;
+    memset(&p, 0, sizeof p);
+    p.i[0] = axis;
+    nc_tensor *in[NC_MAX_INPUTS];
+    for (int k = 0; k < n; k++) in[k] = xs[k];
+    return nc__apply(&nc_op_cat, in, n, &p);
+}
+
+/* ------------------------------------------------------------------------ */
+/* to_dtype                                                                  */
+/* ------------------------------------------------------------------------ */
+
+static nc_status to_dtype_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
+    nc_dtype to = (nc_dtype)n->p.i[0], from = n->in[0]->dtype;
+    if ((to != NC_F32 && to != NC_I32 && to != NC_I8) || (from != NC_F32 && from != NC_I32 && from != NC_I8)) {
+        nc__error(n->in[0]->ctx, NC_ERR_DTYPE, "to_dtype: %s -> %s is not supported", nc__dtype_name(from),
+                  nc__dtype_name(to));
+        return NC_ERR_DTYPE;
+    }
+    *dt = to;
+    return same_shape_infer(n, &from, nd, shape);
+}
+
+static double load_as_double(const void *p, nc_dtype dt, int64_t i) {
+    return dt == NC_F32 ? (double)((const float *)p)[i] : dt == NC_I32 ? (double)((const int32_t *)p)[i]
+                                                                       : (double)((const int8_t *)p)[i];
+}
+
+static nc_status to_dtype_fwd(nc_node *n) {
+    nc_tensor *x = n->in[0], *o = n->out;
+    void *src = nc__arena_alloc(o->ctx, (size_t)nc_numel(x) * nc__dtype_size(x->dtype) + 1);
+    if (!src) return NC_ERR_OOM;
+    nc__copy_strided(x, src);
+    for (int64_t i = 0, N = nc_numel(x); i < N; i++) {
+        double v = load_as_double(src, x->dtype, i);
+        if (o->dtype == NC_F32) ((float *)o->data)[i] = (float)v;
+        else if (o->dtype == NC_I32) ((int32_t *)o->data)[i] = (int32_t)v; /* truncates toward zero */
+        else ((int8_t *)o->data)[i] = (int8_t)(int32_t)v;
+    }
+    return NC_OK;
+}
+
+/* only f32 -> f32 can be on the tape (integer results are detached first) */
+const nc_op_def nc_op_to_dtype = {"to_dtype", 0, 0, to_dtype_infer, NULL, to_dtype_fwd, flat_bwd};
+
+nc_tensor *nc_to_dtype(nc_tensor *x, nc_dtype dt) {
+    if (x && dt != NC_F32) x = nc_detach(x);
+    nc_op_params p;
+    memset(&p, 0, sizeof p);
+    p.i[0] = dt;
+    return nc__apply(&nc_op_to_dtype, &x, 1, &p);
+}

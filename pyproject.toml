@@ -37,5 +37,5 @@ Documentation = "https://github.com/dandmadp/newch/blob/main/docs/PROGRESS.md"
 numpy = ["numpy"]
 
 [tool.setuptools]
-packages = ["newch"]
+packages = ["newch", "newch.net"]
 license-files = ["LICENSE", "NOTICE"]

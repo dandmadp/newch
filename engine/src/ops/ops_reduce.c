@@ -27,9 +27,10 @@ static red_dims get_dims(const nc_node *n) {
 
 static nc_status reduce_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
     nc_tensor *x = n->in[0];
-    if (!nc__expect_f32(n, 0)) return NC_ERR_DTYPE;
+    int int_sum = n->op->kind == RED_SUM && x->dtype == NC_I32; /* counting, e.g. sum of eq() */
+    if (!int_sum && !nc__expect_f32(n, 0)) return NC_ERR_DTYPE;
     int axis = (int)n->p.i[0], keep = (int)n->p.i[1];
-    *dt = n->op->kind == RED_ARGMAX ? NC_I32 : NC_F32;
+    *dt = (n->op->kind == RED_ARGMAX || int_sum) ? NC_I32 : NC_F32;
     if (axis == NC_ALL_AXES) {
         if (nc_numel(x) == 0 && n->op->kind >= RED_MAX) {
             nc__error(x->ctx, NC_ERR_SHAPE, "%s: reduction of an empty tensor", n->op->name);
@@ -59,6 +60,19 @@ static nc_status reduce_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape)
 static nc_status reduce_fwd(nc_node *n) {
     const nc_kernels *k = n->out->ctx->k;
     red_dims d = get_dims(n);
+    if (n->in[0]->dtype == NC_I32) { /* integer sum, accumulated in 64 bits */
+        int32_t *buf = (int32_t *)nc__arena_alloc(n->out->ctx, (size_t)(nc_numel(n->in[0]) + 1) * sizeof(int32_t));
+        if (!buf) return NC_ERR_OOM;
+        nc__copy_strided(n->in[0], buf);
+        int32_t *y = (int32_t *)n->out->data;
+        for (int64_t o = 0; o < d.outer; o++)
+            for (int64_t i = 0; i < d.inner; i++) {
+                int64_t s = 0;
+                for (int64_t r = 0; r < d.R; r++) s += buf[(o * d.R + r) * d.inner + i];
+                y[o * d.inner + i] = (int32_t)s;
+            }
+        return NC_OK;
+    }
     const float *x = nc__contig_f32(n->in[0]);
     if (!x) return NC_ERR_OOM;
     int kind = n->op->kind;

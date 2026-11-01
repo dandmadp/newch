@@ -339,3 +339,77 @@ nc_tensor *nc_silu(nc_tensor *x) { return unary(&nc_op_silu, x, 0); }
 nc_tensor *nc_gelu(nc_tensor *x, int approximate_tanh) {
     return unary(approximate_tanh ? &nc_op_gelu_tanh : &nc_op_gelu, x, 0);
 }
+
+/* ------------------------------------------------------------------------ */
+/* Comparisons -> i32 0/1. f32 and i32 are both 4 bytes, so nc__iterate's     */
+/* float pointers walk either; the row function reads them by dtype.          */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    int op;
+    nc_dtype da, db;
+} cmp_info;
+
+static void row_cmp(int64_t n, float *const *p, const int64_t *s, const void *u) {
+    const cmp_info *c = (const cmp_info *)u;
+    for (int64_t i = 0; i < n; i++) {
+        const float *pa = p[0] + i * s[0], *pb = p[1] + i * s[1];
+        double a = c->da == NC_I32 ? (double)*(const int32_t *)(const void *)pa : (double)*pa;
+        double b = c->db == NC_I32 ? (double)*(const int32_t *)(const void *)pb : (double)*pb;
+        int r = c->op == NC_CMP_EQ   ? a == b
+                : c->op == NC_CMP_NE ? a != b
+                : c->op == NC_CMP_LT ? a < b
+                : c->op == NC_CMP_LE ? a <= b
+                : c->op == NC_CMP_GT ? a > b
+                                     : a >= b;
+        *(int32_t *)(void *)(p[2] + i * s[2]) = r;
+    }
+}
+
+static nc_status compare_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
+    for (int k = 0; k < 2; k++) {
+        if (n->in[k]->dtype != NC_F32 && n->in[k]->dtype != NC_I32) {
+            nc__error(n->in[k]->ctx, NC_ERR_DTYPE, "compare: inputs must be f32 or i32, got %s",
+                      nc__dtype_name(n->in[k]->dtype));
+            return NC_ERR_DTYPE;
+        }
+    }
+    nc_tensor *a = n->in[0], *b = n->in[1];
+    int r = a->ndim > b->ndim ? a->ndim : b->ndim;
+    for (int i = 0; i < r; i++) {
+        int ia = i - (r - a->ndim), ib = i - (r - b->ndim);
+        int64_t da = ia < 0 ? 1 : a->shape[ia], db = ib < 0 ? 1 : b->shape[ib];
+        if (da != db && da != 1 && db != 1) {
+            char sa[96], sb[96];
+            nc__error(a->ctx, NC_ERR_SHAPE, "compare: shapes %s and %s are not broadcastable",
+                      nc__shape_str(a->ndim, a->shape, sa, sizeof sa), nc__shape_str(b->ndim, b->shape, sb, sizeof sb));
+            return NC_ERR_SHAPE;
+        }
+        shape[i] = da == 1 ? db : da;
+    }
+    *dt = NC_I32;
+    *nd = r;
+    return NC_OK;
+}
+
+static nc_status compare_fwd(nc_node *n) {
+    nc_tensor *a = n->in[0], *b = n->in[1], *o = n->out;
+    int64_t st[3][NC_MAX_DIMS];
+    nc__bcast_strides(a, o->ndim, o->shape, st[0]);
+    nc__bcast_strides(b, o->ndim, o->shape, st[1]);
+    memcpy(st[2], o->stride, sizeof st[2]);
+    float *base[3] = {(float *)a->data, (float *)b->data, (float *)o->data};
+    cmp_info c = {(int)n->p.i[0], a->dtype, b->dtype};
+    nc__iterate(3, base, (const int64_t(*)[NC_MAX_DIMS])st, o->ndim, o->shape, row_cmp, &c);
+    return NC_OK;
+}
+
+const nc_op_def nc_op_compare = {"compare", NC_OPF_NONDIFF, 0, compare_infer, NULL, compare_fwd, NULL};
+
+nc_tensor *nc_compare(nc_tensor *a, nc_tensor *b, nc_cmp op) {
+    nc_op_params p;
+    memset(&p, 0, sizeof p);
+    p.i[0] = op;
+    nc_tensor *in[2] = {a, b};
+    return nc__apply(&nc_op_compare, in, 2, &p);
+}

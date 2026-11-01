@@ -224,6 +224,14 @@ static nc_tensor *f_index(nc_tensor **x, nc_tensor *a) { return nc_index_select(
 static nc_tensor *f_logsm(nc_tensor **x, nc_tensor *a) { (void)a; return nc_log_softmax(x[0]); }
 static nc_tensor *f_sm(nc_tensor **x, nc_tensor *a) { (void)a; return nc_softmax(x[0]); }
 static nc_tensor *f_ce(nc_tensor **x, nc_tensor *a) { return nc_cross_entropy(x[0], a); }
+static nc_tensor *f_nll(nc_tensor **x, nc_tensor *a) { return nc_nll_loss(nc_log_softmax(x[0]), a, 0); }
+static nc_tensor *f_nll_sum(nc_tensor **x, nc_tensor *a) { return nc_nll_loss(nc_log_softmax(x[0]), a, 1); }
+static nc_tensor *f_cat(nc_tensor **x, nc_tensor *a) {
+    (void)a;
+    nc_tensor *parts[3] = {x[0], nc_transpose(x[1], 0, 1), x[0]}; /* strided input too */
+    return nc_cat(3, parts, 1);
+}
+static nc_tensor *f_to_f32(nc_tensor **x, nc_tensor *a) { (void)a; return nc_to_dtype(x[0], NC_F32); }
 static nc_tensor *f_mse(nc_tensor **x, nc_tensor *a) { (void)a; return nc_mse_loss(x[0], x[1]); }
 static nc_tensor *f_mlp(nc_tensor **x, nc_tensor *a) {
     nc_tensor *h = nc_tanh(nc_add(nc_matmul(x[0], x[1]), x[2]));
@@ -347,6 +355,40 @@ static void test_gradcheck(void) {
     gradcheck_case(ctx, "index_select", f_index, ridx, 1, in);
     in[0] = gparam(ctx, 0, 2, SHAPE(3, 2)), in[1] = gparam(ctx, 0, 2, SHAPE(3, 2));
     gradcheck_case(ctx, "mse_loss", f_mse, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 2, SHAPE(4, 5));
+    gradcheck_case(ctx, "nll_loss", f_nll, labels, 1, in);
+    gradcheck_case(ctx, "nll_loss sum", f_nll_sum, labels, 1, in);
+    in[0] = gparam(ctx, 0, 2, SHAPE(2, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(4, 2));
+    gradcheck_case(ctx, "cat", f_cat, NULL, 2, in);
+    gradcheck_case(ctx, "to_dtype f32", f_to_f32, NULL, 1, in);
+    {
+        /* nll_loss(log_softmax) == cross_entropy */
+        nc_tensor *lg = gparam(ctx, 0, 2, SHAPE(4, 5));
+        CHECK_NEAR(nc_item(nc_nll_loss(nc_log_softmax(lg), labels, 0)), nc_item(nc_cross_entropy(lg, labels)), 1e-5);
+        /* compare: mixed f32 / i32 with broadcasting, then an integer sum */
+        float fv[4] = {1.0f, 2.0f, 3.5f, 4.0f};
+        int32_t iv[4] = {1, 0, 3, 4};
+        nc_tensor *f = nc_from_data(ctx, NC_F32, fv, 1, SHAPE(4)), *i = nc_from_data(ctx, NC_I32, iv, 1, SHAPE(4));
+        nc_tensor *eq = nc_compare(f, i, NC_CMP_EQ);
+        CHECK(eq && nc_get_dtype(eq) == NC_I32 && nc_data_i32(eq)[0] == 1 && nc_data_i32(eq)[2] == 0);
+        nc_tensor *cnt = nc_sum(eq, NC_ALL_AXES, 0);
+        CHECK(cnt && nc_get_dtype(cnt) == NC_I32 && nc_data_i32(cnt)[0] == 2);
+        nc_tensor *ge = nc_compare(nc_reshape(f, 2, SHAPE(4, 1)), i, NC_CMP_GE); /* [4, 4] */
+        CHECK(ge && nc_dim(ge, 0) == 4 && nc_data_i32(nc_sum(ge, NC_ALL_AXES, 0))[0] == 11); /* 2 + 2 + 3 + 4 */
+        /* to_dtype: truncation toward zero, int -> float, grad detached for ints */
+        float tv[3] = {-1.7f, 2.9f, 0.4f};
+        nc_tensor *ti = nc_to_dtype(nc_from_data(ctx, NC_F32, tv, 1, SHAPE(3)), NC_I32);
+        CHECK(ti && nc_data_i32(ti)[0] == -1 && nc_data_i32(ti)[1] == 2);
+        CHECK(!nc_requires_grad(nc_to_dtype(lg, NC_I32)));
+        CHECK_NEAR(nc_data_f32(nc_to_dtype(i, NC_F32))[3], 4.0, 0);
+        /* cat of int tensors and the input-count limit */
+        nc_tensor *two[2] = {i, i};
+        CHECK(nc_dim(nc_cat(2, two, 0), 0) == 8);
+        nc_tensor *seven[7] = {i, i, i, i, i, i, i};
+        CHECK(!nc_cat(7, seven, 0) && nc_status_code(ctx) == NC_ERR_ARG);
+        nc_clear_error(ctx);
+        nc_step_end(ctx);
+    }
 
     in[0] = gparam(ctx, 0, 2, SHAPE(4, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(3, 6));
     in[2] = gparam(ctx, 0, 1, SHAPE(6)), in[3] = gparam(ctx, 0, 2, SHAPE(6, 5));

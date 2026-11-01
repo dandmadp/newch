@@ -5,9 +5,11 @@ from __future__ import annotations
 import math
 from collections import OrderedDict, namedtuple
 
-from . import _lib as L
-from ._lib import lib
-from .tensor import (Context, Tensor, _is_numpy, _pair, _to_buffer, _unsupported, _window, avg_pool2d, batch_norm,
+from .. import _lib as L
+from .._lib import lib
+from ..tensor import persistent as _persistent_mode
+from ..tensor import (Context, Tensor, _check_device, _is_numpy, _pair, _to_buffer, _unsupported, _window, avg_pool2d,
+                     batch_norm, cross_entropy, mse_loss, nll_loss,
                      conv2d, default_context, dropout, full, gelu, hardsigmoid, hardswish, int32, leaky_relu, linear,
                      load_tensors, log_softmax, max_pool2d, parameter, persistent, rand, randn, relu6, save_tensors,
                      silu, softmax, tensor, zeros)
@@ -43,11 +45,60 @@ class Module:
     def children(self) -> list["Module"]:
         return [v for _, v in self._items() if isinstance(v, Module)]
 
+    def named_children(self):
+        for name, v in self._items():
+            if isinstance(v, Module):
+                yield name, v
+
     def modules(self):
         """This module and every sub-module, depth first."""
         yield self
         for c in self.children():
             yield from c.modules()
+
+    def named_modules(self, prefix: str = ""):
+        yield prefix, self
+        for name, c in self.named_children():
+            yield from c.named_modules(f"{prefix}.{name}" if prefix else name)
+
+    def apply(self, fn) -> "Module":
+        """Calls fn on every sub-module, then on self (e.g. weight initialization)."""
+        for c in self.children():
+            c.apply(fn)
+        fn(self)
+        return self
+
+    def register_buffer(self, name: str, tensor_, persistent: bool = True) -> None:
+        """Stores a non-trainable tensor that is saved in state_dict (e.g. running statistics)."""
+        _unsupported(persistent=(persistent, True))
+        if tensor_ is not None and not (tensor_.is_persistent and not tensor_.requires_grad):
+            with _persistent_mode(tensor_.ctx):
+                tensor_ = tensor(tensor_)  # owned copy that survives step_end()
+        setattr(self, name, tensor_)
+
+    def register_parameter(self, name: str, param) -> None:
+        if param is not None and not (param.is_persistent and param.requires_grad):
+            raise TypeError(f"'{name}' must be a parameter (nc.parameter(...)) or None")
+        setattr(self, name, param)
+
+    def to(self, *args, **kwargs) -> "Module":
+        """Device moves are no-ops on the CPU; changing the dtype of parameters is not supported."""
+        dtype = kwargs.pop("dtype", None)
+        device = kwargs.pop("device", None)
+        kwargs.pop("non_blocking", None)
+        if kwargs:
+            raise TypeError(f"to() got unexpected arguments {sorted(kwargs)}")
+        for a in args:
+            if a in L.DTYPE_CODES:
+                dtype = a
+            else:
+                device = a
+        _check_device(device)
+        _unsupported(dtype=(dtype if dtype != "float32" else None, None))
+        return self
+
+    def cpu(self) -> "Module":
+        return self
 
     def _collect(self, prefix, out, seen, want):
         for name, v in self._items():
@@ -492,7 +543,7 @@ class Model(Module):
     def compile(self, optimizer="rmsprop", loss=None, loss_weights=None, metrics=None, *, lr: float | None = None):
         """Keras' compile. ``optimizer`` is a name ("rmsprop", "adam", "adamw", "sgd" with Keras' default
         hyperparameters) or an optimizer instance; ``lr`` overrides the learning rate of a named optimizer."""
-        from .training import compile_model
+        from ..training import compile_model
 
         _unsupported(loss_weights=(loss_weights, None))
         compile_model(self, optimizer, loss, metrics, lr)
@@ -503,7 +554,7 @@ class Model(Module):
             sample_weight=None, initial_epoch: int = 0, steps_per_epoch=None, *, seed=None):
         """Trains on arrays (x, y), or streams from a DataLoader / iterable of
         (x, y) batches passed as x with y=None (as Keras does for datasets)."""
-        from .training import fit
+        from ..training import fit
 
         _unsupported(class_weight=(class_weight, None), sample_weight=(sample_weight, None),
                      steps_per_epoch=(steps_per_epoch, None))
@@ -514,7 +565,7 @@ class Model(Module):
                  callbacks=None, return_dict: bool = False):
         """Loss (and metrics) on x, y. Like Keras: a float when there are no
         metrics, else ``[loss, accuracy]``; a dict with ``return_dict=True``."""
-        from .training import evaluate
+        from ..training import evaluate
 
         _unsupported(sample_weight=(sample_weight, None), steps=(steps, None), callbacks=(callbacks, None))
         logs = evaluate(self, x, y, 32 if batch_size is None else batch_size)
@@ -524,10 +575,133 @@ class Model(Module):
         return values[0] if len(values) == 1 else values
 
     def predict(self, x, batch_size=None, verbose="auto", steps=None, callbacks=None):
-        from .training import predict
+        from ..training import predict
 
         _unsupported(steps=(steps, None), callbacks=(callbacks, None))
         return predict(self, x, 32 if batch_size is None else batch_size)
+
+
+class ModuleList(Module):
+    """A list of sub-modules whose parameters are registered (torch.nn.ModuleList)."""
+
+    def __init__(self, modules=None):
+        self._list: list = []
+        for m in modules or []:
+            self.append(m)
+
+    def _items(self):
+        for i, m in enumerate(self._list):
+            yield str(i), m
+
+    def append(self, module: Module) -> "ModuleList":
+        if not isinstance(module, Module):
+            raise TypeError(f"ModuleList holds modules, got {type(module).__name__}")
+        self._list.append(module)
+        return self
+
+    def extend(self, modules) -> "ModuleList":
+        for m in modules:
+            self.append(m)
+        return self
+
+    def insert(self, index: int, module: Module) -> None:
+        if not isinstance(module, Module):
+            raise TypeError(f"ModuleList holds modules, got {type(module).__name__}")
+        self._list.insert(index, module)
+
+    def __getitem__(self, i):
+        return ModuleList(self._list[i]) if isinstance(i, slice) else self._list[i]
+
+    def __len__(self) -> int:
+        return len(self._list)
+
+    def __iter__(self):
+        return iter(self._list)
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError("ModuleList has no forward(); iterate over it in your own forward()")
+
+
+class ModuleDict(Module):
+    """A dict of sub-modules whose parameters are registered (torch.nn.ModuleDict)."""
+
+    def __init__(self, modules=None):
+        self._dict: dict = {}
+        for k, m in dict(modules or {}).items():
+            self[k] = m
+
+    def _items(self):
+        yield from self._dict.items()
+
+    def __setitem__(self, key: str, module: Module) -> None:
+        if not isinstance(module, Module):
+            raise TypeError(f"ModuleDict holds modules, got {type(module).__name__}")
+        self._dict[key] = module
+
+    def __getitem__(self, key: str) -> Module:
+        return self._dict[key]
+
+    def __contains__(self, key) -> bool:
+        return key in self._dict
+
+    def __len__(self) -> int:
+        return len(self._dict)
+
+    def __iter__(self):
+        return iter(self._dict)
+
+    def keys(self):
+        return self._dict.keys()
+
+    def values(self):
+        return self._dict.values()
+
+    def items(self):
+        return self._dict.items()
+
+    def forward(self, *args, **kwargs):
+        raise NotImplementedError("ModuleDict has no forward(); pick modules from it in your own forward()")
+
+
+class Identity(Module):
+    """Returns its input; ignores constructor arguments (torch.nn.Identity)."""
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def forward(self, x):
+        return x
+
+
+# Losses as modules (criterion = nn.CrossEntropyLoss(); loss = criterion(output, target))
+class CrossEntropyLoss(Module):
+    def __init__(self, weight=None, size_average=None, ignore_index: int = -100, reduce=None, reduction: str = "mean",
+                 label_smoothing: float = 0.0):
+        _unsupported(weight=(weight, None), size_average=(size_average, None), reduce=(reduce, None),
+                     ignore_index=(ignore_index, -100))
+        self.reduction, self.label_smoothing = reduction, label_smoothing
+
+    def forward(self, input, target):
+        return cross_entropy(input, target, reduction=self.reduction, label_smoothing=self.label_smoothing)
+
+
+class NLLLoss(Module):
+    def __init__(self, weight=None, size_average=None, ignore_index: int = -100, reduce=None, reduction: str = "mean"):
+        _unsupported(weight=(weight, None), size_average=(size_average, None), reduce=(reduce, None),
+                     ignore_index=(ignore_index, -100))
+        self.reduction = reduction
+
+    def forward(self, input, target):
+        return nll_loss(input, target, reduction=self.reduction)
+
+
+class MSELoss(Module):
+    def __init__(self, size_average=None, reduce=None, reduction: str = "mean"):
+        _unsupported(size_average=(size_average, None), reduce=(reduce, None))
+        self.reduction = reduction
+
+    def forward(self, input, target):
+        return mse_loss(input, target, reduction=self.reduction)
 
 
 class Sequential(Model):
@@ -548,11 +722,17 @@ class Sequential(Model):
         return x
 
     def __getitem__(self, i):
-        return self.layers[i]
+        return Sequential(self.layers[i]) if isinstance(i, slice) else self.layers[i]
 
     def __len__(self) -> int:
         return len(self.layers)
 
+    def __iter__(self):
+        return iter(self.layers)
+
     def _items(self):
         for i, layer in enumerate(self.layers):
             yield str(i), layer
+
+
+from . import functional, init  # noqa: E402  (torch.nn.functional / torch.nn.init)

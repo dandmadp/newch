@@ -360,3 +360,67 @@ nc_tensor *nc_batch_norm(nc_tensor *x, nc_tensor *weight, nc_tensor *bias, nc_te
     nc_tensor *in[5] = {x, weight, bias, running_mean, running_var};
     return nc__apply(&nc_op_batch_norm, in, 5, &p);
 }
+
+/* ------------------------------------------------------------------------ */
+/* nll_loss: -logp[i, label_i], mean (p.i[0] = 0) or sum (1) over rows       */
+/* ------------------------------------------------------------------------ */
+
+static nc_status nll_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
+    nc_tensor *x = n->in[0], *y = n->in[1];
+    (void)shape;
+    if (!nc__expect_f32(n, 0)) return NC_ERR_DTYPE;
+    if (y->dtype != NC_I32) {
+        nc__error(x->ctx, NC_ERR_DTYPE, "nll_loss: labels must be i32");
+        return NC_ERR_DTYPE;
+    }
+    if (x->ndim != 2 || y->ndim != 1 || y->shape[0] != x->shape[0]) {
+        char sa[96], sb[96];
+        nc__error(x->ctx, NC_ERR_SHAPE, "nll_loss: expected log-probabilities [N, C] and labels [N], got %s and %s",
+                  nc__shape_str(x->ndim, x->shape, sa, sizeof sa), nc__shape_str(y->ndim, y->shape, sb, sizeof sb));
+        return NC_ERR_SHAPE;
+    }
+    *dt = NC_F32;
+    *nd = 0;
+    return NC_OK;
+}
+
+static nc_status nll_fwd(nc_node *n) {
+    nc_ctx *ctx = n->out->ctx;
+    const float *x = nc__contig_f32(n->in[0]);
+    int64_t N = n->in[0]->shape[0], C = n->in[0]->shape[1];
+    int32_t *lab = (int32_t *)nc__arena_alloc(ctx, (size_t)(N ? N : 1) * sizeof(int32_t));
+    if (!x || !lab) return NC_ERR_OOM;
+    nc__copy_strided(n->in[1], lab);
+    double loss = 0.0;
+    for (int64_t i = 0; i < N; i++) {
+        if (lab[i] < 0 || lab[i] >= C) {
+            nc__error(ctx, NC_ERR_ARG, "nll_loss: label %d at row %lld outside [0, %lld)", lab[i], (long long)i,
+                      (long long)C);
+            return NC_ERR_ARG;
+        }
+        loss -= x[i * C + lab[i]];
+    }
+    *(float *)n->out->data = (float)(n->p.i[0] ? loss : (N ? loss / (double)N : 0.0));
+    n->saved = lab;
+    return NC_OK;
+}
+
+static void nll_bwd(nc_node *n) {
+    nc_tensor *gt = nc__grad_buf(n->in[0]);
+    if (!gt) return;
+    int64_t N = n->in[0]->shape[0], C = n->in[0]->shape[1];
+    const int32_t *lab = (const int32_t *)n->saved;
+    float g = *(const float *)n->out->grad->data;
+    float s = n->p.i[0] ? g : g / (float)(N ? N : 1);
+    for (int64_t i = 0; i < N; i++) ((float *)gt->data)[i * C + lab[i]] -= s;
+}
+
+const nc_op_def nc_op_nll_loss = {"nll_loss", 0, 0, nll_infer, NULL, nll_fwd, nll_bwd};
+
+nc_tensor *nc_nll_loss(nc_tensor *logp, nc_tensor *labels, int sum) {
+    nc_op_params p;
+    memset(&p, 0, sizeof p);
+    p.i[0] = sum ? 1 : 0;
+    nc_tensor *in[2] = {logp, labels};
+    return nc__apply(&nc_op_nll_loss, in, 2, &p);
+}

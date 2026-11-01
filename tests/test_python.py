@@ -80,7 +80,9 @@ class TestTensor(Base):
             a.softmax(dim=0)
         with self.assertRaises(NotImplementedError):
             a.index_select(1, [0])
-        self.assertFalse(hasattr(a, "view"))
+        self.assertEqual(a.view(3, 2).shape, (3, 2))  # never copies, as in PyTorch ...
+        with self.assertRaises(RuntimeError):
+            a.T.view(6)  # ... so a non-contiguous tensor needs reshape()
         self.assertFalse(hasattr(a, "max"))
 
     def test_manual_seed_reseeds(self):

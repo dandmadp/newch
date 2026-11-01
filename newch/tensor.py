@@ -383,6 +383,70 @@ class Tensor:
     def __bool__(self) -> bool:
         return bool(self.item())
 
+    # ---- comparison (elementwise, int32 0/1: there is no bool dtype) -----
+    __hash__ = object.__hash__  # tensors stay usable as dict keys / in sets, as in PyTorch
+
+    def _cmp(self, o, op: int):
+        if isinstance(o, bool):
+            o = int(o)
+        if isinstance(o, int):
+            o = tensor(o, dtype=int32, ctx=self._ctx)
+        elif isinstance(o, float):
+            o = tensor(o, dtype=float32, ctx=self._ctx)
+        elif not isinstance(o, Tensor):
+            return NotImplemented
+        return self._w(lib.nc_compare(self.ptr, o.ptr, op))
+
+    def _cmp_method(op: int):
+        def method(self, other):
+            out = self._cmp(other, op)
+            if out is NotImplemented:
+                raise TypeError(f"cannot compare a Tensor with {type(other).__name__}")
+            return out
+        return method
+
+    def _cmp_operator(op: int):
+        return lambda self, other: self._cmp(other, op)
+
+    # methods raise for unsupported types; operators return NotImplemented, so `t == None` stays False
+    eq, ne, lt, le, gt, ge = _cmp_method(0), _cmp_method(1), _cmp_method(2), _cmp_method(3), _cmp_method(4),         _cmp_method(5)
+    __eq__, __ne__, __lt__, __le__, __gt__, __ge__ = _cmp_operator(0), _cmp_operator(1), _cmp_operator(2),         _cmp_operator(3), _cmp_operator(4), _cmp_operator(5)
+    del _cmp_method, _cmp_operator
+
+    # ---- dtype / device ---------------------------------------------------
+    def to(self, *args, **kwargs) -> "Tensor":
+        """to(device), to(dtype), to(device, dtype) or to(other). Only the CPU device exists."""
+        dtype = kwargs.pop("dtype", None)
+        device = kwargs.pop("device", None)
+        kwargs.pop("non_blocking", None)
+        _unsupported(copy=(kwargs.pop("copy", False), False))
+        if kwargs:
+            raise TypeError(f"to() got unexpected arguments {sorted(kwargs)}")
+        for a in args:
+            if isinstance(a, Tensor):
+                dtype = a.dtype
+            elif a in L.DTYPE_CODES:
+                dtype = a
+            else:
+                device = a
+        _check_device(device)
+        if dtype is None or dtype == self.dtype:
+            return self
+        if dtype not in L.DTYPE_CODES:
+            raise ValueError(f"unsupported dtype {dtype!r}")
+        return self._w(lib.nc_to_dtype(self.ptr, L.DTYPE_CODES[dtype]))
+
+    def float(self) -> "Tensor": return self.to(float32)
+    def int(self) -> "Tensor": return self.to(int32)
+
+    def long(self) -> "Tensor":
+        """int32: newch has no int64 (library-wide rule)."""
+        return self.to(int32)
+
+    def cpu(self) -> "Tensor": return self
+
+    def dim(self) -> int: return self.ndim
+
     # ---- arithmetic ------------------------------------------------------
     def __add__(self, o):
         if isinstance(o, Number):
@@ -483,6 +547,55 @@ class Tensor:
             shape = tuple(shape[0])
         n, arr = L.shape_arg(shape)
         return self._view(lib.nc_reshape(self.ptr, n, arr))
+
+    def view(self, *shape):
+        """Same memory, new shape. Needs a contiguous tensor (else use reshape), as in PyTorch."""
+        if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
+            shape = tuple(shape[0])
+        if len(shape) == 1 and isinstance(shape[0], str):
+            raise NotImplementedError("view(dtype) is not supported; use to(dtype)")
+        if not lib.nc_is_contiguous(self.ptr):
+            raise RuntimeError("view() needs a contiguous tensor; use reshape() or contiguous().view()")
+        out = self.reshape(*shape)
+        if out.is_persistent:
+            raise NotImplementedError("view() inside persistent() would copy; use reshape()")
+        return out
+
+    def view_as(self, other: "Tensor"):
+        return self.view(*other.shape)
+
+    def unsqueeze(self, dim: int):
+        shape = list(self.shape)
+        d = dim + len(shape) + 1 if dim < 0 else dim
+        if not 0 <= d <= len(shape):
+            raise IndexError(f"unsqueeze dim {dim} out of range for {len(shape)}-d tensor")
+        shape.insert(d, 1)
+        return self.reshape(*shape)
+
+    def squeeze(self, dim=None):
+        shape = list(self.shape)
+        if dim is None:
+            keep = [s for s in shape if s != 1]
+        else:
+            dims = {d % len(shape) for d in (dim if isinstance(dim, (list, tuple)) else (dim,))} if shape else set()
+            keep = [s for i, s in enumerate(shape) if not (i in dims and s == 1)]
+        return self.reshape(*keep) if len(keep) != len(shape) else self
+
+    def permute(self, *dims):
+        """Reorders dimensions as a view (a series of transposes, no copy)."""
+        if len(dims) == 1 and isinstance(dims[0], (list, tuple)):
+            dims = tuple(dims[0])
+        n = self.ndim
+        dims = tuple(d % n for d in dims) if n else ()
+        if sorted(dims) != list(range(n)):
+            raise ValueError(f"permute needs a permutation of {n} dims, got {dims}")
+        out, cur = self, list(range(n))
+        for i, want in enumerate(dims):
+            j = cur.index(want)
+            if j != i:
+                out = out.transpose(i, j)
+                cur[i], cur[j] = cur[j], cur[i]
+        return out
 
     def flatten(self, start_dim: int = 0, end_dim: int = -1):
         s = self.shape
@@ -714,6 +827,39 @@ def _implicit_dim(x: Tensor, dim, name: str) -> int:
     return 0 if x.ndim in (0, 1, 3) else 1
 
 
+def _check_device(device) -> None:
+    if device is not None and str(device).split(":")[0] != "cpu":
+        raise NotImplementedError(f"device {device!r} is not available; newch runs on the CPU only")
+
+
+def flatten(input: Tensor, start_dim: int = 0, end_dim: int = -1) -> Tensor:
+    return input.flatten(start_dim, end_dim)
+
+
+def argmax(input: Tensor, dim=None, keepdim: bool = False) -> Tensor:
+    return input.argmax(dim, keepdim)
+
+
+def cat(tensors, dim: int = 0) -> Tensor:
+    """Concatenates along dim (engine op; differentiable for float32)."""
+    tensors = list(tensors)
+    if not tensors:
+        raise ValueError("cat() needs at least one tensor")
+    ctx = tensors[0].ctx
+    while True:  # the engine op takes up to 6 inputs per call
+        group, rest = tensors[:6], tensors[6:]
+        ptrs = L.ptr_array(t.ptr for t in group)
+        out = ctx.wrap(lib.nc_cat(len(group), ptrs, int(dim)))
+        if not rest:
+            return out
+        tensors = [out] + rest
+
+
+def stack(tensors, dim: int = 0) -> Tensor:
+    """Joins equal-shaped tensors along a new dim."""
+    return cat([t.unsqueeze(dim) for t in tensors], dim)
+
+
 def softmax(input: Tensor, dim=None) -> Tensor: return input.softmax(_implicit_dim(input, dim, "softmax"))
 def log_softmax(input: Tensor, dim=None) -> Tensor: return input.log_softmax(_implicit_dim(input, dim, "log_softmax"))
 
@@ -811,6 +957,18 @@ def cross_entropy(input: Tensor, target, weight=None, size_average=None, ignore_
         uniform = (input.log_softmax(-1).mean(-1)).mean() * -1.0  # mean over classes and rows
         loss = loss * (1.0 - label_smoothing) + uniform * label_smoothing
     return loss * float(target.shape[0]) if reduction == "sum" else loss
+
+
+def nll_loss(input: Tensor, target, weight=None, size_average=None, ignore_index: int = -100, reduce=None,
+             reduction: str = "mean") -> Tensor:
+    """Negative log-likelihood of log-probabilities input [N, C] and class indices target [N]."""
+    _unsupported(weight=(weight, None), size_average=(size_average, None), reduce=(reduce, None),
+                 ignore_index=(ignore_index, -100))
+    if reduction not in ("mean", "sum"):
+        raise NotImplementedError(f"reduction={reduction!r} is not supported (use 'mean' or 'sum')")
+    if not isinstance(target, Tensor):
+        target = tensor(target, dtype=int32, ctx=input.ctx)
+    return input._w(lib.nc_nll_loss(input.ptr, target.ptr, int(reduction == "sum")))
 
 
 def mse_loss(input: Tensor, target, size_average=None, reduce=None, reduction: str = "mean") -> Tensor:

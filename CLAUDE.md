@@ -41,8 +41,8 @@ filtered pipeline once hid a failing test that then got pushed.
   gradcheck case in `engine/tests/test_main.c`.
 - `engine/src/kernels/`: `ref/` (truth), `neon/`, `x86/` (AVX2 via per-function `target` attributes). Ops call
   `ctx->k` or `nc__gemm()` (threaded), never ISA code directly. `test_kernel_parity` compares tiers to ref.
-- `newch/`: `tensor.py` (Tensor, Context, functional, NCW1 files), `net.py` (Module, layers, Model, Sequential,
-  quantize_), `data.py` (DataLoader, FileArray), `training.py`, `optim.py` (optimizers, lr_scheduler), `callbacks.py`, `ml.py` (scikit-learn style; each call runs in a
+- `newch/`: `tensor.py` (Tensor, Context, functional, NCW1 files), `net/` (package: `__init__.py` Module, layers,
+  containers, losses, Model, Sequential, quantize_; `functional.py` = torch.nn.functional; `init.py` = torch.nn.init), `data.py` (DataLoader, FileArray), `training.py`, `optim.py` (optimizers, lr_scheduler), `callbacks.py`, `ml.py` (scikit-learn style; each call runs in a
   private Context so it never touches the caller's step arena), `_lib.py` (ctypes
   signatures; keep in sync with `nc.h`, including struct layouts like `nc_config`).
 - Docs: `docs/PROGRESS.md` (state, decisions, naming table, verification), `docs/FORMAT.md`, `docs/PUBLISHING.md`.

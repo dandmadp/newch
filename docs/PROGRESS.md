@@ -35,7 +35,7 @@
 │              Embedding, 활성화 10종), optim(SGD, Adam, AdamW, │
 │              그래디언트 누적, 클리핑), 학습률 스케줄러          │
 ├──────────────────────────────────────────────────────────────┤
-│ L3 즉시 실행   텐서, 연산 레지스트리(41개), autograd, gradcheck  │  ✅ C
+│ L3 즉시 실행   텐서, 연산 레지스트리(45개), autograd, gradcheck  │  ✅ C
 ├──────────────────────────────────────────────────────────────┤
 │ L2 컴파일러    추적 → IR → 융합, 메모리 계획                    │  ⏳ (ctx->trace 훅)
 ├──────────────────────────────────────────────────────────────┤
@@ -61,7 +61,7 @@ newch/
 │   ├── ml.py                 scikit-learn식 전처리, 선형 회귀, k-means, 지표
 │   └── optim.py, training.py, callbacks.py
 ├── tests/                    Python 테스트 (test_python.py, test_features.py)
-├── examples/                 train_spiral.c, mnist_cnn.py
+├── examples/                 train_spiral.c, mnist_cnn.py (Keras식), mnist_torch_style.py (PyTorch식)
 ├── docs/                     PROGRESS.md, FORMAT.md
 ├── tools/build.py            zig cc 기반 멀티 타깃 빌드
 ├── pyproject.toml, setup.py  pip 설치 (빌드 시 zig로 엔진 컴파일)
@@ -89,15 +89,17 @@ newch/
 
 ### C 엔진
 - **텐서:** f32 / i32 / i8, 최대 6차원, stride 뷰, numpy식 브로드캐스팅
-- **연산 41개** (미분 가능한 연산은 전부 gradcheck 통과)
+- **연산 45개** (미분 가능한 연산은 전부 gradcheck 통과)
   - 원소별: `add sub mul div neg exp log sqrt relu sigmoid tanh scale add_scalar pow_scalar dropout`
   - 활성화: `leaky_relu relu6 hardsigmoid hardswish silu gelu gelu_tanh` (PyTorch 정의, 꺾이는 점의 그래디언트도 PyTorch 규칙)
   - 선형대수: `matmul`(전치 뷰는 복사 없이 처리), `linear`(fused `x @ Wᵀ + b`)
+  - 비교: `compare`(eq/ne/lt/le/gt/ge, 브로드캐스팅, f32·i32 혼합, 결과 i32 0/1), i32 `sum`(개수 세기)
+  - 결합·변환: `cat`(입력 6개까지, Python `cat`은 더 많으면 나눠 호출), `to_dtype`(f32↔i32↔i8, 정수로 바꾸면 그래디언트 끊김)
   - 합성곱·풀링: `conv2d`(stride, padding), `max_pool2d`, `avg_pool2d`
   - 정규화: `batch_norm` (학습: 배치 통계 + 이동 평균 갱신, 평가: 이동 평균 사용)
   - 축소: `sum mean max argmax`
   - shape: `reshape transpose contiguous detach index_select`
-  - NN: `log_softmax softmax cross_entropy`, 합성 `mse_loss`
+  - NN: `log_softmax softmax cross_entropy nll_loss`, 합성 `mse_loss`
   - 양자화(추론): `nc_quantize_rows`(행별 대칭 int8), `linear_int8`(동적 양자화, int32 누적)
 - **autograd:** 테이프 기반 역전파, 손실 여러 개, 그래디언트 누적, no-grad, detach
 - **커널:** 레퍼런스(K/N 캐시 블로킹), ARM NEON(4×8 GEMM, 전치 GEMM), **x86 AVX2+FMA**(4×16 GEMM, 전치 GEMM, int8 GEMM, 원소별). AVX2·NEON 모두 **벡터 exp/sigmoid/tanh/erf**(다항식 근사, libm 대비 상대 오차 1.4e-7 이하, erf는 절대 오차 5e-7 이하)를 가지며 sigmoid, tanh, exp, SiLU, GELU, softmax, cross_entropy가 이를 씁니다
@@ -108,6 +110,7 @@ newch/
 
 ### Python 패키지
 - **PyTorch식:** `Tensor`(연산자, `@`, 인덱싱, `.backward()`, `.copy_()`), `net.Module`(파라미터·버퍼 자동 탐색, `state_dict`, `load_state_dict`), `Linear`, `Conv2d`, `MaxPool2d`, `AvgPool2d`, `BatchNorm1d/2d`, `Dropout`, `Embedding`, 활성화, `Flatten`, 함수형 API(`conv2d`, `batch_norm`, `dropout`, …), `optim.SGD/Adam`, `no_grad()`
+- **PyTorch 모델 코드 그대로:** `import newch as torch`, `import newch.net as nn`, `import newch.net.functional as F`로 바꾸면 `class Net(nn.Module)` + `super().__init__()`, `F.relu`/`F.log_softmax`/`F.nll_loss`, `torch.flatten`/`cat`/`stack`, `view`/`view_as`/`unsqueeze`/`squeeze`/`permute`, `eq`와 비교 연산자, `.float()`/`.to(device)`, `nn.ModuleList`/`ModuleDict`/`Identity`, `nn.CrossEntropyLoss`/`NLLLoss`/`MSELoss`, `model.apply()`, `register_buffer`, `nn.init.*`를 쓰는 일반적인 학습 스크립트가 돕니다 (`examples/mnist_torch_style.py`: 1 에포크 14초, 테스트 97.8%)
 - **Keras식:** `Sequential`, `compile`, `fit`(배열 / DataLoader 스트리밍 / FileArray 자동 스트리밍), `evaluate`, `predict`, `summary()`, `save_weights`/`load_weights`, `History`, `EarlyStopping`, `LambdaCallback`
 - **데이터:** `Dataset`, `TensorDataset`, `DataLoader`(shuffle, drop_last, generator), `FileArray`(mmap, `create()`로 한 행씩 기록)
 - **양자화:** `nc.quantize_(model)` → 모든 `Linear`를 `QuantizedLinear`로 교체
@@ -162,17 +165,23 @@ newch/
 | `ml.LinearRegression`, `ml.Ridge` | scikit-learn | 정규방정식(float32 누적, float64 풀이). 열이 선형 종속이면 `LinearRegression`은 에러 (sklearn은 최소 노름 해) |
 | `ml.KMeans` | scikit-learn | 같은 알고리즘(greedy k-means++, Lloyd, 분산 대비 tol, 빈 클러스터 재배치). 난수열은 달라서 같은 시드라도 결과가 다를 수 있음 |
 | `Tensor.__array__` | numpy | 항상 복사 (`copy=False`는 에러) |
+| `nc.net.functional` (`F.relu`, `F.nll_loss`, …) | torch.nn.functional | 같은 이름과 인수. `inplace=True`, `weight`, `ignore_index≠-100`은 에러 |
+| `nc.net.init` (`uniform_`, `normal_`, `constant_`, `zeros_`, `ones_`, `xavier_*`, `kaiming_*`, `calculate_gain`) | torch.nn.init | 같은 분포와 공식. 난수는 newch RNG라 같은 시드라도 값은 다름 |
+| `nn.ModuleList`, `ModuleDict`, `Identity`, `CrossEntropyLoss`, `NLLLoss`, `MSELoss` | torch | 손실 모듈은 함수형과 같은 인수 규칙 |
+| `Module.apply`, `named_modules`, `named_children`, `register_buffer`, `register_parameter`, `to`, `cpu` | torch | `to`는 CPU 장치만 (그 밖은 에러), dtype 변경은 에러. `register_buffer(persistent=False)`는 에러 |
+| `Tensor.view`, `view_as`, `unsqueeze`, `squeeze`, `permute`, `dim`, `to`, `float`, `int`, `cpu` | torch | `view`는 절대 복사하지 않음: 연속이 아니면 에러 (torch와 같음), `persistent()` 안에서도 에러. `permute`는 전치 뷰를 이어 붙인 뷰 |
+| `eq`/`ne`/`lt`/`le`/`gt`/`ge`와 비교 연산자 | torch | 결과 dtype만 int32 (위의 라이브러리 규칙). 텐서는 여전히 해시 가능 (dict 키로 사용 가능) |
+| `nc.cat`, `nc.stack`, `nc.flatten`, `nc.argmax`, `nc.nll_loss` | torch | |
 
-**라이브러리 전체 규칙:** 정수 데이터는 int32가 됩니다 (torch는 int64). 엔진에 int64가 없기 때문입니다.
+**라이브러리 전체 규칙:** 정수 데이터는 int32가 됩니다 (torch는 int64). 엔진에 int64가 없기 때문입니다. 같은 이유로 `.long()`도 int32이고, bool dtype이 없어서 비교 결과(`eq`, `==` 등)는 int32 0/1입니다 (`.sum().item()`은 torch처럼 정수).
 
 ### 의미가 달라서 다른 이름을 쓴 것
 
 | 원본 이름 | newch 이름 | 이유 |
 |---|---|---|
-| `torch.nn` | **`nc.net`** | PyTorch에 없는 Keras식 `Model`까지 들어 있습니다 |
+| `torch.nn` | **`nc.net`** | PyTorch에 없는 Keras식 `Model`까지 들어 있습니다 (`import newch.net as nn`으로 쓰면 됩니다) |
 | `torch.nn.Parameter(tensor)` | **`nc.parameter(init)`** | 클래스가 아니라 함수이고, shape 튜플도 받습니다 |
 | `Tensor.max(dim)` (값+인덱스) | **`Tensor.amax(dim)`** | 값만 반환 = torch `amax` |
-| `Tensor.view()` (절대 복사 안 함) | **`reshape()`만 제공** | 필요하면 복사합니다 |
 | `Tensor.T` (3차원 이상) | **`Tensor.mT`** | 마지막 두 축 교환 = torch `mT` |
 | Keras `"sparse_categorical_crossentropy"` | **`"cross_entropy"`만** | Keras 기본은 확률 입력, 우리는 로짓 입력 |
 | `torch.save` / `torch.load` (pickle, 임의 객체) | **`nc.save_tensors` / `nc.load_tensors`** | 텐서 딕셔너리만 다룹니다 |
@@ -255,8 +264,8 @@ newch/
 
 | 항목 | 결과 |
 |---|---|
-| C 테스트 | **21개 테스트 통과** (활성화 7종 gradcheck와 알려진 값, 벡터 exp/sigmoid/tanh/erf와 libm 비교, AdamW, RMSprop, 그래디언트 누적, 클리핑, grad None 처리 추가. 스레드 결정성 테스트가 열 분할 GEMM 경로를 실제로 거치도록 수정) — 기존: 연산별 gradcheck 40여 건, 합성곱·풀링·배치 정규화, 드롭아웃 통계, int8 정확도와 커널 일치, 저장/불러오기와 에러, 스레드 결정성, 아레나 축소, 학습 2종 등) |
-| Python 테스트 | **54개 통과** (`test_extras.py` 26개: 활성화 레이어 값과 그래디언트, 인수 순서·기본값 호환 10개 포함, AdamW, 누적=큰 배치 동일성, 클리핑, 스케줄러, Keras 콜백, numpy 연동, `newch.ml` 전체 / 기존 17개 + CNN 학습, 레이어 shape와 모드, BN 버퍼, 저장 후 예측 일치, strict/불일치 에러, torch 형식 state_dict, 양자화, FileArray 스트리밍 fit, 일반 Dataset 묶음, GC 자동 해제, 스레드/trim) |
+| C 테스트 | **21개 테스트 통과** (nll_loss·cat·to_dtype gradcheck, 비교 연산과 i32 sum, 활성화 7종 gradcheck와 알려진 값, 벡터 exp/sigmoid/tanh/erf와 libm 비교, AdamW, RMSprop, 그래디언트 누적, 클리핑, grad None 처리 추가. 스레드 결정성 테스트가 열 분할 GEMM 경로를 실제로 거치도록 수정) — 기존: 연산별 gradcheck 40여 건, 합성곱·풀링·배치 정규화, 드롭아웃 통계, int8 정확도와 커널 일치, 저장/불러오기와 에러, 스레드 결정성, 아레나 축소, 학습 2종 등) |
+| Python 테스트 | **64개 통과** (`test_torch_style.py` 10개: PyTorch 예제 구조 그대로 CNN 학습 90% 이상, 텐서 메서드, 컨테이너, 손실 모듈, nn.init, 장치 이동 / `test_extras.py` 26개: 활성화 레이어 값과 그래디언트, 인수 순서·기본값 호환 10개 포함, AdamW, 누적=큰 배치 동일성, 클리핑, 스케줄러, Keras 콜백, numpy 연동, `newch.ml` 전체 / 기존 17개 + CNN 학습, 레이어 shape와 모드, BN 버퍼, 저장 후 예측 일치, strict/불일치 에러, torch 형식 state_dict, 양자화, FileArray 스트리밍 fit, 일반 Dataset 묶음, GC 자동 해제, 스레드/trim) |
 | 디버그 빌드 | `-O0` + UBSan 통과 |
 | 실제 데이터 | MNIST CNN 1 에포크 18초, 테스트 98.13%, int8 후 98.13% |
 | 패키징 | 휠 빌드 → 별도 venv 설치(numpy 없음) → 학습 성공 |
