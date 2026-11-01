@@ -161,8 +161,8 @@ newch/
 | 아레나 최소 4MB | 기본 1MB + `trim()` | trim 후 예약 0 |
 | `pip install` 불가 | pyproject + setup.py (zig로 빌드) | 깨끗한 venv(numpy 없음)에 휠 설치 후 학습 |
 | 내부 심볼 노출 | `NC_API` + `-fvisibility=hidden` + strip | DLL에서 `nc__*` 접근 불가, `.so`에 `nc__` 0개 |
-| CI 없음 | GitHub Actions (아래) | 워크플로 작성. **GitHub에서는 아직 실행하지 않음** |
-| ARM 실기기 검증 없음 | **보류** (오렌지파이 미가동). CI에 QEMU 에뮬레이션과 Apple Silicon 실행을 넣어 둠 | — |
+| CI 없음 | GitHub Actions (Windows/Linux/macOS, QEMU ARM·RISC-V, CMake, 휠) | 작업 12개 모두 통과 |
+| ARM 실기기 검증 없음 | Apple Silicon(macOS CI)과 QEMU(aarch64, armv7)에서 NEON 커널 실행 | 레퍼런스와 결과 일치. 오렌지파이 실측은 보류 |
 
 ### 성능 (x86 PC, 12스레드, 정방 행렬곱)
 
@@ -184,11 +184,15 @@ newch/
 | 실제 데이터 | MNIST CNN 1 에포크 18초, 테스트 98.13%, int8 후 98.13% |
 | 패키징 | 휠 빌드 → 별도 venv 설치(numpy 없음) → 학습 성공 |
 | 크로스 컴파일 | x86_64 Windows/Linux, aarch64(gnu/musl/v8.2), armv7(gnu/musl), riscv64(gnu/musl). 경고 0 |
+| CI (GitHub Actions) | Windows, Ubuntu, macOS(Apple Silicon)에서 C·Python 테스트, QEMU aarch64·armv7·riscv64, CMake+gcc, 휠 빌드. 모든 테스트는 해제 메모리 덮어쓰기 모드(`NC_DEBUG_POISON=1`)로 실행 |
+
+**CI에서 찾아 고친 버그:** Python에서 `lib.f(임시텐서().ptr)` 형태로 쓰면 C 호출 전에 영구 임시 텐서가 해제되는
+use-after-free가 있었습니다 (7곳). Windows 할당기에서는 우연히 동작했고 Linux/macOS에서 드러났습니다.
+수정 후 `NC_DEBUG_POISON`으로 모든 플랫폼에서 재현되게 만들고 회귀 테스트를 추가했습니다.
 
 **아직 확인하지 못한 것**
-- NEON 커널(4×8 GEMM, 전치 GEMM)은 **컴파일만 확인**했습니다. 오렌지파이 실측은 보류 상태이고, CI의 Apple Silicon·QEMU 작업은 GitHub에 올려야 실행됩니다
-- CI 워크플로와 CMake 경로(gcc)는 이 PC에서 실행해 볼 수 없었습니다 (리눅스 환경 없음)
-- macOS 빌드는 시도하지 않았습니다
+- 저사양 ARM 보드(오렌지파이 등) 실측: 보류. NEON 커널의 정확성은 Apple Silicon과 QEMU에서 확인했지만, Cortex-A 코어에서의 **속도**는 측정하지 않았습니다
+- 리눅스·macOS에서의 `pip install`(sdist) 설치 경로
 
 ## 8. 빌드와 사용
 

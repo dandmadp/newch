@@ -68,6 +68,7 @@ PyPI 웹에서 "yank" 처리한 뒤 다음 번호로 올리세요.
 - **sdist 설치는 `ziglang` 패키지(수십 MB)를 내려받아 컴파일합니다.** 저사양 기기에서는 시간이 걸리고 네트워크가 필요합니다.
   리눅스·ARM용 휠을 따로 올리면 이 과정이 없어집니다. ARM 실측이 끝나면 `python tools/build.py --target aarch64` 결과로
   리눅스 휠을 만드는 단계를 추가할 수 있습니다
-- **리눅스·macOS에서의 sdist 설치는 아직 실행해 보지 않았습니다.** Windows에서는 휠 설치와 sdist 설치를 새 가상환경에서 모두 확인했습니다
+- **리눅스·macOS에서의 sdist 설치는 아직 실행해 보지 않았습니다.** Windows에서는 휠 설치와 sdist 설치를 새 가상환경에서 모두 확인했고,
+  리눅스·macOS에서는 CI가 소스에서 빌드한 엔진으로 전체 테스트를 통과합니다
 - PyPI 페이지에는 README.md가 그대로 표시됩니다. README의 상대 링크(`docs/...`)는 PyPI에서 열리지 않으므로,
   GitHub 저장소를 만들면 `pyproject.toml`에 `[project.urls]`를 추가하고 링크를 절대 주소로 바꾸는 것을 권합니다
