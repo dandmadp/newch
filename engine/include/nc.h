@@ -37,7 +37,7 @@ extern "C" {
 #endif
 
 #define NC_VERSION_MAJOR 0
-#define NC_VERSION_MINOR 2
+#define NC_VERSION_MINOR 3
 #define NC_VERSION_PATCH 0
 
 #define NC_MAX_DIMS 6
@@ -200,6 +200,16 @@ NC_API nc_tensor *nc_scale(nc_tensor *x, float s);      /* x * s */
 NC_API nc_tensor *nc_add_scalar(nc_tensor *x, float s); /* x + s */
 NC_API nc_tensor *nc_pow_scalar(nc_tensor *x, float p); /* x ^ p */
 
+/* Activations (PyTorch definitions; gradients at kinks follow PyTorch). */
+NC_API nc_tensor *nc_leaky_relu(nc_tensor *x, float negative_slope); /* x > 0 ? x : slope * x */
+NC_API nc_tensor *nc_relu6(nc_tensor *x);       /* min(max(x, 0), 6) */
+NC_API nc_tensor *nc_hardsigmoid(nc_tensor *x); /* min(max(x / 6 + 1/2, 0), 1) */
+NC_API nc_tensor *nc_hardswish(nc_tensor *x);   /* x * relu6(x + 3) / 6 */
+NC_API nc_tensor *nc_silu(nc_tensor *x);        /* x * sigmoid(x), a.k.a. swish */
+/* x * Phi(x) with the exact erf form, or the tanh approximation when
+ * approximate_tanh != 0 */
+NC_API nc_tensor *nc_gelu(nc_tensor *x, int approximate_tanh);
+
 /* Linear algebra. a: [..., M, K] (2-D for now), b: [K, N]. */
 NC_API nc_tensor *nc_matmul(nc_tensor *a, nc_tensor *b);
 /* y = x @ weight^T + bias. x [..., in], weight [out, in] (PyTorch layout),
@@ -276,6 +286,10 @@ NC_API nc_status nc_load(nc_ctx *ctx, const char *path, int n, const char *const
  * nc_grad() of every reachable tensor with requires_grad. */
 NC_API nc_status nc_backward(nc_tensor *loss);
 NC_API void nc_zero_grad(nc_tensor *t);
+/* Marks the grad as absent (torch's zero_grad(set_to_none=True)): nc_grad()
+ * returns NULL and optimizers skip t until a backward reaches it again. The
+ * buffer is kept and reused, so there is no allocation per step. */
+NC_API void nc_clear_grad(nc_tensor *t);
 
 /* Numerical gradient check. `fn` builds a scalar from `inputs`; every input
  * with requires_grad is checked. Returns max relative error found. */
@@ -308,15 +322,30 @@ NC_API void nc_set_training(nc_module *m, int training);
 typedef struct {
     float lr;
     float momentum;     /* SGD only */
-    float weight_decay; /* L2, added to grad */
-    float beta1, beta2, eps; /* Adam only; 0 = defaults 0.9/0.999/1e-8 */
+    float weight_decay; /* SGD/Adam: L2 added to grad; AdamW: decoupled */
+    float beta1, beta2, eps; /* Adam: 0 = defaults 0.9/0.999/1e-8; RMSprop uses beta2, eps */
 } nc_optim_opts;
 
 NC_API nc_optim *nc_sgd(nc_ctx *ctx, nc_tensor **params, int n, nc_optim_opts opts);
 NC_API nc_optim *nc_adam(nc_ctx *ctx, nc_tensor **params, int n, nc_optim_opts opts);
+/* Adam with decoupled weight decay (torch.optim.AdamW): w *= 1 - lr * wd. */
+NC_API nc_optim *nc_adamw(nc_ctx *ctx, nc_tensor **params, int n, nc_optim_opts opts);
+/* RMSprop. opts.beta2 is the smoothing constant (0 = 0.99), opts.eps the
+ * stabilizer (0 = 1e-8). eps_inside_sqrt = 0: w -= lr * g / (sqrt(v) + eps)
+ * (PyTorch); 1: w -= lr * g / sqrt(v + eps) (Keras). */
+NC_API nc_optim *nc_rmsprop(nc_ctx *ctx, nc_tensor **params, int n, nc_optim_opts opts, int eps_inside_sqrt);
 NC_API void nc_optim_zero_grad(nc_optim *o);
+/* Like nc_optim_zero_grad but with nc_clear_grad (set_to_none semantics). */
+NC_API void nc_optim_clear_grad(nc_optim *o);
 NC_API void nc_optim_step(nc_optim *o);
 NC_API void nc_optim_set_lr(nc_optim *o, float lr);
+/* Update every `steps` calls of nc_optim_step with the averaged gradient
+ * (Keras' gradient_accumulation_steps). zero_grad keeps the running sum
+ * until the update. Large effective batch at small-batch memory. */
+NC_API void nc_optim_set_accumulation(nc_optim *o, int steps);
+/* Scales all grads so their joint 2-norm is at most max_norm
+ * (torch.nn.utils.clip_grad_norm_). Returns the norm before clipping. */
+NC_API float nc_clip_grad_norm(nc_tensor **params, int n, float max_norm);
 
 #ifdef __cplusplus
 }

@@ -18,19 +18,19 @@ static nc_status softmax_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape
     return NC_OK;
 }
 
-/* Numerically stable softmax / log-softmax of one row. */
-static void softmax_row(int64_t C, const float *x, float *y, int log_form) {
+/* Numerically stable softmax / log-softmax of one row (y may not alias x). */
+static void softmax_row(const nc_kernels *k, int64_t C, const float *x, float *y, int log_form) {
     float m = x[0];
     for (int64_t c = 1; c < C; c++)
         if (x[c] > m) m = x[c];
-    float s = 0.0f;
-    for (int64_t c = 0; c < C; c++) s += expf(x[c] - m);
+    for (int64_t c = 0; c < C; c++) y[c] = x[c] - m;
+    k->exp_f32(C, y, y);
+    float s = k->sum_f32(C, y);
     if (log_form) {
         float ls = logf(s);
         for (int64_t c = 0; c < C; c++) y[c] = x[c] - m - ls;
     } else {
-        float inv = 1.0f / s;
-        for (int64_t c = 0; c < C; c++) y[c] = expf(x[c] - m) * inv;
+        k->scale_f32(C, 1.0f / s, y, y);
     }
 }
 
@@ -40,7 +40,8 @@ static nc_status softmax_fwd(nc_node *n) {
     float *y = (float *)n->out->data;
     int64_t C = n->out->shape[n->out->ndim - 1];
     int64_t rows = C ? nc_numel(n->out) / C : 0;
-    for (int64_t r = 0; r < rows; r++) softmax_row(C, x + r * C, y + r * C, n->op->kind == SM_LOG);
+    const nc_kernels *k = n->out->ctx->k;
+    for (int64_t r = 0; r < rows; r++) softmax_row(k, C, x + r * C, y + r * C, n->op->kind == SM_LOG);
     return NC_OK;
 }
 
@@ -121,9 +122,9 @@ static nc_status ce_fwd(nc_node *n) {
             return NC_ERR_ARG;
         }
         float *p = prob + i * C;
-        softmax_row(C, x + i * C, p, 1);
+        softmax_row(ctx->k, C, x + i * C, p, 1);
         loss -= p[lab[i]];
-        for (int64_t c = 0; c < C; c++) p[c] = expf(p[c]);
+        ctx->k->exp_f32(C, p, p);
     }
     *(float *)n->out->data = N ? (float)(loss / (double)N) : 0.0f;
     sv->prob = prob;

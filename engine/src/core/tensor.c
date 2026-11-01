@@ -199,7 +199,9 @@ const int64_t *nc_shape(const nc_tensor *t) { return t ? t->shape : NULL; }
 int64_t nc_numel(const nc_tensor *t) { return t ? nc__shape_numel(t->ndim, t->shape) : 0; }
 nc_dtype nc_get_dtype(const nc_tensor *t) { return t ? t->dtype : NC_F32; }
 int nc_requires_grad(const nc_tensor *t) { return t ? nc__needs_grad(t) : 0; }
-nc_tensor *nc_grad(const nc_tensor *t) { return t ? t->grad : NULL; }
+nc_tensor *nc_grad(const nc_tensor *t) {
+    return (t && !(t->flags & NC_TF_GRAD_CLEARED)) ? t->grad : NULL;
+}
 int nc_is_persistent(const nc_tensor *t) { return t && (t->flags & NC_TF_PERSISTENT) != 0; }
 
 void nc_release(nc_tensor *t) {
@@ -352,6 +354,10 @@ const float *nc__contig_f32(nc_tensor *t) {
 }
 
 nc_tensor *nc__grad_buf(nc_tensor *t) {
+    if (t->grad && (t->flags & NC_TF_GRAD_CLEARED)) {
+        memset(t->grad->data, 0, (size_t)nc_numel(t) * sizeof(float));
+        t->flags &= ~NC_TF_GRAD_CLEARED;
+    }
     if (!t->grad) {
         int persistent = (t->flags & NC_TF_PERSISTENT) != 0;
         t->grad = nc__tensor_new(t->ctx, NC_F32, t->ndim, t->shape, persistent);

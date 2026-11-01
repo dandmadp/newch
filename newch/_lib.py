@@ -126,6 +126,9 @@ _SIGNATURES = {
     **{f"nc_{n}": (P, [P, c_float]) for n in ("scale", "add_scalar", "pow_scalar")},
     **{f"nc_{n}": (P, [P, c_int, c_int]) for n in ("sum", "mean", "max", "transpose")},
     "nc_argmax": (P, [P, c_int]),
+    **{f"nc_{n}": (P, [P]) for n in ("relu6", "hardsigmoid", "hardswish", "silu")},
+    "nc_leaky_relu": (P, [P, c_float]),
+    "nc_gelu": (P, [P, c_int]),
     "nc_conv2d": (P, [P, P, P, c_int, c_int, c_int, c_int]),
     "nc_max_pool2d": (P, [P, c_int, c_int, c_int, c_int, c_int, c_int]),
     "nc_avg_pool2d": (P, [P, c_int, c_int, c_int, c_int, c_int, c_int]),
@@ -139,10 +142,16 @@ _SIGNATURES = {
     # autograd
     "nc_backward": (c_int, [P]),
     "nc_zero_grad": (None, [P]),
+    "nc_clear_grad": (None, [P]),
     # optimizers
     "nc_sgd": (P, [P, POINTER(c_void_p), c_int, OptimOpts]),
     "nc_adam": (P, [P, POINTER(c_void_p), c_int, OptimOpts]),
+    "nc_adamw": (P, [P, POINTER(c_void_p), c_int, OptimOpts]),
+    "nc_optim_set_accumulation": (None, [P, c_int]),
+    "nc_clip_grad_norm": (c_float, [POINTER(c_void_p), c_int, c_float]),
     "nc_optim_zero_grad": (None, [P]),
+    "nc_optim_clear_grad": (None, [P]),
+    "nc_rmsprop": (P, [P, POINTER(c_void_p), c_int, OptimOpts, c_int]),
     "nc_optim_step": (None, [P]),
     "nc_optim_set_lr": (None, [P, c_float]),
 }

@@ -7,9 +7,10 @@ from collections import OrderedDict, namedtuple
 
 from . import _lib as L
 from ._lib import lib
-from .tensor import (Context, Tensor, _is_numpy, _to_buffer, avg_pool2d, batch_norm, conv2d, default_context, dropout,
-                     full, int32, linear, load_tensors, max_pool2d, parameter, persistent, rand, randn, save_tensors,
-                     tensor, zeros)
+from .tensor import (Context, Tensor, _is_numpy, _pair, _to_buffer, _unsupported, _window, avg_pool2d, batch_norm,
+                     conv2d, default_context, dropout, full, gelu, hardsigmoid, hardswish, int32, leaky_relu, linear,
+                     load_tensors, log_softmax, max_pool2d, parameter, persistent, rand, randn, relu6, save_tensors,
+                     silu, softmax, tensor, zeros)
 
 IncompatibleKeys = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
 
@@ -125,9 +126,10 @@ class Module:
     def eval(self) -> "Module":
         return self.train(False)
 
-    def zero_grad(self) -> None:
+    def zero_grad(self, set_to_none: bool = True) -> None:
+        """Resets the grads; with set_to_none (default, as in PyTorch) they read as None until the next backward."""
         for p in self.parameters():
-            p.zero_grad()
+            (lib.nc_clear_grad if set_to_none else lib.nc_zero_grad)(p.ptr)
 
     # ---- display ---------------------------------------------------------
     def extra_repr(self) -> str:
@@ -168,7 +170,7 @@ def _uniform_param(shape, bound: float, ctx: Context) -> Tensor:
 class Linear(Module):
     """y = x @ weight.T + bias with weight [out, in], bias [out] (same as torch.nn.Linear)."""
 
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, ctx: Context | None = None):
+    def __init__(self, in_features: int, out_features: int, bias: bool = True, *, ctx: Context | None = None):
         ctx = ctx or default_context()
         self.in_features, self.out_features = in_features, out_features
         bound = 1.0 / math.sqrt(in_features)  # PyTorch's default init
@@ -183,12 +185,12 @@ class Linear(Module):
 
 
 class Conv2d(Module):
-    """NCHW convolution, weight [out, in, kh, kw] (torch.nn.Conv2d without dilation/groups)."""
+    """NCHW convolution, weight [out, in, kh, kw] (torch.nn.Conv2d; dilation and groups must be 1)."""
 
-    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride=1, padding=0, bias: bool = True,
-                 ctx: Context | None = None):
-        from .tensor import _pair
-
+    def __init__(self, in_channels: int, out_channels: int, kernel_size, stride=1, padding=0, dilation=1,
+                 groups: int = 1, bias: bool = True, padding_mode: str = "zeros", *, ctx: Context | None = None):
+        _unsupported(dilation=(_pair(dilation, "dilation"), (1, 1)), groups=(groups, 1),
+                     padding_mode=(padding_mode, "zeros"))
         ctx = ctx or default_context()
         self.in_channels, self.out_channels = in_channels, out_channels
         self.kernel_size = _pair(kernel_size, "kernel_size")
@@ -205,18 +207,31 @@ class Conv2d(Module):
                 f"stride={self.stride}, padding={self.padding}")
 
 
-class MaxPool2d(Module):
-    def __init__(self, kernel_size, stride=None, padding=0):
-        self.kernel_size, self.stride, self.padding = kernel_size, stride, padding
-
-    def forward(self, x): return max_pool2d(x, self.kernel_size, self.stride, self.padding)
-
+class _Pool2d(Module):
     def extra_repr(self) -> str:
         return f"kernel_size={self.kernel_size}, stride={self.stride or self.kernel_size}, padding={self.padding}"
 
 
-class AvgPool2d(MaxPool2d):
+class MaxPool2d(_Pool2d):
+    def __init__(self, kernel_size, stride=None, padding=0, dilation=1, return_indices: bool = False,
+                 ceil_mode: bool = False):
+        _unsupported(dilation=(_pair(dilation, "dilation"), (1, 1)), return_indices=(return_indices, False),
+                     ceil_mode=(ceil_mode, False))
+        _window(kernel_size, stride, padding)  # validate now, not at the first forward
+        self.kernel_size, self.stride, self.padding = kernel_size, stride, padding
+
+    def forward(self, x): return max_pool2d(x, self.kernel_size, self.stride, self.padding)
+
+
+class AvgPool2d(_Pool2d):
     """Padded cells count toward the average (torch's count_include_pad=True)."""
+
+    def __init__(self, kernel_size, stride=None, padding=0, ceil_mode: bool = False, count_include_pad: bool = True,
+                 divisor_override=None):
+        _unsupported(ceil_mode=(ceil_mode, False), count_include_pad=(count_include_pad, True),
+                     divisor_override=(divisor_override, None))
+        _window(kernel_size, stride, padding)
+        self.kernel_size, self.stride, self.padding = kernel_size, stride, padding
 
     def forward(self, x): return avg_pool2d(x, self.kernel_size, self.stride, self.padding)
 
@@ -224,7 +239,8 @@ class AvgPool2d(MaxPool2d):
 class Dropout(Module):
     """Zeroes inputs with probability p during training; identity in eval mode."""
 
-    def __init__(self, p: float = 0.5):
+    def __init__(self, p: float = 0.5, inplace: bool = False):
+        _unsupported(inplace=(inplace, False))
         if not 0.0 <= p <= 1.0:
             raise ValueError(f"dropout probability must be in [0, 1], got {p}")
         self.p = p
@@ -238,8 +254,9 @@ class Dropout(Module):
 class _BatchNorm(Module):
     _input_ndims: tuple = ()
 
-    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1, affine: bool = True,
-                 ctx: Context | None = None):
+    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float | None = 0.1, affine: bool = True,
+                 track_running_stats: bool = True, *, ctx: Context | None = None):
+        _unsupported(track_running_stats=(track_running_stats, True))
         ctx = ctx or default_context()
         self.num_features, self.eps, self.momentum = num_features, eps, momentum
         with persistent(ctx):
@@ -254,10 +271,14 @@ class _BatchNorm(Module):
         if x.ndim not in self._input_ndims:
             raise ValueError(f"{type(self).__name__} expects {' or '.join(map(str, self._input_ndims))}-D input, "
                              f"got {x.ndim}-D")
+        momentum = self.momentum
         if self.training:
-            self.num_batches_tracked.copy_([self.num_batches_tracked.item() + 1])
+            tracked = self.num_batches_tracked.item() + 1
+            self.num_batches_tracked.copy_([tracked])
+            if momentum is None:  # cumulative moving average, as in PyTorch
+                momentum = 1.0 / tracked
         return batch_norm(x, self.running_mean, self.running_var, self.weight, self.bias, self.training,
-                          self.momentum, self.eps)
+                          momentum if momentum is not None else 0.0, self.eps)
 
     def extra_repr(self) -> str:
         return f"{self.num_features}, eps={self.eps}, momentum={self.momentum}, affine={self.weight is not None}"
@@ -276,7 +297,9 @@ class BatchNorm2d(_BatchNorm):
 class Embedding(Module):
     """Lookup table: int32 indices [B] -> rows [B, embedding_dim]; weight ~ N(0, 1)."""
 
-    def __init__(self, num_embeddings: int, embedding_dim: int, ctx: Context | None = None):
+    def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx=None, max_norm=None, *,
+                 ctx: Context | None = None):
+        _unsupported(padding_idx=(padding_idx, None), max_norm=(max_norm, None))
         ctx = ctx or default_context()
         self.num_embeddings, self.embedding_dim = num_embeddings, embedding_dim
         self.weight = parameter(randn(num_embeddings, embedding_dim, ctx=ctx), ctx=ctx)
@@ -300,18 +323,68 @@ class Tanh(Module):
     def forward(self, x): return x.tanh()
 
 
+class LeakyReLU(Module):
+    def __init__(self, negative_slope: float = 0.01, inplace: bool = False):
+        _unsupported(inplace=(inplace, False))
+        self.negative_slope = negative_slope
+
+    def forward(self, x): return leaky_relu(x, self.negative_slope)
+
+    def extra_repr(self) -> str:
+        return f"negative_slope={self.negative_slope}"
+
+
+class _Elementwise(Module):
+    _fn = None
+
+    def __init__(self, inplace: bool = False):
+        _unsupported(inplace=(inplace, False))
+
+    def forward(self, x): return type(self)._fn(x)
+
+
+class ReLU6(_Elementwise):
+    _fn = staticmethod(relu6)
+
+
+class Hardsigmoid(_Elementwise):
+    _fn = staticmethod(hardsigmoid)
+
+
+class Hardswish(_Elementwise):
+    """x * relu6(x + 3) / 6: SiLU-like curve without exp (MobileNetV3)."""
+    _fn = staticmethod(hardswish)
+
+
+class SiLU(_Elementwise):
+    """x * sigmoid(x) (also called swish)."""
+    _fn = staticmethod(silu)
+
+
+class GELU(Module):
+    def __init__(self, approximate: str = "none"):
+        if approximate not in ("none", "tanh"):
+            raise ValueError(f"approximate must be 'none' or 'tanh', got {approximate!r}")
+        self.approximate = approximate
+
+    def forward(self, x): return gelu(x, self.approximate)
+
+    def extra_repr(self) -> str:
+        return f"approximate={self.approximate!r}"
+
+
 class Softmax(Module):
-    def __init__(self, dim: int = -1):
+    def __init__(self, dim: int | None = None):
         self.dim = dim
 
-    def forward(self, x): return x.softmax(self.dim)
+    def forward(self, x): return softmax(x, self.dim)
 
 
 class LogSoftmax(Module):
-    def __init__(self, dim: int = -1):
+    def __init__(self, dim: int | None = None):
         self.dim = dim
 
-    def forward(self, x): return x.log_softmax(self.dim)
+    def forward(self, x): return log_softmax(x, self.dim)
 
 
 class Flatten(Module):
@@ -321,6 +394,28 @@ class Flatten(Module):
         self.start_dim, self.end_dim = start_dim, end_dim
 
     def forward(self, x): return x.flatten(self.start_dim, self.end_dim)
+
+
+# --------------------------------------------------------------------------
+# Gradient utilities (torch.nn.utils)
+# --------------------------------------------------------------------------
+
+
+def clip_grad_norm_(parameters, max_norm: float, norm_type: float = 2.0) -> Tensor:
+    """Scales grads in place so their joint 2-norm is at most max_norm
+    (torch.nn.utils.clip_grad_norm_). Returns the norm before clipping."""
+    if norm_type != 2.0:
+        raise NotImplementedError("clip_grad_norm_ supports only norm_type=2")
+    params = [parameters] if isinstance(parameters, Tensor) else list(parameters)
+    if not params:
+        return tensor(0.0)
+    ptrs = L.ptr_array(p.ptr for p in params)
+    total = lib.nc_clip_grad_norm(ptrs, len(params), float(max_norm))
+    return tensor(total, ctx=params[0].ctx)
+
+
+class utils:  # noqa: N801  (namespace, as torch.nn.utils)
+    clip_grad_norm_ = staticmethod(clip_grad_norm_)
 
 
 # --------------------------------------------------------------------------
@@ -389,36 +484,50 @@ class Model(Module):
     _compiled = None
     stop_training = False
 
-    def compile(self, optimizer="adam", loss="cross_entropy", metrics=None, lr: float | None = None):
+    @property
+    def optimizer(self):
+        """The optimizer set by compile() (Keras' model.optimizer), else None."""
+        return self._compiled.optimizer if self._compiled is not None else None
+
+    def compile(self, optimizer="rmsprop", loss=None, loss_weights=None, metrics=None, *, lr: float | None = None):
+        """Keras' compile. ``optimizer`` is a name ("rmsprop", "adam", "adamw", "sgd" with Keras' default
+        hyperparameters) or an optimizer instance; ``lr`` overrides the learning rate of a named optimizer."""
         from .training import compile_model
 
+        _unsupported(loss_weights=(loss_weights, None))
         compile_model(self, optimizer, loss, metrics, lr)
         return self
 
-    def fit(self, x, y=None, epochs: int = 1, batch_size: int = 32, validation_data=None,
-            validation_split: float = 0.0, shuffle: bool = True, callbacks=None, verbose: int = 1, seed=None):
+    def fit(self, x=None, y=None, batch_size=None, epochs: int = 1, verbose="auto", callbacks=None,
+            validation_split: float = 0.0, validation_data=None, shuffle: bool = True, class_weight=None,
+            sample_weight=None, initial_epoch: int = 0, steps_per_epoch=None, *, seed=None):
         """Trains on arrays (x, y), or streams from a DataLoader / iterable of
         (x, y) batches passed as x with y=None (as Keras does for datasets)."""
         from .training import fit
 
-        return fit(self, x, y, epochs, batch_size, validation_data, validation_split, shuffle, callbacks, verbose,
-                   seed)
+        _unsupported(class_weight=(class_weight, None), sample_weight=(sample_weight, None),
+                     steps_per_epoch=(steps_per_epoch, None))
+        return fit(self, x, y, epochs, 32 if batch_size is None else batch_size, validation_data, validation_split,
+                   shuffle, callbacks, 1 if verbose == "auto" else verbose, seed, initial_epoch)
 
-    def evaluate(self, x, y=None, batch_size: int = 256, return_dict: bool = False):
+    def evaluate(self, x=None, y=None, batch_size=None, verbose="auto", sample_weight=None, steps=None,
+                 callbacks=None, return_dict: bool = False):
         """Loss (and metrics) on x, y. Like Keras: a float when there are no
         metrics, else ``[loss, accuracy]``; a dict with ``return_dict=True``."""
         from .training import evaluate
 
-        logs = evaluate(self, x, y, batch_size)
+        _unsupported(sample_weight=(sample_weight, None), steps=(steps, None), callbacks=(callbacks, None))
+        logs = evaluate(self, x, y, 32 if batch_size is None else batch_size)
         if return_dict:
             return logs
         values = list(logs.values())
         return values[0] if len(values) == 1 else values
 
-    def predict(self, x, batch_size: int = 256):
+    def predict(self, x, batch_size=None, verbose="auto", steps=None, callbacks=None):
         from .training import predict
 
-        return predict(self, x, batch_size)
+        _unsupported(steps=(steps, None), callbacks=(callbacks, None))
+        return predict(self, x, 32 if batch_size is None else batch_size)
 
 
 class Sequential(Model):

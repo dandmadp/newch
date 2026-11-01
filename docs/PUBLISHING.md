@@ -70,5 +70,5 @@ PyPI 웹에서 "yank" 처리한 뒤 다음 번호로 올리세요.
   리눅스 휠을 만드는 단계를 추가할 수 있습니다
 - **리눅스·macOS에서의 sdist 설치는 아직 실행해 보지 않았습니다.** Windows에서는 휠 설치와 sdist 설치를 새 가상환경에서 모두 확인했고,
   리눅스·macOS에서는 CI가 소스에서 빌드한 엔진으로 전체 테스트를 통과합니다
-- PyPI 페이지에는 README.md가 그대로 표시됩니다. README의 상대 링크(`docs/...`)는 PyPI에서 열리지 않으므로,
-  GitHub 저장소를 만들면 `pyproject.toml`에 `[project.urls]`를 추가하고 링크를 절대 주소로 바꾸는 것을 권합니다
+- PyPI 페이지에는 README.md가 그대로 표시됩니다. README의 상대 링크는 PyPI에서 열리지 않으므로 README 링크는
+  GitHub 절대 주소로 씁니다 (`pyproject.toml`의 `[project.urls]`도 GitHub를 가리킵니다)

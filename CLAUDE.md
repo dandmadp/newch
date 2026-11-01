@@ -42,7 +42,8 @@ filtered pipeline once hid a failing test that then got pushed.
 - `engine/src/kernels/`: `ref/` (truth), `neon/`, `x86/` (AVX2 via per-function `target` attributes). Ops call
   `ctx->k` or `nc__gemm()` (threaded), never ISA code directly. `test_kernel_parity` compares tiers to ref.
 - `newch/`: `tensor.py` (Tensor, Context, functional, NCW1 files), `net.py` (Module, layers, Model, Sequential,
-  quantize_), `data.py` (DataLoader, FileArray), `training.py`, `optim.py`, `callbacks.py`, `_lib.py` (ctypes
+  quantize_), `data.py` (DataLoader, FileArray), `training.py`, `optim.py` (optimizers, lr_scheduler), `callbacks.py`, `ml.py` (scikit-learn style; each call runs in a
+  private Context so it never touches the caller's step arena), `_lib.py` (ctypes
   signatures; keep in sync with `nc.h`, including struct layouts like `nc_config`).
 - Docs: `docs/PROGRESS.md` (state, decisions, naming table, verification), `docs/FORMAT.md`, `docs/PUBLISHING.md`.
 
@@ -60,11 +61,15 @@ filtered pipeline once hid a failing test that then got pushed.
 - GEMM threading must stay deterministic (one thread per output element).
 - Version lives in three places: `pyproject.toml`, `newch/__init__.py`, `NC_VERSION_*` in `nc.h`.
 
-## Status (2026-11-01)
+## Status (2026-11-02)
 
-- v0.2.0 on GitHub; CI (Windows/Linux/macOS, QEMU aarch64/armv7/riscv64, CMake, wheels) all green.
-- **Published on PyPI as `newch` 0.2.0** (Windows x86-64 wheel + sdist; https://pypi.org/project/newch/),
-  verified by installing from PyPI into a fresh venv. 0.2.0 can never be re-uploaded: any fix ships as a new
-  version (bump all three version locations). The user runs `twine upload` themselves (`docs/PUBLISHING.md`).
-- Next candidates: manylinux/macOS wheels, scikit-learn-style classic ML, graph compiler (memory planning inside a
-  step), Orange Pi measurement and NEON int8 (dotprod) kernels. See `docs/PROGRESS.md` §10.
+- **0.3.0 committed locally, not yet pushed or uploaded.** Adds: argument order/defaults aligned with
+  torch/Keras/sklearn (unsupported args raise), AdamW/RMSprop, gradient accumulation, clip_grad_norm_, LR
+  schedulers, Keras callbacks, `newch.ml` (scikit-learn style), 7 activations, AVX2/NEON vector exp/sigmoid/
+  tanh/erf kernels. Activation comparison is in `docs/PROGRESS.md` §7 (`tools/bench_act.py`).
+- PyPI has `newch` 0.2.0 (Windows x86-64 wheel + sdist; https://pypi.org/project/newch/). Released versions
+  can never be re-uploaded: any fix ships as a new version (bump all three version locations). The user runs
+  `twine upload` themselves (`docs/PUBLISHING.md`).
+- NEON vector kernels are compiled but only verified under QEMU in CI, not on a real board.
+- Next candidates: LogisticRegression, optimizer state save/resume, manylinux/macOS wheels, graph compiler
+  (memory planning inside a step), parallel elementwise ops. See `docs/PROGRESS.md` §11.

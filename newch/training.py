@@ -45,7 +45,9 @@ def compile_model(model, optimizer, loss, metrics, lr) -> None:
     params = model.parameters()
     if not params:
         raise ValueError("model has no trainable parameters")
-    if isinstance(loss, str):
+    if loss is None:
+        loss_fn = None  # allowed by compile; fit/evaluate then ask for it
+    elif isinstance(loss, str):
         try:
             loss_fn = LOSSES[loss]
         except KeyError:
@@ -66,6 +68,8 @@ def compile_model(model, optimizer, loss, metrics, lr) -> None:
 def _require(model) -> Compiled:
     if model._compiled is None:
         raise RuntimeError("call model.compile(...) before fit/evaluate")
+    if model._compiled.loss is None:
+        raise ValueError("no loss configured: pass loss=... to compile()")
     return model._compiled
 
 
@@ -167,10 +171,11 @@ def _evaluate_batches(model, cfg: Compiled, batches) -> dict:
 
 
 def _fmt(logs: dict) -> str:
-    return " - ".join(f"{k}: {v:.4f}" for k, v in logs.items())
+    return "  ".join(f"{k} {v:.4f}" for k, v in logs.items())
 
 
-def fit(model, x, y, epochs, batch_size, validation_data, validation_split, shuffle, callbacks, verbose, seed):
+def fit(model, x, y, epochs, batch_size, validation_data, validation_split, shuffle, callbacks, verbose, seed,
+        initial_epoch=0):
     cfg = _require(model)
     ctx = cfg.ctx
     label_dtype = int32 if cfg.classification else float32
@@ -237,7 +242,9 @@ def fit(model, x, y, epochs, batch_size, validation_data, validation_split, shuf
             cb.on_train_begin({})
         model.stop_training = False
         logs: dict = {}
-        for epoch in range(epochs):
+        for epoch in range(initial_epoch, epochs):
+            for cb in cbs:
+                cb.on_epoch_begin(epoch, {})
             model.train()
             t0 = time.perf_counter()
             logs = _run_epoch(model, cfg, train_batches(), train=True)
@@ -246,7 +253,7 @@ def fit(model, x, y, epochs, batch_size, validation_data, validation_split, shuf
             for cb in cbs:
                 cb.on_epoch_end(epoch, logs)
             if verbose:
-                print(f"Epoch {epoch + 1}/{epochs} - {time.perf_counter() - t0:.2f}s - {_fmt(logs)}",
+                print(f"[{epoch + 1}/{epochs}] {time.perf_counter() - t0:.2f}s  {_fmt(logs)}",
                       file=sys.stdout, flush=True)
             if model.stop_training:
                 break

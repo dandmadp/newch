@@ -16,6 +16,10 @@ static void merge(nc_kernels *dst, const nc_kernels *t) {
     NC_MERGE(scale_f32);
     NC_MERGE(relu_f32);
     NC_MERGE(sum_f32);
+    NC_MERGE(exp_f32);
+    NC_MERGE(sigmoid_f32);
+    NC_MERGE(tanh_f32);
+    NC_MERGE(erf_f32);
     NC_MERGE(gemm_f32);
     NC_MERGE(gemm_s8_nt);
     dst->name = t->name;

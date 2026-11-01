@@ -61,6 +61,31 @@ model.fit(DataLoader(TensorDataset(x, y), batch_size=64, shuffle=True), epochs=3
 model.load_state_dict({k: v.numpy() for k, v in torch_model.state_dict().items()})
 ```
 
+**메모리가 작을 때:** `gradient_accumulation_steps`로 작은 배치를 여러 번 모아 한 번에 갱신합니다 (Keras 3과 같은 의미).
+
+```python
+opt = nc.optim.AdamW(model.parameters(), lr=1e-3, gradient_accumulation_steps=4)   # 배치 16 x 4 = 64처럼 학습
+model.compile(optimizer=opt, loss="cross_entropy", metrics=["accuracy"])
+model.fit(x, y, batch_size=16, callbacks=[nc.callbacks.ReduceLROnPlateau(patience=2),
+                                          nc.callbacks.ModelCheckpoint("best.ncw", save_best_only=True,
+                                                                       save_weights_only=True)])
+```
+
+**고전 ML (scikit-learn 스타일):** 전처리, 선형 회귀, k-means를 같은 엔진으로 실행합니다.
+
+```python
+from newch import ml
+X_tr, X_te, y_tr, y_te = ml.train_test_split(X, y, test_size=0.2, random_state=0)
+scaler = ml.StandardScaler().fit(X_tr)
+reg = ml.Ridge(alpha=1.0).fit(scaler.transform(X_tr), y_tr)
+print(reg.score(scaler.transform(X_te), y_te))
+labels = ml.KMeans(n_clusters=3, random_state=0).fit_predict(X)
+```
+
+**활성화 함수:** `ReLU`, `LeakyReLU`, `ReLU6`, `Hardsigmoid`, `Hardswish`, `SiLU`, `GELU`, `Sigmoid`, `Tanh` (PyTorch와 같은 정의).
+exp가 필요한 함수도 AVX2·NEON 벡터 커널로 ReLU와 비슷한 속도로 학습합니다. 비교 결과는
+[docs/PROGRESS.md](https://github.com/dandmadp/newch/blob/main/docs/PROGRESS.md)의 "활성화 함수 비교"에 있습니다.
+
 **int8 양자화 (추론):** `nc.quantize_(model)`은 모든 `Linear`를 int8 가중치로 바꿉니다 (가중치 메모리 1/4).
 
 **스레드:** 기본값은 모든 코어입니다. `nc.set_default_context(nc.Context(threads=2))`로 바꿀 수 있습니다.
@@ -128,7 +153,7 @@ engine/src/ops/            elementwise, linalg, reduce, shape, nn, conv, quant
 engine/src/kernels/        디스패치, ref/, neon/, x86/(AVX2)
 engine/src/runtime/        CPU 감지, 스레드 풀
 engine/tests/              C 테스트
-newch/                     Python 패키지 (tensor, net, optim, data, training, callbacks)
+newch/                     Python 패키지 (tensor, net, optim, data, training, callbacks, ml)
 tests/                     Python 테스트
 examples/                  train_spiral.c, mnist_cnn.py
 docs/                      PROGRESS.md (작업 요약), FORMAT.md (가중치 파일 포맷)

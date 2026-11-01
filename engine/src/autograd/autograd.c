@@ -99,5 +99,10 @@ nc_status nc_backward(nc_tensor *loss) {
 }
 
 void nc_zero_grad(nc_tensor *t) {
-    if (t && t->grad) memset(t->grad->data, 0, (size_t)nc_numel(t) * sizeof(float));
+    if (t && t->grad && !(t->flags & NC_TF_GRAD_CLEARED))
+        memset(t->grad->data, 0, (size_t)nc_numel(t) * sizeof(float));
+}
+
+void nc_clear_grad(nc_tensor *t) {
+    if (t && t->grad) t->flags |= NC_TF_GRAD_CLEARED;
 }
