@@ -231,6 +231,9 @@ class Tensor:
     def __del__(self):
         # Persistent tensors own their memory exclusively (the engine never
         # makes persistent views), so the owning wrapper can free it.
+        # Consequence for callers: never pass `make_tensor().ptr` straight
+        # into a C call. CPython drops the temporary right after `.ptr` is
+        # read, before the call runs; bind it to a name first.
         try:
             if self._owner and self._p and self._ctx._p:
                 lib.nc_release(self._p)
@@ -376,14 +379,16 @@ class Tensor:
     def __add__(self, o):
         if isinstance(o, Number):
             return self._w(lib.nc_add_scalar(self.ptr, float(o)))
-        return self._w(lib.nc_add(self.ptr, self._other(o).ptr))
+        o = self._other(o)  # keep the operand alive across the call
+        return self._w(lib.nc_add(self.ptr, o.ptr))
 
     __radd__ = __add__
 
     def __sub__(self, o):
         if isinstance(o, Number):
             return self._w(lib.nc_add_scalar(self.ptr, -float(o)))
-        return self._w(lib.nc_sub(self.ptr, self._other(o).ptr))
+        o = self._other(o)  # keep the operand alive across the call
+        return self._w(lib.nc_sub(self.ptr, o.ptr))
 
     def __rsub__(self, o):
         return self._other(o) - self
@@ -391,14 +396,16 @@ class Tensor:
     def __mul__(self, o):
         if isinstance(o, Number):
             return self._w(lib.nc_scale(self.ptr, float(o)))
-        return self._w(lib.nc_mul(self.ptr, self._other(o).ptr))
+        o = self._other(o)  # keep the operand alive across the call
+        return self._w(lib.nc_mul(self.ptr, o.ptr))
 
     __rmul__ = __mul__
 
     def __truediv__(self, o):
         if isinstance(o, Number):
             return self._w(lib.nc_scale(self.ptr, 1.0 / float(o)))
-        return self._w(lib.nc_div(self.ptr, self._other(o).ptr))
+        o = self._other(o)  # keep the operand alive across the call
+        return self._w(lib.nc_div(self.ptr, o.ptr))
 
     def __rtruediv__(self, o):
         return self._other(o) / self
@@ -412,7 +419,8 @@ class Tensor:
         return self._w(lib.nc_pow_scalar(self.ptr, float(p)))
 
     def __matmul__(self, o):
-        return self._w(lib.nc_matmul(self.ptr, self._other(o).ptr))
+        o = self._other(o)  # keep the operand alive across the call
+        return self._w(lib.nc_matmul(self.ptr, o.ptr))
 
     def __rmatmul__(self, o):
         return self._other(o) @ self
@@ -544,7 +552,8 @@ def tensor(data, dtype: str | None = None, requires_grad: bool = False, ctx: Con
     """
     if isinstance(data, Tensor):
         if data.dtype == float32 and dtype in (None, float32):
-            t = data.ctx.wrap(lib.nc_add_scalar(data.detach().ptr, 0.0))  # engine-side copy
+            src = data.detach()  # must outlive the call: a persistent temp is freed on GC
+            t = data.ctx.wrap(lib.nc_add_scalar(src.ptr, 0.0))  # engine-side copy
             if requires_grad:
                 t.requires_grad = True
             return t
@@ -703,7 +712,8 @@ def cross_entropy(logits: Tensor, labels) -> Tensor:
 
 
 def mse_loss(pred: Tensor, target) -> Tensor:
-    return pred._w(lib.nc_mse_loss(pred.ptr, pred._other(target).ptr))
+    target = pred._other(target)
+    return pred._w(lib.nc_mse_loss(pred.ptr, target.ptr))
 
 
 # --------------------------------------------------------------------------

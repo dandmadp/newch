@@ -25,11 +25,12 @@ jobs:
         run: python tools/build.py --debug --no-run
       - name: C tests (debug)
         shell: bash
-        run: ./build/host/nc_tests*
+        run: NC_DEBUG_POISON=1 ./build/host/nc_tests*
       - name: Python tests without numpy
+        shell: bash
         run: |
           pip uninstall -y numpy
-          python -m unittest discover -s tests
+          NC_DEBUG_POISON=1 python -m unittest discover -s tests
 
   # ARM / RISC-V correctness under QEMU (static musl binaries, no sysroot needed).
   emulated:
@@ -52,7 +53,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y qemu-user-static
       - run: pip install ziglang
       - run: python tools/build.py --target ${{ matrix.target }} --no-run
-      - run: ${{ matrix.qemu }} ./build/${{ matrix.target }}/nc_tests
+      - run: NC_DEBUG_POISON=1 ${{ matrix.qemu }} ./build/${{ matrix.target }}/nc_tests
 
   # Every cross target must keep compiling without warnings.
   cross:

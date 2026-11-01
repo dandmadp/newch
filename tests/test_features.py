@@ -215,6 +215,25 @@ class TestMemory(Base):
         nc.step_end()
         self.assertEqual(nc.mem_stats()["persistent_bytes"], base)
 
+    def test_persistent_temporaries_survive_calls(self):
+        # Temporaries made inside persistent() are owned and freed on GC; they
+        # must stay alive until the C call that uses them returns. Run with
+        # NC_DEBUG_POISON=1 (tools/build.py does) so a regression reads garbage.
+        base = nc.randn(3)
+        with nc.persistent():
+            p = nc.tensor([1.0, 2.0, 3.0])
+            copy = nc.tensor(base)                  # detach() temporary
+            added = p + [10.0, 20.0, 30.0]          # list operand temporary
+            prod = p * nc.tensor([2.0, 2.0, 2.0])
+            rsub = [1.0, 1.0, 1.0] - p
+            mse = nc.mse_loss(p, [1.0, 2.0, 5.0])
+        nc.step_end()
+        self.assertEqual(copy.tolist(), [round(v, 7) for v in copy.tolist()])
+        self.assertEqual(added.tolist(), [11.0, 22.0, 33.0])
+        self.assertEqual(prod.tolist(), [2.0, 4.0, 6.0])
+        self.assertEqual(rsub.tolist(), [0.0, -1.0, -2.0])
+        self.assertAlmostEqual(mse.item(), 4.0 / 3.0, places=5)
+
     def test_threads_and_trim(self):
         a, b = [], []
         for threads, out in ((1, a), (4, b)):

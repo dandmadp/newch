@@ -15,6 +15,7 @@ this script is for development hosts and cross-checking all targets.
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -108,10 +109,13 @@ def main() -> int:
             out_dir = build(t, args.debug, args.lib_only)
             if t == "host" and not (args.no_run or args.lib_only):
                 exe = ".exe" if sys.platform == "win32" else ""
-                subprocess.run([str(out_dir / f"nc_tests{exe}")], check=True)
+                # Released memory is overwritten during tests, so a use-after-free
+                # fails everywhere instead of only on some allocators.
+                env = {**os.environ, "NC_DEBUG_POISON": "1"}
+                subprocess.run([str(out_dir / f"nc_tests{exe}")], check=True, env=env)
                 print("\n[python] unittest")
                 subprocess.run([sys.executable, "-m", "unittest", "discover", "-s", "tests"],
-                               check=True, cwd=ROOT)
+                               check=True, cwd=ROOT, env=env)
     except subprocess.CalledProcessError as e:
         return e.returncode or 1
     return 0

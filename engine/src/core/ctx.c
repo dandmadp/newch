@@ -38,9 +38,22 @@ void *nc__persistent_alloc(nc_ctx *ctx, size_t bytes) {
     return p;
 }
 
+/* NC_DEBUG_POISON=1 fills released memory with 0xCD so that any later read
+ * of a released tensor shows up as garbage on every platform, instead of
+ * depending on what the allocator happens to leave behind. Used by tests. */
+static int poison_enabled(void) {
+    static int cached = -1;
+    if (cached < 0) {
+        const char *v = getenv("NC_DEBUG_POISON");
+        cached = v && v[0] && v[0] != '0';
+    }
+    return cached;
+}
+
 void nc__persistent_free(nc_ctx *ctx, void *p) {
     if (!p) return;
     nc_pblock *blk = (nc_pblock *)((void **)p)[-1];
+    if (poison_enabled()) memset(p, 0xCD, blk->bytes);
     if (blk->prev) blk->prev->next = blk->next;
     else ctx->persistent_list = blk->next;
     if (blk->next) blk->next->prev = blk->prev;
