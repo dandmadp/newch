@@ -311,6 +311,14 @@ NC_API nc_status nc_backward(nc_tensor *loss);
  * fails with NC_ERR_STATE (PyTorch: retain_graph=False). NC_BACKWARD_RETAIN
  * keeps everything (no release at all). */
 enum { NC_BACKWARD_FREE_GRAPH = 1, NC_BACKWARD_RETAIN = 2 };
+
+/* Gives a temporary tensor's data back to the step arena now (inference:
+ * an activation the caller is done with). Ignored for persistent tensors,
+ * views (they do not own data) and tensors a recorded op uses (backward
+ * needs them). The tensor must not be read afterwards; views of it must be
+ * dead too. Ops that are not recorded (no_grad, or no input requiring grad)
+ * already free their own scratch memory when they return. */
+NC_API void nc_release_temp(nc_tensor *t);
 NC_API nc_status nc_backward_ex(nc_tensor *loss, int flags, nc_tensor *const *keep, int n_keep);
 NC_API void nc_zero_grad(nc_tensor *t);
 /* Marks the grad as absent (torch's zero_grad(set_to_none=True)): nc_grad()

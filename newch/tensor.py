@@ -43,6 +43,7 @@ class Context:
             raise NcError("nc_init failed (out of memory?)")
         self.step_id = 0
         self._pdepth = 0  # nesting of persistent(): results are persistent while > 0
+        self._grad_on = True  # False inside no_grad(): temporaries are freed when Python drops them
         self._live: dict = {}  # this step's temporaries that Python still references: ptr -> count
 
     def step_end(self) -> None:
@@ -79,6 +80,7 @@ class Context:
             self.raise_error()
         t = Tensor._from_ptr(ptr, self, base, self._pdepth > 0 if persistent is None else persistent)
         t._owner = t._step is None
+        t._free = t._step is not None and not self._grad_on
         return t
 
     @property
@@ -132,9 +134,11 @@ def mem_stats(ctx: Context | None = None) -> dict:
 def no_grad(ctx: Context | None = None):
     ctx = ctx or default_context()
     prev = lib.nc_set_grad_enabled(ctx._p, 0)
+    prev_py, ctx._grad_on = ctx._grad_on, False
     try:
         yield
     finally:
+        ctx._grad_on = prev_py
         lib.nc_set_grad_enabled(ctx._p, prev)
 
 
@@ -227,7 +231,7 @@ class Tensor:
     raises NcError instead of reading freed memory.
     """
 
-    __slots__ = ("_p", "_ctx", "_step", "_owner", "_base")
+    __slots__ = ("_p", "_ctx", "_step", "_owner", "_base", "_free")
 
     @classmethod
     def _from_ptr(cls, ptr, ctx: Context, base: "Tensor | None" = None, persistent: "bool | None" = None) -> "Tensor":
@@ -245,6 +249,7 @@ class Tensor:
             live[ptr] = live.get(ptr, 0) + 1
         t._owner = False  # only Context.wrap hands out ownership
         t._base = base    # keeps the tensor whose memory this one uses alive
+        t._free = False   # set by Context.wrap / _w for no_grad results
         return t
 
     def __del__(self):
@@ -265,6 +270,10 @@ class Tensor:
                     live[self._p] = c
                 else:
                     live.pop(self._p, None)
+                    if self._free:
+                        # inference: nobody holds this result any more; the engine
+                        # keeps it anyway if backward needs it or it is a view
+                        lib.nc_release_temp(self._p)
         except Exception:  # interpreter shutdown
             pass
 
@@ -296,9 +305,11 @@ class Tensor:
         if ctx._pdepth:
             t._step = None
             t._owner = True
+            t._free = False
         else:
             t._step = ctx.step_id
             t._owner = False
+            t._free = not ctx._grad_on
             live = ctx._live
             live[ptr] = live.get(ptr, 0) + 1
         return t

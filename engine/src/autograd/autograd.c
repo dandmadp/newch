@@ -35,6 +35,13 @@ nc_tensor *nc__apply(const nc_op_def *op, nc_tensor **in, int n_in, const nc_op_
     int64_t shape[NC_MAX_DIMS];
     if (op->infer(n, &dt, &nd, shape) != NC_OK) return NULL;
 
+    int record = ctx->grad_enabled && !persistent && op->backward != NULL;
+    if (record) {
+        record = 0;
+        for (int i = 0; i < n_in; i++)
+            if (nc__needs_grad(in[i])) record = 1;
+    }
+
     /* Persistent results always own their data, so each one can be released
      * on its own (nc_release) without invalidating another. */
     int can_view = op->view != NULL && !persistent;
@@ -42,17 +49,29 @@ nc_tensor *nc__apply(const nc_op_def *op, nc_tensor **in, int n_in, const nc_op_
     if (!(can_view && op->view(n, nd, shape))) {
         n->out = nc__tensor_new(ctx, dt, nd, shape, persistent);
         if (!n->out) return NULL;
-        if (op->forward(n) != NC_OK) return NULL;
+        /* An op that will not be recorded never runs backward, so whatever its
+         * forward allocates besides the output (scratch, saved values) is dead
+         * once it returns: hand it back right away (inference memory). */
+        int scratch = !record && !persistent && !ctx->bwd_logging;
+        if (scratch) {
+            ctx->bwd_logging = 1;
+            ctx->bwd_tmp_n = 0;
+        }
+        nc_status st = op->forward(n);
+        if (scratch) {
+            ctx->bwd_logging = 0;
+            for (int i = 0; i < ctx->bwd_tmp_n; i++) nc__arena_free(ctx, ctx->bwd_tmp[i], ctx->bwd_tmp_size[i]);
+            ctx->bwd_tmp_n = 0;
+            n->saved = NULL;
+        }
+        if (st != NC_OK) return NULL;
     }
     if (!n->out) return NULL;
 
-    int record = ctx->grad_enabled && !persistent && op->backward != NULL;
     if (record) {
-        record = 0;
-        for (int i = 0; i < n_in; i++)
-            if (nc__needs_grad(in[i])) record = 1;
-    }
-    if (record) {
+        /* backward reads these: keep their data (owners, for views) */
+        for (int i = 0; i < n_in; i++) (in[i]->owner ? in[i]->owner : in[i])->flags |= NC_TF_ON_TAPE;
+        (n->out->owner ? n->out->owner : n->out)->flags |= NC_TF_ON_TAPE;
         n->out->flags |= NC_TF_REQUIRES_GRAD;
         n->out->node = n;
         n->prev = ctx->tape;
@@ -72,6 +91,18 @@ static int is_kept(void *const *kept, int n, void *data) {
 }
 
 nc_status nc_backward(nc_tensor *loss) { return nc_backward_ex(loss, 0, NULL, 0); }
+
+void nc_release_temp(nc_tensor *t) {
+    if (!t || (t->flags & (NC_TF_PERSISTENT | NC_TF_ON_TAPE)) || !(t->flags & NC_TF_OWNS_DATA) || !t->data) return;
+    nc_ctx *ctx = t->ctx;
+    nc__arena_free(ctx, t->data, (size_t)nc_numel(t) * nc__dtype_size(t->dtype));
+    t->data = NULL;
+    if (t->grad && t->grad->data && !(t->grad->flags & NC_TF_PERSISTENT)) {
+        nc__arena_free(ctx, t->grad->data, (size_t)nc_numel(t->grad) * sizeof(float));
+        t->grad->data = NULL;
+        t->grad = NULL;
+    }
+}
 
 nc_status nc_backward_ex(nc_tensor *loss, int flags, nc_tensor *const *keep, int n_keep) {
     if (!loss) return NC_ERR_ARG;

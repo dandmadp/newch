@@ -261,5 +261,47 @@ class TestBackwardMemory(Base):
         self.assertEqual(w.grad.tolist(), [3.0, 3.0])
 
 
+
+class TestInferenceMemory(Base):
+    def model(self):
+        torch.manual_seed(2)
+        return nn.Sequential(nn.Conv2d(1, 16, 3, padding=1), nn.ReLU(), nn.Conv2d(16, 16, 3, padding=1), nn.ReLU(),
+                             nn.Flatten(), nn.Linear(16 * 28 * 28, 10)).eval()
+
+    def test_no_grad_forwards_do_not_pile_up(self):
+        model, ctx = self.model(), torch.default_context()
+        ctx.step_end()
+        x = torch.randn(64, 1, 28, 28)
+        with torch.no_grad():
+            first = model(x).tolist()
+            ctx.reset_peak()
+            for _ in range(5):
+                out = model(x)
+            peak = torch.mem_stats()["arena_peak_bytes"]
+            self.assertEqual(out.tolist(), first)  # same values with memory reuse
+        one_activation = 64 * 16 * 28 * 28 * 4
+        self.assertLess(peak, 6 * one_activation)  # five forwards would hold ~20 activations otherwise
+
+    def test_held_tensors_survive(self):
+        model = self.model()
+        with torch.no_grad():
+            x = torch.randn(4, 1, 28, 28)
+            h = model[1](model[0](x))  # kept by the caller
+            flat = h.view(4, -1)       # a view keeps its base alive
+            del h
+            out = model[5](model[4](model[3](model[2](flat.view(4, 16, 28, 28)))))
+        self.assertEqual(out.shape, (4, 10))
+        self.assertTrue(math.isfinite(flat.sum().item()))
+
+    def test_no_grad_tensor_later_used_for_training(self):
+        lin = nn.Linear(8, 2)
+        with torch.no_grad():
+            feats = torch.randn(4, 8) * 2.0   # made under no_grad ...
+        loss = F.cross_entropy(lin(feats), torch.tensor([0, 1, 0, 1]))
+        del feats                              # ... dropped, but the tape still needs it
+        loss.backward()
+        self.assertTrue(all(math.isfinite(v) for row in lin.weight.grad.tolist() for v in row))
+
+
 if __name__ == "__main__":
     unittest.main()

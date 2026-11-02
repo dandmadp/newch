@@ -129,6 +129,7 @@ nc_tensor *nc__tensor_alias(const nc_tensor *src, int persistent) {
     t->grad = NULL;
     t->node = NULL;
     t->name = NULL;
+    t->owner = src->owner ? src->owner : (nc_tensor *)src;
     t->flags = persistent ? NC_TF_PERSISTENT : 0;
     return t;
 }

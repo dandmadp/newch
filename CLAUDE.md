@@ -53,7 +53,10 @@ filtered pipeline once hid a failing test that then got pushed.
   it goes (`nc_backward_ex`): node temporaries, intermediate grads, and activations nobody holds. Python passes
   its live temporaries (`Context._live`, kept by `Tensor._from_ptr` / `_w` / `__del__`) so they survive. Arena
   allocations >= chunk/4 are separate blocks with a budgeted cache (`ctx.c`). Backward ops must only allocate
-  through `nc__arena_alloc` (logged and freed after the node) or `nc__grad_buf` (kept).
+  through `nc__arena_alloc` (logged and freed after the node) or `nc__grad_buf` (kept). Ops that are not recorded
+  free their forward scratch on return; under `no_grad()` Python calls `nc_release_temp` when a temporary's last
+  wrapper dies (`Tensor._free`). Data a recorded node uses is flagged `NC_TF_ON_TAPE` on its owner (views carry
+  `owner`) and is never released early.
 - **Never pass `make_tensor().ptr` straight into a C call.** CPython drops the temporary after `.ptr` is read,
   before the call runs; a persistent temporary is then freed (use-after-free). Bind it to a name first. Tests run
   with `NC_DEBUG_POISON=1` so this shows up on every platform.

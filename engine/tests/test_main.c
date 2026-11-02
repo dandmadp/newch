@@ -518,6 +518,53 @@ static void test_backward_release(void) {
     nc_free_ctx(ctx);
 }
 
+static void test_inference_release(void) {
+    nc_ctx *ctx = new_ctx();
+    nc_tensor *w = nc_parameter(ctx, nc_randn(ctx, 0.1f, 4, SHAPE(16, 8, 3, 3)), 4, SHAPE(16, 8, 3, 3));
+    size_t peak[2];
+    float ref = 0;
+    for (int mode = 0; mode < 2; mode++) { /* 0: keep everything (grad on), 1: no_grad + release */
+        nc_step_end(ctx);
+        nc_manual_seed(ctx, 3);
+        nc_tensor *own = nc_randn(ctx, 1.0f, 4, SHAPE(32, 8, 28, 56));
+        nc_reset_peak(ctx);
+        int prev = nc_set_grad_enabled(ctx, mode == 0);
+        for (int layer = 0; layer < 4; layer++) {
+            nc_tensor *inp = nc_reshape(own, 4, SHAPE(32, 8, 28, 56)); /* a view of the previous output */
+            nc_tensor *c = nc_conv2d(inp, nc_reshape(w, 4, SHAPE(16, 8, 3, 3)), NULL, 1, 2, 1, 1);
+            nc_tensor *next = nc_relu(c); /* [32, 16, 28, 28] */
+            if (mode == 1) {
+                nc_release_temp(c);
+                nc_release_temp(own);
+            }
+            own = next;
+        }
+        nc_tensor *h = own;
+        float v = nc_item(nc_sum(h, NC_ALL_AXES, 0));
+        if (mode == 0) ref = v;
+        else CHECK_NEAR(v, ref, 1e-3 * fabs(ref)); /* same result */
+        nc_set_grad_enabled(ctx, prev);
+        peak[mode] = nc_get_mem_stats(ctx).arena_peak_bytes;
+    }
+    printf("    4-layer forward peak: grad on %.1f MiB, no_grad + release %.1f MiB\n", peak[0] / 1048576.0,
+           peak[1] / 1048576.0);
+    CHECK(peak[1] * 2 < peak[0]);
+
+    /* never released: tensors on the tape, and views */
+    nc_step_end(ctx);
+    nc_tensor *p = nc_parameter(ctx, nc_full(ctx, 2.0f, 1, SHAPE(4)), 1, SHAPE(4));
+    nc_tensor *a = nc_full(ctx, 3.0f, 1, SHAPE(4));
+    nc_tensor *av = nc_reshape(a, 2, SHAPE(2, 2));
+    nc_tensor *loss = nc_sum(nc_mul(nc_reshape(av, 1, SHAPE(4)), p), NC_ALL_AXES, 0);
+    nc_release_temp(a);  /* a's data is used by the recorded mul (through views): kept */
+    nc_release_temp(av); /* a view owns nothing */
+    CHECK(nc_data_f32(a) != NULL);
+    CHECK(nc_backward(loss) == NC_OK);
+    CHECK_NEAR(nc_data_f32(nc_grad(p))[0], 3.0, 0);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
 static void test_release(void) {
     nc_ctx *ctx = new_ctx();
     size_t base = nc_get_mem_stats(ctx).persistent_bytes;
@@ -1007,6 +1054,7 @@ int main(void) {
         {"memory", test_memory},
         {"release", test_release},
         {"backward_release", test_backward_release},
+        {"inference_release", test_inference_release},
         {"kernel_parity", test_kernel_parity},
         {"conv_pool_bn", test_conv_pool_bn},
         {"dropout", test_dropout},

@@ -23,7 +23,10 @@ enum {
     /* grad buffer is kept for reuse but counts as absent (nc_clear_grad):
      * nc_grad() returns NULL and optimizers skip the tensor until backward
      * writes a fresh gradient into it */
-    NC_TF_GRAD_CLEARED = 1u << 3
+    NC_TF_GRAD_CLEARED = 1u << 3,
+    /* a recorded node uses this data (as input or output): backward needs it,
+     * so nc_release_temp leaves it alone. Set on the data owner. */
+    NC_TF_ON_TAPE = 1u << 4
 };
 
 typedef struct nc_node nc_node;
@@ -38,6 +41,7 @@ struct nc_tensor {
     void *data;                  /* points at logical element 0 */
     nc_tensor *grad;             /* contiguous, same logical shape */
     nc_node *node;               /* op that produced this tensor (NULL = leaf) */
+    nc_tensor *owner;            /* views: the tensor whose data this aliases (NULL = owns it) */
     const char *name;
 };
 

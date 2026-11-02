@@ -146,6 +146,7 @@ _SIGNATURES = {
     # autograd
     "nc_backward": (c_int, [P]),
     "nc_backward_ex": (c_int, [P, c_int, POINTER(c_void_p), c_int]),
+    "nc_release_temp": (None, [P]),
     "nc_zero_grad": (None, [P]),
     "nc_clear_grad": (None, [P]),
     # optimizers
