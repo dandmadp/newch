@@ -5,6 +5,7 @@ from __future__ import annotations
 import array
 import contextlib
 import ctypes
+import json
 import warnings
 from typing import Sequence
 
@@ -14,6 +15,7 @@ from ._lib import lib
 float32 = "float32"
 int32 = "int32"
 int8 = "int8"
+uint8 = "uint8"  # compact storage for raw data (pixels, small labels); convert with .float()
 
 
 class NcError(RuntimeError):
@@ -178,18 +180,29 @@ def _is_numpy(obj) -> bool:
     return type(obj).__module__.split(".")[0] == "numpy"
 
 
+def _numpy_dtype(arr) -> str:
+    """newch dtype for a numpy array: uint8/int8 stay 1 byte, other integers and bools become int32."""
+    import numpy as np
+
+    if arr.dtype == np.uint8:
+        return uint8
+    if arr.dtype == np.int8:
+        return int8
+    return int32 if np.issubdtype(arr.dtype, np.integer) or arr.dtype == np.bool_ else float32
+
+
 def _to_buffer(data, dtype: str | None):
     """Returns (keepalive, address, shape, dtype) for contiguous host data."""
     if _is_numpy(data):
         import numpy as np
 
         if dtype is None:
-            dtype = int32 if np.issubdtype(data.dtype, np.integer) or data.dtype == np.bool_ else float32
-        arr = np.ascontiguousarray(data, dtype={float32: np.float32, int32: np.int32, int8: np.int8}[dtype])
+            dtype = _numpy_dtype(data)
+        arr = np.ascontiguousarray(data, dtype=dtype)  # newch dtype names are numpy names
         return arr, arr.ctypes.data, arr.shape, dtype
     if isinstance(data, array.array):
         if dtype is None:
-            dtype = float32 if data.typecode in "fd" else int8 if data.typecode == "b" else int32
+            dtype = {"f": float32, "d": float32, "b": int8, "B": uint8}.get(data.typecode, int32)
         code = L.ARRAY_CODE[dtype]
         buf = data if data.typecode == code else array.array(code, data)
         return buf, (buf.buffer_info()[0] if len(buf) else None), (len(buf),), dtype
@@ -378,7 +391,7 @@ class Tensor:
         if self.numel() != 1:
             raise ValueError(f"item() needs exactly one element, tensor has {self.numel()}")
         v = lib.nc_item(self.ptr)
-        return int(v) if self.dtype == int32 else v
+        return v if self.dtype == float32 else int(v)
 
     def _flat(self) -> array.array:
         dt = self.dtype
@@ -409,8 +422,7 @@ class Tensor:
     def numpy(self):
         import numpy as np
 
-        np_dtype = {float32: np.float32, int32: np.int32, int8: np.int8}[self.dtype]
-        return np.frombuffer(self._flat(), dtype=np_dtype).reshape(self.shape).copy()
+        return np.frombuffer(self._flat(), dtype=self.dtype).reshape(self.shape).copy()
 
     def __array__(self, dtype=None, copy=None):
         """numpy interop: np.asarray(t), np.array(t), np.stack([...]) (always a copy)."""
@@ -1025,8 +1037,7 @@ def cross_entropy(input: Tensor, target, weight=None, size_average=None, ignore_
                  ignore_index=(ignore_index, -100))
     if reduction not in ("mean", "sum"):
         raise NotImplementedError(f"reduction={reduction!r} is not supported (use 'mean' or 'sum')")
-    if not isinstance(target, Tensor):
-        target = tensor(target, dtype=int32, ctx=input.ctx)
+    target = _class_indices(target, input)
     loss = input._w(lib.nc_cross_entropy(input.ptr, target.ptr))
     if label_smoothing:
         if not 0.0 <= label_smoothing <= 1.0:
@@ -1043,9 +1054,15 @@ def nll_loss(input: Tensor, target, weight=None, size_average=None, ignore_index
                  ignore_index=(ignore_index, -100))
     if reduction not in ("mean", "sum"):
         raise NotImplementedError(f"reduction={reduction!r} is not supported (use 'mean' or 'sum')")
-    if not isinstance(target, Tensor):
-        target = tensor(target, dtype=int32, ctx=input.ctx)
+    target = _class_indices(target, input)
     return input._w(lib.nc_nll_loss(input.ptr, target.ptr, int(reduction == "sum")))
+
+
+def _class_indices(target, input: Tensor) -> Tensor:
+    """int32 class indices; 1-byte integer labels (uint8 datasets) are widened."""
+    if not isinstance(target, Tensor):
+        return tensor(target, dtype=int32, ctx=input.ctx)
+    return target.int() if target.dtype in (uint8, int8) else target
 
 
 def mse_loss(input: Tensor, target, size_average=None, reduce=None, reduction: str = "mean") -> Tensor:
@@ -1067,12 +1084,65 @@ def mse_loss(input: Tensor, target, size_average=None, reduce=None, reduction: s
 # --------------------------------------------------------------------------
 
 
+_TREE = "__newch_tree__"  # entry holding the layout of a nested checkpoint (UTF-8 JSON, uint8)
+
+
+def _tree_encode(obj, path: str, out: list, names: set):
+    if isinstance(obj, Tensor):
+        name, k = path or "tensor", 1
+        while name in names:  # keys containing dots can produce the same path twice
+            name, k = f"{path}#{k}", k + 1
+        names.add(name)
+        out.append((name, obj))
+        return {"T": name}
+    sub = (lambda key: f"{path}.{key}" if path else str(key))
+    if isinstance(obj, dict):
+        items = []
+        for key, v in obj.items():
+            if isinstance(key, bool) or not isinstance(key, (str, int)):
+                raise TypeError(f"save_tensors: dict keys must be str or int, got {key!r} at '{path}'")
+            items.append([key, _tree_encode(v, sub(key), out, names)])
+        return {"d": items}
+    if isinstance(obj, (list, tuple)):
+        return {"l" if isinstance(obj, list) else "t": [_tree_encode(v, sub(i), out, names) for i, v in enumerate(obj)]}
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return {"v": obj}
+    raise TypeError(f"save_tensors: cannot store {type(obj).__name__} at '{path}' "
+                    "(Tensors, dicts, lists, tuples, numbers, strings and None only)")
+
+
+def _tree_decode(node, tensors: dict):
+    ((kind, val),) = node.items()
+    if kind == "T":
+        return tensors[val]
+    if kind == "d":
+        return {key: _tree_decode(v, tensors) for key, v in val}
+    if kind in ("l", "t"):
+        items = [_tree_decode(v, tensors) for v in val]
+        return items if kind == "l" else tuple(items)
+    return val
+
+
 def save_tensors(tensors: dict, path) -> None:
-    """Writes {name: Tensor} to an NCW1 file (format: docs/FORMAT.md)."""
-    if not tensors:
-        raise ValueError("save_tensors: nothing to save")
-    items = list(tensors.items())
-    ctx = items[0][1].ctx
+    """Writes {name: Tensor} to an NCW1 file (format: docs/FORMAT.md).
+
+    Whole checkpoints work too: nested dicts, lists and tuples of Tensors, numbers, strings and None,
+    e.g. ``{"model": model.state_dict(), "optimizer": opt.state_dict(), "epoch": 3}``.
+    load_tensors returns the same structure.
+    """
+    if not isinstance(tensors, dict) or not tensors:
+        raise ValueError("save_tensors: expected a non-empty dict")
+    if all(isinstance(k, str) and isinstance(v, Tensor) for k, v in tensors.items()):
+        if _TREE in tensors:
+            raise ValueError(f"save_tensors: the name {_TREE!r} is reserved")
+        items, tree = list(tensors.items()), None
+    else:
+        items = []
+        tree = json.dumps(_tree_encode(tensors, "", items, {_TREE})).encode("utf-8")
+    ctx = items[0][1].ctx if items else default_context()
+    if tree is not None:
+        layout = tensor_from_bytes(tree, (len(tree),), uint8, ctx)  # bound: must outlive nc_save
+        items.append((_TREE, layout))
     st = lib.nc_save(ctx._p, str(path).encode("utf-8"), len(items), L.name_array(k for k, _ in items),
                      L.ptr_array(t.ptr for _, t in items))
     if st != 0:
@@ -1080,7 +1150,7 @@ def save_tensors(tensors: dict, path) -> None:
 
 
 def load_tensors(path, ctx: Context | None = None) -> dict:
-    """Reads an NCW1 file into {name: persistent Tensor}."""
+    """Reads an NCW1 file into {name: persistent Tensor}, or the nested structure save_tensors wrote."""
     import struct
 
     ctx = _ctx(ctx)
@@ -1102,4 +1172,6 @@ def load_tensors(path, ctx: Context | None = None) -> dict:
                 if len(data) != nbytes or code not in L.DTYPE_NAMES:
                     raise NcError(f"load_tensors: '{path}' is truncated or corrupt")
                 out[name] = tensor_from_bytes(data, shape, L.DTYPE_NAMES[code], ctx)
+    if _TREE in out:
+        return _tree_decode(json.loads(out.pop(_TREE)._flat().tobytes()), out)
     return out

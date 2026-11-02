@@ -565,6 +565,90 @@ static void test_inference_release(void) {
     nc_free_ctx(ctx);
 }
 
+/* A copied optimizer state (buffers + step count) continues bit-identically. */
+static void test_optim_state(void) {
+    nc_ctx *ctx = new_ctx();
+    float wv[4] = {1.0f, -2.0f, 0.5f, 3.0f};
+    for (int kind = 0; kind < 3; kind++) { /* adam, sgd + momentum, rmsprop + momentum */
+        nc_optim_opts o = {.lr = 0.05f, .momentum = kind ? 0.9f : 0.0f, .weight_decay = 0.01f};
+        nc_tensor *a = nc_parameter(ctx, T(ctx, wv, 4), 1, SHAPE(4));
+        nc_tensor *b = nc_parameter(ctx, T(ctx, wv, 4), 1, SHAPE(4));
+        nc_optim *oa = kind == 0 ? nc_adam(ctx, &a, 1, o) : kind == 1 ? nc_sgd(ctx, &a, 1, o)
+                                                                       : nc_rmsprop(ctx, &a, 1, o, 0);
+        nc_optim *ob = kind == 0 ? nc_adam(ctx, &b, 1, o) : kind == 1 ? nc_sgd(ctx, &b, 1, o)
+                                                                       : nc_rmsprop(ctx, &b, 1, o, 0);
+        for (int s = 0; s < 5; s++) { /* train a only */
+            nc_optim_zero_grad(oa);
+            nc_backward(nc_sum(nc_mul(a, a), NC_ALL_AXES, 0));
+            nc_optim_step(oa);
+            nc_step_end(ctx);
+        }
+        CHECK(nc_optim_get_step(oa) == 5);
+        memcpy(nc_data_f32(b), nc_data_f32(a), sizeof wv);
+        for (int slot = 0; slot < 2; slot++) {
+            float *sa = nc_optim_state(oa, 0, slot), *sb = nc_optim_state(ob, 0, slot);
+            CHECK((sa == NULL) == (sb == NULL));
+            if (sa) memcpy(sb, sa, sizeof wv);
+        }
+        CHECK(nc_optim_state(oa, 0, 1) != NULL || kind == 1); /* SGD has no slot 1 */
+        CHECK(nc_optim_state(oa, 1, 0) == NULL);              /* out of range */
+        nc_optim_set_step(ob, nc_optim_get_step(oa));
+        for (int s = 0; s < 3; s++) { /* both continue the same way */
+            nc_optim *os[2] = {oa, ob};
+            nc_tensor *ps[2] = {a, b};
+            for (int k = 0; k < 2; k++) {
+                nc_optim_zero_grad(os[k]);
+                nc_backward(nc_sum(nc_mul(ps[k], ps[k]), NC_ALL_AXES, 0));
+                nc_optim_step(os[k]);
+            }
+            nc_step_end(ctx);
+        }
+        CHECK(memcmp(nc_data_f32(a), nc_data_f32(b), sizeof wv) == 0);
+        if (kind) { /* momentum buffer cannot appear or vanish */
+            o.momentum = 0.0f;
+            nc_optim_set_opts(oa, o);
+            CHECK(nc_status_code(ctx) == NC_ERR_ARG);
+            nc_clear_error(ctx);
+        }
+    }
+    nc_optim_set_step(NULL, 1);
+    /* nc_optim_free gives all of its state back */
+    nc_tensor *w = nc_parameter(ctx, T(ctx, wv, 4), 1, SHAPE(4));
+    size_t base = nc_get_mem_stats(ctx).persistent_bytes;
+    nc_optim_free(nc_adam(ctx, &w, 1, (nc_optim_opts){.lr = 0.1f}));
+    nc_optim_free(nc_sgd(ctx, &w, 1, (nc_optim_opts){.lr = 0.1f, .momentum = 0.9f}));
+    CHECK(nc_get_mem_stats(ctx).persistent_bytes == base);
+    nc_optim_free(NULL);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
+/* u8: storage dtype for raw data, converted with to_dtype */
+static void test_uint8(void) {
+    nc_ctx *ctx = new_ctx();
+    uint8_t px[4] = {0, 1, 128, 255};
+    nc_tensor *u = nc_from_data(ctx, NC_U8, px, 2, SHAPE(2, 2));
+    CHECK(u && nc_get_dtype(u) == NC_U8);
+    CHECK_NEAR(nc_item(nc_reshape(nc_index_select(nc_reshape(u, 1, SHAPE(4)),
+                                                  nc_from_data(ctx, NC_I32, (int32_t[]){3}, 1, SHAPE(1))),
+                                  0, NULL)),
+               255.0, 0);
+    nc_tensor *f = nc_to_dtype(nc_transpose(u, 0, 1), NC_F32); /* strided u8 view */
+    float want[4] = {0, 128, 1, 255};
+    for (int i = 0; i < 4; i++) CHECK_NEAR(nc_data_f32(f)[i], want[i], 0);
+    float fv[4] = {-3.0f, 0.4f, 254.6f, 1000.0f};
+    nc_tensor *back = nc_to_dtype(T(ctx, fv, 4), NC_U8); /* truncates, saturates to [0, 255] */
+    uint8_t got[4];
+    CHECK(nc_copy_to(back, got, sizeof got));
+    CHECK(got[0] == 0 && got[1] == 0 && got[2] == 254 && got[3] == 255);
+    nc_tensor *i8 = nc_to_dtype(u, NC_I8);
+    CHECK_NEAR(nc_get(i8, (int64_t[]){1, 1}), 127.0, 0);
+    CHECK(nc_empty(ctx, (nc_dtype)99, 1, SHAPE(2)) == NULL);
+    CHECK(nc_status_code(ctx) == NC_ERR_DTYPE);
+    nc_clear_error(ctx);
+    nc_free_ctx(ctx);
+}
+
 static void test_release(void) {
     nc_ctx *ctx = new_ctx();
     size_t base = nc_get_mem_stats(ctx).persistent_bytes;
@@ -1055,6 +1139,8 @@ int main(void) {
         {"release", test_release},
         {"backward_release", test_backward_release},
         {"inference_release", test_inference_release},
+        {"optim_state", test_optim_state},
+        {"uint8", test_uint8},
         {"kernel_parity", test_kernel_parity},
         {"conv_pool_bn", test_conv_pool_bn},
         {"dropout", test_dropout},

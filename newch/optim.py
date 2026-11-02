@@ -4,19 +4,31 @@ engine next to the parameters (SGD: 0x or 1x parameter memory, Adam/AdamW: 2x).
 Low-memory training: ``gradient_accumulation_steps=n`` (as in Keras 3)
 updates the weights every n-th ``step()`` with the averaged gradient, so a
 batch of B trains like a batch of n*B at the activation memory of B.
+
+Resuming: ``state_dict()`` / ``load_state_dict()`` use PyTorch's layout, and
+``nc.save_tensors`` stores a whole checkpoint in one file:
+
+    nc.save_tensors({"model": model.state_dict(), "optimizer": opt.state_dict()}, "ckpt.ncw")
 """
 
 from __future__ import annotations
 
+import ctypes
 import math
 
 from . import _lib as L
 from ._lib import lib
-from .tensor import Tensor, _unsupported
+from .tensor import Tensor, _to_buffer, _unsupported, float32, persistent, tensor_from_bytes
 
 
 class Optimizer:
-    def __init__(self, params, factory, opts: L.OptimOpts, gradient_accumulation_steps: int | None = None):
+    # per subclass: names of the engine's state slots 0 and 1 (torch's state keys), whether the
+    # state carries torch's "step", and the torch arguments that must keep their default
+    _STATE_NAMES: tuple = (None, None)
+    _HAS_STEP = False
+    _FIXED: dict = {}
+
+    def __init__(self, params, factory, hyper: dict, gradient_accumulation_steps: int | None = None):
         params = list(params)
         if not params:
             raise ValueError("optimizer got an empty parameter list")
@@ -24,8 +36,9 @@ class Optimizer:
             raise TypeError("optimizer parameters must be newch Tensors")
         self.params = params  # keeps the Python wrappers alive
         self._ctx = params[0].ctx
-        self._lr = opts.lr
-        self._p = factory(self._ctx._p, L.ptr_array(p.ptr for p in params), len(params), opts)
+        self._p = None
+        self._hyper = dict(hyper)
+        self._p = factory(self._ctx._p, L.ptr_array(p.ptr for p in params), len(params), self._opts(self._hyper))
         if not self._p:
             self._ctx.raise_error()
         self.gradient_accumulation_steps = gradient_accumulation_steps
@@ -33,6 +46,19 @@ class Optimizer:
             if int(gradient_accumulation_steps) < 1:
                 raise ValueError("gradient_accumulation_steps must be >= 1")
             lib.nc_optim_set_accumulation(self._p, int(gradient_accumulation_steps))
+
+    def __del__(self):
+        # the engine state (up to 2x the parameters) goes with the Python object
+        try:
+            if self._p and self._ctx._p:
+                lib.nc_optim_free(self._p)
+                self._p = None
+        except Exception:  # interpreter shutdown
+            pass
+
+    @staticmethod
+    def _opts(h: dict) -> L.OptimOpts:
+        raise NotImplementedError
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         """Resets the grads (kept while gradient accumulation is in progress). With set_to_none
@@ -45,54 +71,157 @@ class Optimizer:
 
     @property
     def lr(self) -> float:
-        return self._lr
+        return self._hyper["lr"]
 
     @lr.setter
     def lr(self, value: float) -> None:
-        self._lr = float(value)
-        lib.nc_optim_set_lr(self._p, self._lr)
+        self._hyper["lr"] = float(value)
+        lib.nc_optim_set_lr(self._p, self._hyper["lr"])
+
+    # ---- checkpoints (torch.optim.Optimizer layout) ------------------------
+    def state_dict(self) -> dict:
+        """``{"state": {i: {name: Tensor, "step": float}}, "param_groups": [{hyperparameters, "params"}]}``
+        as in PyTorch (one parameter group). The state Tensors are persistent copies, not live buffers."""
+        step = float(lib.nc_optim_get_step(self._p))
+        state = {}
+        with persistent(self._ctx):
+            for i, p in enumerate(self.params):
+                entry = {"step": step} if self._HAS_STEP else {}
+                for slot, name in enumerate(self._STATE_NAMES):
+                    buf = lib.nc_optim_state(self._p, i, slot)
+                    if buf:
+                        entry[name] = tensor_from_bytes(ctypes.string_at(buf, 4 * p.numel()), p.shape, float32,
+                                                        self._ctx)
+                if entry:
+                    state[i] = entry
+        group = {**self._hyper, **self._FIXED, "params": list(range(len(self.params)))}
+        return {"state": state, "param_groups": [group]}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        """Restores hyperparameters, state buffers and the step count from ``state_dict()`` output
+        (also PyTorch's, with tensors converted to numpy). Checks everything before changing anything."""
+        groups = state_dict["param_groups"]
+        if len(groups) != 1:
+            raise ValueError(f"load_state_dict: newch optimizers have one parameter group, got {len(groups)}")
+        group = groups[0]
+        ids = list(group["params"])
+        if len(ids) != len(self.params):
+            raise ValueError(f"load_state_dict: {len(ids)} parameters in the checkpoint, {len(self.params)} here")
+        _unsupported(**{k: (group.get(k, v), v) for k, v in self._FIXED.items()})
+        missing = [k for k in self._hyper if k not in group]
+        if missing:
+            raise ValueError(f"load_state_dict: parameter group lacks {missing}")
+        hyper = {k: tuple(float(b) for b in group[k]) if k == "betas" else float(group[k]) for k in self._hyper}
+        if "momentum" in hyper and (hyper["momentum"] != 0) != (self._hyper["momentum"] != 0):
+            raise ValueError("load_state_dict: momentum cannot switch between zero and non-zero "
+                             f"({self._hyper['momentum']} -> {hyper['momentum']}); create the optimizer with it")
+        allowed = {n for n in self._STATE_NAMES if n} | ({"step"} if self._HAS_STEP else set())
+        states = state_dict.get("state", {})
+        writes, steps = [], set()
+        for i, (pid, p) in enumerate(zip(ids, self.params)):
+            entry = states.get(pid, {})
+            extra = set(entry) - allowed
+            if extra:
+                raise ValueError(f"load_state_dict: parameter {i} has unexpected state {sorted(extra)}")
+            for slot, name in enumerate(self._STATE_NAMES):
+                buf = lib.nc_optim_state(self._p, i, slot)
+                if not buf:
+                    continue
+                if name not in entry:  # never stepped in the source: starts from zero, as fresh state
+                    writes.append((buf, None, 4 * p.numel()))
+                    continue
+                src = entry[name]
+                keep, addr, shape, _ = _to_buffer(src._flat() if isinstance(src, Tensor) else src, float32)
+                n = math.prod(shape)
+                if n != p.numel():
+                    raise ValueError(f"load_state_dict: '{name}' of parameter {i} has {n} elements, "
+                                     f"the parameter {p.numel()}")
+                writes.append((buf, (keep, addr), 4 * n))
+            if "step" in entry:
+                s = entry["step"]
+                steps.add(float(s.item() if hasattr(s, "item") else s))
+        if len(steps) > 1:
+            raise NotImplementedError(f"load_state_dict: parameters have different step counts {sorted(steps)}; "
+                                      "newch keeps one count per optimizer")
+        lib.nc_optim_set_opts(self._p, self._opts(hyper))
+        if not lib.nc_ok(self._ctx._p):
+            self._ctx.raise_error()
+        self._hyper = hyper
+        for buf, src, nbytes in writes:
+            if src is None:
+                ctypes.memset(buf, 0, nbytes)
+            elif nbytes:
+                ctypes.memmove(buf, src[1], nbytes)
+        lib.nc_optim_set_step(self._p, int(steps.pop()) if steps else 0)
 
 
 class SGD(Optimizer):
+    _STATE_NAMES = ("momentum_buffer", None)
+    _FIXED = {"dampening": 0.0, "nesterov": False, "maximize": False}
+
     def __init__(self, params, lr: float = 1e-3, momentum: float = 0.0, dampening: float = 0.0,
                  weight_decay: float = 0.0, nesterov: bool = False, *, maximize: bool = False,
                  gradient_accumulation_steps: int | None = None):
         _unsupported(dampening=(dampening, 0.0), nesterov=(nesterov, False), maximize=(maximize, False))
-        super().__init__(params, lib.nc_sgd, L.OptimOpts(lr, momentum, weight_decay, 0, 0, 0),
+        super().__init__(params, lib.nc_sgd, {"lr": lr, "momentum": momentum, "weight_decay": weight_decay},
                          gradient_accumulation_steps)
+
+    @staticmethod
+    def _opts(h: dict) -> L.OptimOpts:
+        return L.OptimOpts(h["lr"], h["momentum"], h["weight_decay"], 0.0, 0.0, 0.0)
 
 
 class Adam(Optimizer):
     """torch.optim.Adam: weight_decay is an L2 term added to the gradient."""
 
+    _STATE_NAMES = ("exp_avg", "exp_avg_sq")
+    _HAS_STEP = True
+    _FIXED = {"amsgrad": False, "maximize": False}
+    _FACTORY = "nc_adam"
+
     def __init__(self, params, lr: float = 1e-3, betas=(0.9, 0.999), eps: float = 1e-8,
                  weight_decay: float = 0.0, amsgrad: bool = False, *, maximize: bool = False,
                  gradient_accumulation_steps: int | None = None):
         _unsupported(amsgrad=(amsgrad, False), maximize=(maximize, False))
-        super().__init__(params, lib.nc_adam, L.OptimOpts(lr, 0.0, weight_decay, betas[0], betas[1], eps),
+        super().__init__(params, getattr(lib, self._FACTORY),
+                         {"lr": lr, "betas": tuple(betas), "eps": eps, "weight_decay": weight_decay},
                          gradient_accumulation_steps)
 
+    @staticmethod
+    def _opts(h: dict) -> L.OptimOpts:
+        return L.OptimOpts(h["lr"], 0.0, h["weight_decay"], h["betas"][0], h["betas"][1], h["eps"])
 
-class AdamW(Optimizer):
+
+class AdamW(Adam):
     """torch.optim.AdamW: decoupled weight decay (w *= 1 - lr * weight_decay), default 0.01."""
+
+    _FACTORY = "nc_adamw"
 
     def __init__(self, params, lr: float = 1e-3, betas=(0.9, 0.999), eps: float = 1e-8,
                  weight_decay: float = 1e-2, amsgrad: bool = False, *, maximize: bool = False,
                  gradient_accumulation_steps: int | None = None):
-        _unsupported(amsgrad=(amsgrad, False), maximize=(maximize, False))
-        super().__init__(params, lib.nc_adamw, L.OptimOpts(lr, 0.0, weight_decay, betas[0], betas[1], eps),
-                         gradient_accumulation_steps)
+        super().__init__(params, lr, betas, eps, weight_decay, amsgrad, maximize=maximize,
+                         gradient_accumulation_steps=gradient_accumulation_steps)
 
 
 class RMSprop(Optimizer):
     """torch.optim.RMSprop: v = alpha v + (1 - alpha) g^2, w -= lr g / (sqrt(v) + eps)."""
+
+    _STATE_NAMES = ("momentum_buffer", "square_avg")
+    _HAS_STEP = True
+    _FIXED = {"centered": False, "maximize": False}
 
     def __init__(self, params, lr: float = 1e-2, alpha: float = 0.99, eps: float = 1e-8,
                  weight_decay: float = 0.0, momentum: float = 0.0, centered: bool = False, *,
                  maximize: bool = False, gradient_accumulation_steps: int | None = None):
         _unsupported(centered=(centered, False), maximize=(maximize, False))
         super().__init__(params, lambda c, p, n, o: lib.nc_rmsprop(c, p, n, o, 0),
-                         L.OptimOpts(lr, momentum, weight_decay, 0.0, alpha, eps), gradient_accumulation_steps)
+                         {"lr": lr, "alpha": alpha, "eps": eps, "weight_decay": weight_decay, "momentum": momentum},
+                         gradient_accumulation_steps)
+
+    @staticmethod
+    def _opts(h: dict) -> L.OptimOpts:
+        return L.OptimOpts(h["lr"], h["momentum"], h["weight_decay"], 0.0, h["alpha"], h["eps"])
 
 
 # Names accepted by compile(): the same classes, with their own defaults.
@@ -137,6 +266,13 @@ class LRScheduler:
 
     def get_last_lr(self) -> list:
         return [self.optimizer.lr]
+
+    def state_dict(self) -> dict:
+        """Everything but the optimizer (and LambdaLR's function), as in PyTorch."""
+        return {k: v for k, v in self.__dict__.items() if k not in ("optimizer", "lr_lambda")}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.__dict__.update(state_dict)
 
 
 class LambdaLR(LRScheduler):
@@ -228,6 +364,13 @@ class ReduceLROnPlateau:
 
     def get_last_lr(self) -> list:
         return [self.optimizer.lr]
+
+    def state_dict(self) -> dict:
+        """Everything but the optimizer (and LambdaLR's function), as in PyTorch."""
+        return {k: v for k, v in self.__dict__.items() if k not in ("optimizer", "lr_lambda")}
+
+    def load_state_dict(self, state_dict: dict) -> None:
+        self.__dict__.update(state_dict)
 
 
 class _SchedulerNamespace:

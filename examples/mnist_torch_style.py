@@ -1,7 +1,10 @@
 """MNIST written the way PyTorch training scripts usually are: an nn.Module
 subclass, functional activations, an explicit train/test loop.
 
-    python examples/mnist_torch_style.py [--epochs 1] [--batch-size 64] [--lr 1e-3]
+    python examples/mnist_torch_style.py [--epochs 1] [--batch-size 64] [--lr 1e-3] [--resume]
+
+A checkpoint (model, optimizer, scheduler, epoch) is written after every epoch;
+--resume continues from it exactly where it stopped.
 
 Only the imports differ from a PyTorch script (newch -> torch, newch.net -> torch.nn).
 Data comes from examples/mnist_cnn.py's on-disk FileArrays (downloaded on first run).
@@ -44,6 +47,7 @@ class Net(nn.Module):
 def train(model, loader, optimizer, epoch: int, log_every: int = 200) -> None:
     model.train()
     for batch, (data, target) in enumerate(loader):
+        data = data.float() / 255  # uint8 pixels -> [0, 1]
         optimizer.zero_grad()
         loss = F.nll_loss(model(data), target)
         loss.backward()
@@ -58,7 +62,7 @@ def test(model, loader) -> float:
     loss_sum, correct = 0.0, 0
     with torch.no_grad():
         for data, target in loader:
-            output = model(data)
+            output = model(data.float() / 255)
             loss_sum += F.nll_loss(output, target, reduction="sum").item()
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
@@ -75,6 +79,7 @@ def main() -> int:
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--data", default=str(Path.home() / ".cache" / "newch" / "mnist"))
+    ap.add_argument("--resume", action="store_true", help="continue from the last checkpoint")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -86,12 +91,23 @@ def main() -> int:
     model = Net().to("cpu")
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=1, gamma=0.7)
-    for epoch in range(1, args.epochs + 1):
+    ckpt_path = data_dir / "mnist_torch_style_ckpt.ncw"
+    start = 1
+    if args.resume and ckpt_path.exists():
+        ckpt = torch.load_tensors(ckpt_path)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        scheduler.load_state_dict(ckpt["scheduler"])
+        start = ckpt["epoch"] + 1
+        print(f"resumed after epoch {ckpt['epoch']}")
+    for epoch in range(start, args.epochs + 1):
         t0 = time.perf_counter()
         train(model, train_loader, optimizer, epoch)
         print(f"epoch {epoch}: {time.perf_counter() - t0:.1f}s")
         test(model, test_loader)
         scheduler.step()
+        torch.save_tensors({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                            "scheduler": scheduler.state_dict(), "epoch": epoch}, ckpt_path)
     torch.save_tensors(model.state_dict(), data_dir / "mnist_torch_style.ncw")
     return 0
 

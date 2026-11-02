@@ -119,8 +119,10 @@ def _stream_batches(ctx: Context, loader, label_dtype: str | None):
             xb, yb = item[0], (item[1] if len(item) > 1 else None)
         if not isinstance(xb, Tensor):
             xb = tensor(xb, dtype=float32, ctx=ctx)
-        if yb is not None and (not isinstance(yb, Tensor) or (label_dtype and yb.dtype != label_dtype)):
-            yb = tensor(yb if not isinstance(yb, Tensor) else yb.tolist(), dtype=label_dtype, ctx=ctx)
+        if yb is not None and not isinstance(yb, Tensor):
+            yb = tensor(yb, dtype=label_dtype, ctx=ctx)
+        elif yb is not None and label_dtype and yb.dtype != label_dtype:
+            yb = yb.to(label_dtype)
         yield xb, yb
 
 

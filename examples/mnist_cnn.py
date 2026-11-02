@@ -2,15 +2,15 @@
 
     python examples/mnist_cnn.py [--epochs 2] [--data ~/.cache/newch/mnist]
 
-The first run downloads MNIST (~11 MB) and converts it to raw FileArray
-files; training then reads one batch at a time, so peak memory stays near
-one batch plus the model, whatever the dataset size.
+The first run downloads MNIST (~11 MB) and unpacks it to raw uint8 FileArray
+files (55 MB instead of 220 MB as float32); training then reads one batch at a
+time and converts it to float, so peak memory stays near one batch plus the
+model, whatever the dataset size.
 """
 
 from __future__ import annotations
 
 import argparse
-import array
 import gzip
 import os
 import struct
@@ -41,20 +41,33 @@ def fetch(data_dir: Path, name: str) -> Path:
 
 
 def prepare(data_dir: Path, split: str):
-    """IDX (gzip) -> float32 images [N, 1, 28, 28] in [0, 1] and int32 labels, as FileArrays."""
+    """IDX (gzip) -> uint8 images [N, 1, 28, 28] and uint8 labels, as FileArrays (the IDX payload as is)."""
     img_gz, lab_gz, n = FILES[split]
-    x_bin, y_bin = data_dir / f"{split}_x.f32", data_dir / f"{split}_y.i32"
+    x_bin, y_bin = data_dir / f"{split}_x.u8", data_dir / f"{split}_y.u8"
     if not (x_bin.exists() and y_bin.exists()):
         with gzip.open(fetch(data_dir, img_gz), "rb") as f:
             _, count, rows, cols = struct.unpack(">IIII", f.read(16))
             with open(x_bin, "wb") as out:
                 for _ in range(count):  # one image at a time: no full copy in memory
-                    px = f.read(rows * cols)
-                    out.write(array.array("f", (p / 255.0 for p in px)).tobytes())
+                    out.write(f.read(rows * cols))
         with gzip.open(fetch(data_dir, lab_gz), "rb") as f:
             f.read(8)
-            y_bin.write_bytes(array.array("i", list(f.read())).tobytes())  # uint8 labels -> int32
-    return FileArray(x_bin, (n, 1, 28, 28)), FileArray(y_bin, (n,), dtype=nc.int32)
+            y_bin.write_bytes(f.read())
+    return FileArray(x_bin, (n, 1, 28, 28), dtype=nc.uint8), FileArray(y_bin, (n,), dtype=nc.uint8)
+
+
+class Scaled(nc.data.Dataset):
+    """Batches of a uint8 dataset as float32 pixels in [0, 1] (fit() feeds x to the model as is)."""
+
+    def __init__(self, ds, limit: int = 0):
+        self.ds, self.limit = ds, limit
+
+    def __len__(self):
+        return self.limit or len(self.ds)
+
+    def get_batch(self, idx, ctx):
+        x, y = self.ds.get_batch(idx, ctx)
+        return [x.float() * (1 / 255), y]
 
 
 def build_model() -> nc.Sequential:
@@ -77,14 +90,7 @@ def main() -> int:
     data_dir.mkdir(parents=True, exist_ok=True)
     xtr, ytr = prepare(data_dir, "train")
     xte, yte = prepare(data_dir, "test")
-    train = TensorDataset(xtr, ytr)
-    if args.limit:
-        full = train  # bind the full dataset now: `train` is rebound just below
-
-        class Head(nc.data.Dataset):  # first N samples, still streamed
-            def __len__(self): return args.limit
-            def get_batch(self, idx, ctx): return full.get_batch(idx, ctx)
-        train = Head()
+    train = Scaled(TensorDataset(xtr, ytr), limit=args.limit)  # --limit: first N samples, still streamed
 
     ctx = nc.default_context()
     print(f"backend {ctx.backend}, {ctx.threads} threads, {len(train)} training samples")
@@ -93,7 +99,7 @@ def main() -> int:
     model.compile(optimizer="adam", loss="cross_entropy", metrics=["accuracy"], lr=1e-3)
 
     loader = DataLoader(train, batch_size=args.batch_size, shuffle=True)
-    test_loader = DataLoader(TensorDataset(xte, yte), batch_size=256)
+    test_loader = DataLoader(Scaled(TensorDataset(xte, yte)), batch_size=256)
     t0 = time.perf_counter()
     model.fit(loader, epochs=args.epochs, validation_data=test_loader)
     print(f"trained in {time.perf_counter() - t0:.1f}s, "

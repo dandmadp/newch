@@ -68,13 +68,25 @@ loss, acc = model.evaluate(x_test, y_test)
 ```
 
 **RAM보다 큰 데이터셋:** 샘플을 디스크 파일에 저장하고 `FileArray`로 열면 배치 단위로만 읽습니다.
+픽셀처럼 0~255인 데이터는 `uint8`로 두면 float32의 1/4 크기이고, 배치마다 `.float()`로 바꿉니다.
 
 ```python
 from newch.data import DataLoader, FileArray, TensorDataset
 
-x = FileArray.create("x.bin", rows, row_shape=(1, 28, 28))   # 한 행씩 기록
-y = FileArray.create("y.bin", labels, row_shape=(), dtype=torch.int32)
-model.fit(DataLoader(TensorDataset(x, y), batch_size=64, shuffle=True), epochs=3)
+x = FileArray.create("x.u8", rows, row_shape=(1, 28, 28), dtype=torch.uint8)   # 한 행씩 기록
+y = FileArray.create("y.u8", labels, row_shape=(), dtype=torch.uint8)
+for xb, yb in DataLoader(TensorDataset(x, y), batch_size=64, shuffle=True):
+    loss = F.cross_entropy(model(xb.float() / 255), yb)
+    ...
+```
+
+**학습 재개:** 옵티마이저와 스케줄러도 PyTorch와 같은 `state_dict()`를 가지며, 체크포인트 전체를 파일 하나에 저장합니다.
+
+```python
+torch.save_tensors({"model": model.state_dict(), "optimizer": opt.state_dict(),
+                    "scheduler": sched.state_dict(), "epoch": epoch}, "ckpt.ncw")
+ckpt = torch.load_tensors("ckpt.ncw")
+model.load_state_dict(ckpt["model"]); opt.load_state_dict(ckpt["optimizer"])
 ```
 
 **PyTorch 가중치 가져오기:** 레이어 이름과 레이아웃이 같으므로 numpy로 바꿔서 넣으면 됩니다.

@@ -407,6 +407,9 @@ static nc_status compare_fwd(nc_node *n) {
 const nc_op_def nc_op_compare = {"compare", NC_OPF_NONDIFF, 0, compare_infer, NULL, compare_fwd, NULL};
 
 nc_tensor *nc_compare(nc_tensor *a, nc_tensor *b, nc_cmp op) {
+    /* 1-byte integers (u8 data, i8) compare as i32: exact, and keeps the row loop 4-byte */
+    if (a && (a->dtype == NC_U8 || a->dtype == NC_I8)) a = nc_to_dtype(a, NC_I32);
+    if (b && (b->dtype == NC_U8 || b->dtype == NC_I8)) b = nc_to_dtype(b, NC_I32);
     nc_op_params p;
     memset(&p, 0, sizeof p);
     p.i[0] = op;

@@ -48,6 +48,7 @@ typedef enum {
     NC_I32 = 1,
     NC_F16 = 2, /* reserved: storage format for later fp16 kernels */
     NC_I8 = 3,  /* quantized weights */
+    NC_U8 = 4,  /* compact raw data (images, small labels): 4x smaller than f32 */
     NC_DTYPE_COUNT
 } nc_dtype;
 
@@ -373,7 +374,22 @@ NC_API void nc_optim_zero_grad(nc_optim *o);
 /* Like nc_optim_zero_grad but with nc_clear_grad (set_to_none semantics). */
 NC_API void nc_optim_clear_grad(nc_optim *o);
 NC_API void nc_optim_step(nc_optim *o);
+/* Frees the optimizer and its state now instead of at nc_free_ctx() (the
+ * parameters stay). */
+NC_API void nc_optim_free(nc_optim *o);
 NC_API void nc_optim_set_lr(nc_optim *o, float lr);
+/* Checkpoints. nc_optim_state returns state buffer `slot` of parameter
+ * `param` (numel(param) floats, readable and writable) or NULL if this
+ * optimizer keeps no such state: slot 0 = momentum buffer (SGD, RMSprop) or
+ * Adam's m, slot 1 = Adam's v or RMSprop's square average. */
+NC_API float *nc_optim_state(nc_optim *o, int param, int slot);
+/* Updates applied so far (Adam's bias correction counts them). Setting it
+ * also restarts a gradient-accumulation cycle. */
+NC_API int64_t nc_optim_get_step(const nc_optim *o);
+NC_API void nc_optim_set_step(nc_optim *o, int64_t t);
+/* Replaces every hyperparameter. momentum cannot switch between zero and
+ * non-zero (that decides whether a momentum buffer exists): NC_ERR_ARG. */
+NC_API void nc_optim_set_opts(nc_optim *o, nc_optim_opts opts);
 /* Update every `steps` calls of nc_optim_step with the averaged gradient
  * (Keras' gradient_accumulation_steps). zero_grad keeps the running sum
  * until the update. Large effective batch at small-batch memory. */

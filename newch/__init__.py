@@ -20,7 +20,7 @@ from .net import Model, Module, Sequential, quantize_
 from .tensor import (Context, NcError, Tensor, argmax, cat, default_context, exp, flatten, float32, full, int8, int32,
                      load_tensors, log, manual_seed, matmul, mem_stats, no_grad, ones, parameter, persistent, rand,
                      randn, release, save_tensors, set_default_context, sigmoid, sqrt, stack, step_end, tanh, tensor,
-                     zeros)
+                     uint8, zeros)
 
 __version__ = "0.3.1"
 
@@ -29,5 +29,5 @@ __all__ = [
     "default_context", "exp", "flatten", "float32", "full", "int8", "int32", "load_tensors", "log", "manual_seed",
     "matmul", "mem_stats", "net", "no_grad", "ones", "optim", "parameter", "persistent", "quantize_", "rand",
     "randn", "release", "save_tensors", "set_default_context", "sigmoid", "sqrt", "stack", "step_end", "tanh",
-    "tensor", "zeros",
+    "tensor", "uint8", "zeros",
 ]

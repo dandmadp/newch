@@ -72,7 +72,8 @@ filtered pipeline once hid a failing test that then got pushed.
 - PyPI has `newch` 0.3.0 (uploaded by the user). Released versions can never be re-uploaded: any fix ships as a new
   version (bump all three version locations). The user runs `twine upload` themselves (`docs/PUBLISHING.md`).
 - 0.3.1 (branch `torch-style-models`, not pushed yet): PyTorch-style model code (`newch.net` package with
-  `functional`/`init`), new ops (nll_loss, compare, cat, to_dtype, i32 sum), backward memory release (-48% reserved),
+  `functional`/`init`), new ops (nll_loss, compare, cat, to_dtype, i32 sum), backward memory release (-48% reserved), inference memory
+  release, optimizer/scheduler `state_dict` with nested `save_tensors` checkpoints, `uint8` data dtype,
   lower Python call overhead, and the dedupe cleanup listed at the top of `docs/PROGRESS.md` (torch style is the
   base; Keras reduced to `fit()`; `newch.ml` removed; NN functions only in `F`; one save path).
 - API surface is frozen at this level: do not add more library-mirroring APIs without discussing it first.

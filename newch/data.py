@@ -17,8 +17,8 @@ import random
 from pathlib import Path
 
 from . import _lib as L
-from .tensor import (Context, Tensor, _flatten, _is_numpy, _unsupported, default_context, float32, int8, int32,
-                     tensor, tensor_from_bytes)
+from .tensor import (Context, Tensor, _flatten, _is_numpy, _numpy_dtype, _unsupported, default_context, float32,
+                     int32, tensor, tensor_from_bytes)
 
 
 class Dataset:
@@ -39,7 +39,8 @@ class Dataset:
 class FileArray:
     """A read-only array stored row-major in a raw binary file (like numpy.memmap).
 
-    shape includes the number of rows; dtype is "float32", "int32" or "int8".
+    shape includes the number of rows; dtype is "float32", "int32", "int8" or "uint8"
+    (uint8 keeps raw pixels at a quarter of the float32 size: convert batches with ``.float()``).
     """
 
     def __init__(self, path, shape, dtype: str = float32, offset: int = 0):
@@ -68,8 +69,7 @@ class FileArray:
                 if _is_numpy(row):
                     import numpy as np
 
-                    f.write(np.ascontiguousarray(row, dtype={float32: np.float32, int32: np.int32,
-                                                             int8: np.int8}[dtype]).tobytes())
+                    f.write(np.ascontiguousarray(row, dtype=dtype).tobytes())
                 else:
                     flat: list = []
                     _flatten(row, [], flat) if isinstance(row, (list, tuple)) else flat.append(row)
@@ -110,8 +110,8 @@ class _MemoryRows:
         elif _is_numpy(data):
             import numpy as np
 
-            kind = int32 if np.issubdtype(data.dtype, np.integer) or data.dtype == np.bool_ else float32
-            arr = np.ascontiguousarray(data, dtype=np.int32 if kind == int32 else np.float32)
+            kind = _numpy_dtype(data)
+            arr = np.ascontiguousarray(data, dtype=kind)
             self.dtype, shape, self.buf = kind, arr.shape, arr.tobytes()
         else:
             shape_l: list = []
@@ -155,7 +155,8 @@ class TensorDataset(Dataset):
     """Samples are rows of each array (torch.utils.data.TensorDataset).
 
     Arrays may be nested lists, array.array, numpy arrays, Tensors or FileArray
-    (disk-backed). Integer data becomes int32, floating data float32.
+    (disk-backed). numpy uint8/int8 data keeps its 1-byte dtype, other integer
+    data becomes int32, floating data float32.
     """
 
     def __init__(self, *arrays):

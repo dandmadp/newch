@@ -14,6 +14,7 @@ size_t nc__dtype_size(nc_dtype dt) {
     case NC_I32: return 4;
     case NC_F16: return 2;
     case NC_I8: return 1;
+    case NC_U8: return 1;
     default: return 0;
     }
 }
@@ -24,6 +25,7 @@ const char *nc__dtype_name(nc_dtype dt) {
     case NC_I32: return "i32";
     case NC_F16: return "f16";
     case NC_I8: return "i8";
+    case NC_U8: return "u8";
     default: return "?";
     }
 }
@@ -107,6 +109,10 @@ static int check_shape(nc_ctx *ctx, int ndim, const int64_t *shape) {
 
 nc_tensor *nc__tensor_new(nc_ctx *ctx, nc_dtype dt, int ndim, const int64_t *shape, int persistent) {
     if (!ctx || !check_shape(ctx, ndim, shape)) return NULL;
+    if (nc__dtype_size(dt) == 0) {
+        nc__error(ctx, NC_ERR_DTYPE, "unknown dtype %d", (int)dt);
+        return NULL;
+    }
     nc_tensor *t = (nc_tensor *)nc__alloc(ctx, sizeof(nc_tensor), persistent);
     if (!t) return NULL;
     memset(t, 0, sizeof *t);
@@ -256,6 +262,8 @@ float nc_get(const nc_tensor *t, const int64_t *index) {
     for (int i = 0; i < t->ndim; i++) off += index[i] * t->stride[i];
     if (t->dtype == NC_F32) return ((const float *)t->data)[off];
     if (t->dtype == NC_I32) return (float)((const int32_t *)t->data)[off];
+    if (t->dtype == NC_I8) return (float)((const int8_t *)t->data)[off];
+    if (t->dtype == NC_U8) return (float)((const uint8_t *)t->data)[off];
     return NAN;
 }
 

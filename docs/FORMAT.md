@@ -13,7 +13,7 @@ offset  크기        내용
 엔트리:
   u32               이름 길이 L (바이트, 최대 4096)
   L                 이름 (UTF-8, 널 문자 없음)
-  u32               dtype: 0 = f32, 1 = i32, 3 = i8
+  u32               dtype: 0 = f32, 1 = i32, 3 = i8, 4 = u8
   u32               차원 수 d (최대 6)
   i64 × d           shape
   u64               데이터 바이트 수 B (= 원소 수 × dtype 크기)
@@ -24,3 +24,20 @@ offset  크기        내용
 - 읽는 쪽은 요청하지 않은 엔트리를 건너뛰므로, 파일에 추가 텐서가 있어도 됩니다
 - `nc_load`는 이름이 없거나 dtype/shape가 다르면 에러를 냅니다. Python에서는 `model.load_state_dict(load_tensors(path))`가 같은 규칙(strict)으로 검사합니다
 - 양자화된 `Linear`는 `weight`(i8 `[out, in]`), `scale`(f32 `[out]`), `bias`(f32 `[out]`)로 저장됩니다
+
+## 중첩 체크포인트
+
+`save_tensors`에 `{"model": ..., "optimizer": ..., "epoch": 3}`처럼 딕셔너리·리스트·튜플·숫자·문자열·None이 섞인
+값을 주면, 텐서는 경로 이름(`model.0.weight`, `optimizer.state.0.exp_avg`)의 일반 엔트리로 쓰고 구조는
+`__newch_tree__`라는 u8 1차원 엔트리에 UTF-8 JSON으로 넣습니다. 노드는 키 하나짜리 객체입니다.
+
+```
+{"T": "엔트리 이름"}        텐서
+{"d": [[키, 노드], ...]}    dict (키는 문자열 또는 정수, 순서 유지)
+{"l": [노드, ...]}          list
+{"t": [노드, ...]}          tuple
+{"v": 값}                   숫자, 문자열, true/false, null (inf/nan은 Python json 표기)
+```
+
+텐서만 담긴 평평한 `{이름: 텐서}`는 지금까지와 똑같이 저장되어 (`__newch_tree__` 없음) C의 `nc_load`로도 읽힙니다.
+`load_tensors`는 `__newch_tree__`가 있으면 원래 구조로 되돌려 반환합니다.

@@ -37,6 +37,7 @@ static nc_optim *create(nc_ctx *ctx, int kind, nc_tensor **params, int n, nc_opt
     }
     nc_optim *opt = (nc_optim *)nc__persistent_alloc(ctx, sizeof(nc_optim));
     if (!opt) return NULL;
+    memset(opt, 0, sizeof *opt);
     opt->ctx = ctx;
     opt->kind = kind;
     opt->n = n;
@@ -44,19 +45,37 @@ static nc_optim *create(nc_ctx *ctx, int kind, nc_tensor **params, int n, nc_opt
     opt->accum_steps = 1;
     size_t ptrs = sizeof(void *) * (size_t)(n ? n : 1);
     opt->params = (nc_tensor **)nc__persistent_alloc(ctx, ptrs);
-    if (!opt->params) return NULL;
+    if (!opt->params) goto fail;
     memcpy(opt->params, params, sizeof(nc_tensor *) * (size_t)n);
 
     int adam = kind == OPT_ADAM || kind == OPT_ADAMW;
     int need1 = adam || o.momentum != 0.0f, need2 = adam || kind == OPT_RMSPROP;
-    if (need1 && !(opt->s1 = (float **)nc__persistent_alloc(ctx, ptrs))) return NULL;
-    if (need2 && !(opt->s2 = (float **)nc__persistent_alloc(ctx, ptrs))) return NULL;
+    if (need1 && !(opt->s1 = (float **)nc__persistent_alloc(ctx, ptrs))) goto fail;
+    if (need2 && !(opt->s2 = (float **)nc__persistent_alloc(ctx, ptrs))) goto fail;
+    if (opt->s1) memset(opt->s1, 0, ptrs);
+    if (opt->s2) memset(opt->s2, 0, ptrs);
     for (int i = 0; i < n; i++) {
         size_t bytes = (size_t)nc_numel(params[i]) * sizeof(float);
-        if (need1 && !(opt->s1[i] = (float *)nc__persistent_alloc(ctx, bytes))) return NULL;
-        if (need2 && !(opt->s2[i] = (float *)nc__persistent_alloc(ctx, bytes))) return NULL;
+        if (need1 && !(opt->s1[i] = (float *)nc__persistent_alloc(ctx, bytes))) goto fail;
+        if (need2 && !(opt->s2[i] = (float *)nc__persistent_alloc(ctx, bytes))) goto fail;
     }
     return opt;
+fail:
+    nc_optim_free(opt);
+    return NULL;
+}
+
+void nc_optim_free(nc_optim *o) {
+    if (!o) return;
+    nc_ctx *ctx = o->ctx;
+    for (int i = 0; i < o->n; i++) {
+        if (o->s1) nc__persistent_free(ctx, o->s1[i]);
+        if (o->s2) nc__persistent_free(ctx, o->s2[i]);
+    }
+    nc__persistent_free(ctx, o->s1);
+    nc__persistent_free(ctx, o->s2);
+    nc__persistent_free(ctx, o->params);
+    nc__persistent_free(ctx, o);
 }
 
 nc_optim *nc_sgd(nc_ctx *ctx, nc_tensor **params, int n, nc_optim_opts opts) {
@@ -108,6 +127,35 @@ void nc_optim_clear_grad(nc_optim *o) {
 
 void nc_optim_set_lr(nc_optim *o, float lr) {
     if (o) o->o.lr = lr;
+}
+
+float *nc_optim_state(nc_optim *o, int param, int slot) {
+    if (!o || param < 0 || param >= o->n || slot < 0 || slot > 1) return NULL;
+    float **s = slot == 0 ? o->s1 : o->s2;
+    return s ? s[param] : NULL;
+}
+
+int64_t nc_optim_get_step(const nc_optim *o) { return o ? o->t : 0; }
+
+void nc_optim_set_step(nc_optim *o, int64_t t) {
+    if (!o) return;
+    if (t < 0) {
+        nc__error(o->ctx, NC_ERR_ARG, "optimizer step count must be >= 0, got %lld", (long long)t);
+        return;
+    }
+    o->t = t;
+    o->accum_count = 0;
+}
+
+void nc_optim_set_opts(nc_optim *o, nc_optim_opts opts) {
+    if (!o) return;
+    int has_momentum = o->kind != OPT_ADAM && o->kind != OPT_ADAMW && o->s1 != NULL;
+    if (o->kind != OPT_ADAM && o->kind != OPT_ADAMW && has_momentum != (opts.momentum != 0.0f)) {
+        nc__error(o->ctx, NC_ERR_ARG, "optimizer: momentum cannot switch between zero and non-zero (%g -> %g)",
+                  (double)o->o.momentum, (double)opts.momentum);
+        return;
+    }
+    o->o = opts;
 }
 
 void nc_optim_step(nc_optim *o) {

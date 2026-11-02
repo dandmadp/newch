@@ -355,7 +355,7 @@ nc_tensor *nc_cat(int n, nc_tensor *const *xs, int axis) {
 
 static nc_status to_dtype_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
     nc_dtype to = (nc_dtype)n->p.i[0], from = n->in[0]->dtype;
-    if ((to != NC_F32 && to != NC_I32 && to != NC_I8) || (from != NC_F32 && from != NC_I32 && from != NC_I8)) {
+    if (to == NC_F16 || from == NC_F16 || nc__dtype_size(to) == 0) {
         nc__error(n->in[0]->ctx, NC_ERR_DTYPE, "to_dtype: %s -> %s is not supported", nc__dtype_name(from),
                   nc__dtype_name(to));
         return NC_ERR_DTYPE;
@@ -365,8 +365,12 @@ static nc_status to_dtype_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shap
 }
 
 static double load_as_double(const void *p, nc_dtype dt, int64_t i) {
-    return dt == NC_F32 ? (double)((const float *)p)[i] : dt == NC_I32 ? (double)((const int32_t *)p)[i]
-                                                                       : (double)((const int8_t *)p)[i];
+    switch (dt) {
+    case NC_F32: return (double)((const float *)p)[i];
+    case NC_I32: return (double)((const int32_t *)p)[i];
+    case NC_I8: return (double)((const int8_t *)p)[i];
+    default: return (double)((const uint8_t *)p)[i];
+    }
 }
 
 /* Float to int truncates toward zero. Out-of-range values saturate and NaN
@@ -386,7 +390,8 @@ static nc_status to_dtype_fwd(nc_node *n) {
         double v = load_as_double(src, x->dtype, i);
         if (o->dtype == NC_F32) ((float *)o->data)[i] = (float)v;
         else if (o->dtype == NC_I32) ((int32_t *)o->data)[i] = (int32_t)saturate(v, -2147483648.0, 2147483647.0);
-        else ((int8_t *)o->data)[i] = (int8_t)saturate(v, -128.0, 127.0);
+        else if (o->dtype == NC_I8) ((int8_t *)o->data)[i] = (int8_t)saturate(v, -128.0, 127.0);
+        else ((uint8_t *)o->data)[i] = (uint8_t)saturate(v, 0.0, 255.0);
     }
     return NC_OK;
 }
