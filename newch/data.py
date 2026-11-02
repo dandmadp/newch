@@ -21,6 +21,9 @@ from .tensor import (Context, Tensor, _flatten, _is_numpy, _numpy_dtype, _unsupp
                      int32, tensor, tensor_from_bytes)
 
 
+__all__ = ["DataLoader", "Dataset", "FileArray", "TensorDataset"]
+
+
 class Dataset:
     """Map-style dataset: implement ``__len__`` and ``__getitem__``."""
 

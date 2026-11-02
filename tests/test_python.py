@@ -108,7 +108,6 @@ class TestTensor(Base):
         y = (x * x).sum() + (x * 3).sum()
         y.backward()
         self.assertEqual(x.grad.tolist(), [5, -1, 9])  # 2x + 3
-        x.zero_grad()
         with nc.no_grad():
             z = x * x
         self.assertFalse(z.requires_grad)

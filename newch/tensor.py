@@ -743,8 +743,6 @@ class Tensor:
         if st != 0:
             ctx.raise_error()
 
-    def zero_grad(self) -> None:
-        lib.nc_zero_grad(self.ptr)
 
 
 # --------------------------------------------------------------------------
@@ -821,16 +819,34 @@ def ones(*size, dtype: str = float32, ctx: Context | None = None) -> Tensor:
     return full(_shape(size), 1, dtype=dtype, ctx=ctx)
 
 
-def randn(*shape, std: float = 1.0, ctx: Context | None = None) -> Tensor:
+def _randn(shape, std: float, ctx: Context | None) -> Tensor:
     ctx = _ctx(ctx)
-    n, arr = L.shape_arg(_shape(shape))
+    n, arr = L.shape_arg(shape)
     return ctx.wrap(lib.nc_randn(ctx._p, float(std), n, arr))
 
 
-def rand(*shape, low: float = 0.0, high: float = 1.0, ctx: Context | None = None) -> Tensor:
+def _rand_uniform(shape, low: float, high: float, ctx: Context | None) -> Tensor:
     ctx = _ctx(ctx)
-    n, arr = L.shape_arg(_shape(shape))
+    n, arr = L.shape_arg(shape)
     return ctx.wrap(lib.nc_rand_uniform(ctx._p, float(low), float(high), n, arr))
+
+
+def _random(t: Tensor, dtype: str, requires_grad: bool) -> Tensor:
+    if dtype != float32:
+        raise NotImplementedError(f"dtype={dtype!r} is not supported for random tensors (only float32)")
+    if requires_grad:
+        t.requires_grad = True
+    return t
+
+
+def randn(*size, dtype: str = float32, requires_grad: bool = False, ctx: Context | None = None) -> Tensor:
+    """Samples from N(0, 1) (torch.randn). Other spreads: ``randn(...) * std + mean``."""
+    return _random(_randn(_shape(size), 1.0, ctx), dtype, requires_grad)
+
+
+def rand(*size, dtype: str = float32, requires_grad: bool = False, ctx: Context | None = None) -> Tensor:
+    """Samples from U[0, 1) (torch.rand). Other ranges: ``rand(...) * (high - low) + low``."""
+    return _random(_rand_uniform(_shape(size), 0.0, 1.0, ctx), dtype, requires_grad)
 
 
 def parameter(init, ctx: Context | None = None) -> Tensor:
@@ -1008,22 +1024,22 @@ def dropout(input: Tensor, p: float = 0.5, training: bool = True, inplace: bool 
     return input._w(lib.nc_dropout(input.ptr, float(p)))
 
 
-def batch_norm(x: Tensor, running_mean: Tensor, running_var: Tensor, weight: Tensor | None = None,
+def batch_norm(input: Tensor, running_mean: Tensor, running_var: Tensor, weight: Tensor | None = None,
                bias: Tensor | None = None, training: bool = False, momentum: float = 0.1,
                eps: float = 1e-5) -> Tensor:
     """torch.nn.functional.batch_norm. In training mode the running buffers are updated in place."""
     c = running_mean.shape[0]
     if weight is None:
-        weight = full((c,), 1.0, ctx=x.ctx)
+        weight = full((c,), 1.0, ctx=input.ctx)
     if bias is None:
-        bias = zeros(c, ctx=x.ctx)
-    return x._w(lib.nc_batch_norm(x.ptr, weight.ptr, bias.ptr, running_mean.ptr, running_var.ptr,
-                                  int(training), float(momentum), float(eps)))
+        bias = zeros(c, ctx=input.ctx)
+    return input._w(lib.nc_batch_norm(input.ptr, weight.ptr, bias.ptr, running_mean.ptr, running_var.ptr,
+                                      int(training), float(momentum), float(eps)))
 
 
-def linear(x: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
-    """y = x @ weight.T + bias, weight [out, in] (torch.nn.functional.linear)."""
-    return x._w(lib.nc_linear_fn(x.ptr, weight.ptr, bias.ptr if bias is not None else None))
+def linear(input: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
+    """y = input @ weight.T + bias, weight [out, in] (torch.nn.functional.linear)."""
+    return input._w(lib.nc_linear_fn(input.ptr, weight.ptr, bias.ptr if bias is not None else None))
 
 
 def cross_entropy(input: Tensor, target, weight=None, size_average=None, ignore_index: int = -100, reduce=None,

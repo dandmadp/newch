@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import math
 
-from ..tensor import Tensor, full, rand, randn
+from ..tensor import Tensor, _rand_uniform, _randn, full
 
 __all__ = [
     "calculate_gain", "constant_", "kaiming_normal_", "kaiming_uniform_", "normal_", "ones_", "uniform_",
@@ -38,11 +38,11 @@ def _fill(tensor: Tensor, src: Tensor) -> Tensor:
 
 
 def uniform_(tensor: Tensor, a: float = 0.0, b: float = 1.0) -> Tensor:
-    return _fill(tensor, rand(*tensor.shape, low=a, high=b, ctx=tensor.ctx))
+    return _fill(tensor, _rand_uniform(tensor.shape, a, b, tensor.ctx))
 
 
 def normal_(tensor: Tensor, mean: float = 0.0, std: float = 1.0) -> Tensor:
-    return _fill(tensor, randn(*tensor.shape, std=std, ctx=tensor.ctx) + float(mean))
+    return _fill(tensor, _randn(tensor.shape, std, tensor.ctx) + float(mean))
 
 
 def constant_(tensor: Tensor, val: float) -> Tensor:

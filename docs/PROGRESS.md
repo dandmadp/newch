@@ -18,6 +18,9 @@
 | `compile(loss="mean_squared_error")` | `loss="mse"` |
 | `compile(loss_weights=...)` 인수 | 삭제 (원래 지원하지 않아 에러만 냈음) |
 | `newch.ml` (scikit-learn식 7종 + 지표) | 삭제. scikit-learn을 쓰고 `np.asarray(tensor)`로 주고받기 |
+| `nc.rand(..., low=a, high=b)`, `nc.randn(..., std=s)` | torch와 같은 `rand(*size)` / `randn(*size)`만. `nc.rand(...) * (b - a) + a`, `nc.randn(...) * s` |
+| `tensor.zero_grad()` | 삭제 (torch 텐서에 없음). `model.zero_grad()` / `optimizer.zero_grad()` |
+| `nc.optim.get(...)` | 내부 함수로 바꿈. `compile("adam")` 또는 `nc.optim.Adam(...)` |
 
 결과: Python 패키지 약 3,740줄 → 약 3,000줄, 최상위 공개 이름 60개 → 42개(이후 `uint8` 추가), 콜백 7개 → 5개.
 
@@ -168,6 +171,7 @@ newch/
 | `cross_entropy(input, target, ..., reduction, label_smoothing)` | torch | `reduction`은 "mean"/"sum", `weight`, `ignore_index≠-100`, `reduction="none"`은 에러 |
 | `mse_loss(input, target, reduction)` | torch | "mean"/"sum"/"none" |
 | `full(size, fill_value, *, dtype)`, `ones(*size, dtype)`, `zeros` | torch | dtype을 생략하면 값에서 정함 (정수 → int32) |
+| `rand(*size, dtype, requires_grad)`, `randn(*size, dtype, requires_grad)` | torch | U[0, 1), N(0, 1). float32만 (그 밖의 dtype은 에러). `generator`, `out`, `device` 인수 없음 |
 | `state_dict`, `load_state_dict(strict)` | torch | 같은 키 규칙. torch `state_dict`를 numpy로 바꾸면 그대로 불러옵니다 |
 | `state_dict` + `nc.save_tensors` / `nc.load_tensors` | torch | 저장 경로는 이 한 가지 (torch.save의 pickle 대신 텐서 파일) |
 | `Optimizer.state_dict()`, `load_state_dict()` | torch | 같은 구조 (`state` = {번호: {`exp_avg`, `exp_avg_sq`, `momentum_buffer`, `square_avg`, `step`}}, `param_groups` 1개). 상태 텐서는 실제 버퍼가 아니라 복사본. 파라미터마다 `step`이 다르거나 momentum이 0↔0 아님으로 바뀌면 에러. 불러오기는 모두 검사한 뒤에야 바꿈 |
@@ -189,7 +193,7 @@ newch/
 | `EarlyStopping(monitor, min_delta, patience, verbose, mode, baseline, restore_best_weights, start_from_epoch)` | Keras | Keras와 같은 순서와 판정 규칙. 모니터 값이 없으면 경고 |
 | `LambdaCallback(on_epoch_begin, on_epoch_end, on_train_begin, on_train_end)` | Keras | 배치 단위 훅은 없음 |
 | `Tensor.__array__` | numpy | 항상 복사 (`copy=False`는 에러) |
-| `nc.net.functional` (`F.relu`, `F.nll_loss`, …) | torch.nn.functional | 같은 이름과 인수. `inplace=True`, `weight`, `ignore_index≠-100`은 에러 |
+| `nc.net.functional` (`F.relu`, `F.nll_loss`, …) | torch.nn.functional | 같은 이름과 인수(첫 인수 이름도 `input`). `inplace=True`, `weight`, `ignore_index≠-100`은 에러 |
 | `nc.net.init` (`uniform_`, `normal_`, `constant_`, `zeros_`, `ones_`, `xavier_*`, `kaiming_*`, `calculate_gain`) | torch.nn.init | 같은 분포와 공식. 난수는 newch RNG라 같은 시드라도 값은 다름 |
 | `nn.ModuleList`, `ModuleDict`, `Identity`, `CrossEntropyLoss`, `NLLLoss`, `MSELoss` | torch | 손실 모듈은 함수형과 같은 인수 규칙 |
 | `Module.apply`, `named_modules`, `named_children`, `register_buffer`, `register_parameter`, `to`, `cpu` | torch | `to`는 CPU 장치만 (그 밖은 에러), dtype 변경은 에러. `register_buffer(persistent=False)`는 에러 |
@@ -288,7 +292,7 @@ newch/
 | 항목 | 결과 |
 |---|---|
 | C 테스트 | **25개 테스트 통과** (옵티마이저 상태 복사 후 SGD·Adam·RMSprop 계속 학습이 비트 일치, momentum 전환 에러, `nc_optim_free` 후 영구 메모리 원상태, u8 변환·포화·strided 뷰·index_select, 알 수 없는 dtype 에러 추가 / 추론 해제: 같은 결과·최대 메모리 1/3·테이프와 뷰는 보호, 역전파 해제 3모드의 그래디언트 비트 일치·최대 메모리 감소·재역전파 에러, nll_loss·cat·to_dtype gradcheck, 비교 연산과 i32 sum, 활성화 7종 gradcheck와 알려진 값, 벡터 exp/sigmoid/tanh/erf와 libm 비교, AdamW, RMSprop, 그래디언트 누적, 클리핑, grad None 처리 추가. 스레드 결정성 테스트가 열 분할 GEMM 경로를 실제로 거치도록 수정) — 기존: 연산별 gradcheck 40여 건, 합성곱·풀링·배치 정규화, 드롭아웃 통계, int8 정확도와 커널 일치, 저장/불러오기와 에러, 스레드 결정성, 아레나 축소, 학습 2종 등) |
-| Python 테스트 | **77개 통과** (`test_checkpoint.py` 12개: 4가지 옵티마이저의 저장→새 모델에 불러오기→재개가 끊지 않은 학습과 비트 일치, torch 구조, 복사본, 하이퍼파라미터 복원, 잘못된 상태는 아무것도 바꾸지 않고 에러, numpy 상태, 스케줄러, 중첩 저장(정수 키·튜플·None·inf·경로 충돌), uint8 텐서·numpy·FileArray 학습·fit / 추론 메모리 3개: 반복 순전파가 쌓이지 않음·참조 중인 텐서와 뷰 유지·no_grad 텐서를 나중에 학습에 써도 안전 / 0.3.1: `newch.ml` 테스트 7개 제거, `ReduceLROnPlateau` 스케줄러 1개 추가 / 역전파 메모리 3개: 해제해도 그래디언트 동일·참조 중인 출력 유지·`retain_graph` / `test_torch_style.py` 10개: PyTorch 예제 구조 그대로 CNN 학습 90% 이상, 텐서 메서드, 컨테이너, 손실 모듈, nn.init, 장치 이동 / `test_extras.py` 26개: 활성화 레이어 값과 그래디언트, 인수 순서·기본값 호환 10개 포함, AdamW, 누적=큰 배치 동일성, 클리핑, 스케줄러, Keras 콜백, numpy 연동, `newch.ml` 전체 / 기존 17개 + CNN 학습, 레이어 shape와 모드, BN 버퍼, 저장 후 예측 일치, strict/불일치 에러, torch 형식 state_dict, 양자화, FileArray 스트리밍 fit, 일반 Dataset 묶음, GC 자동 해제, 스레드/trim) |
+| Python 테스트 | **79개 통과** (API 표면 2개: torch 시그니처(`F.linear(input=)`, `rand(requires_grad=)`, `low`/`std` 거부, `Tensor.zero_grad` 없음)·`__all__`에 내부 이름 없음 / `test_checkpoint.py` 12개: 4가지 옵티마이저의 저장→새 모델에 불러오기→재개가 끊지 않은 학습과 비트 일치, torch 구조, 복사본, 하이퍼파라미터 복원, 잘못된 상태는 아무것도 바꾸지 않고 에러, numpy 상태, 스케줄러, 중첩 저장(정수 키·튜플·None·inf·경로 충돌), uint8 텐서·numpy·FileArray 학습·fit / 추론 메모리 3개: 반복 순전파가 쌓이지 않음·참조 중인 텐서와 뷰 유지·no_grad 텐서를 나중에 학습에 써도 안전 / 0.3.1: `newch.ml` 테스트 7개 제거, `ReduceLROnPlateau` 스케줄러 1개 추가 / 역전파 메모리 3개: 해제해도 그래디언트 동일·참조 중인 출력 유지·`retain_graph` / `test_torch_style.py` 10개: PyTorch 예제 구조 그대로 CNN 학습 90% 이상, 텐서 메서드, 컨테이너, 손실 모듈, nn.init, 장치 이동 / `test_extras.py` 26개: 활성화 레이어 값과 그래디언트, 인수 순서·기본값 호환 10개 포함, AdamW, 누적=큰 배치 동일성, 클리핑, 스케줄러, Keras 콜백, numpy 연동, `newch.ml` 전체 / 기존 17개 + CNN 학습, 레이어 shape와 모드, BN 버퍼, 저장 후 예측 일치, strict/불일치 에러, torch 형식 state_dict, 양자화, FileArray 스트리밍 fit, 일반 Dataset 묶음, GC 자동 해제, 스레드/trim) |
 | 디버그 빌드 | `-O0` + UBSan 통과 |
 | 실제 데이터 | MNIST CNN(uint8 파일) 1 에포크 18.5초, 테스트 98.28%, int8 후 98.29%, 최대 25.3MiB. torch식 예제 1 에포크 → `--resume`으로 2 에포크 98.35% |
 | 패키징 | 휠 빌드 → 별도 venv 설치(numpy 없음) → 학습 성공 |

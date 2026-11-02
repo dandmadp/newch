@@ -303,5 +303,36 @@ class TestInferenceMemory(Base):
         self.assertTrue(all(math.isfinite(v) for row in lin.weight.grad.tolist() for v in row))
 
 
+class TestApiSurface(Base):
+    def test_torch_signatures(self):
+        x, w, b = torch.randn(2, 3), torch.randn(4, 3), torch.zeros(4)
+        self.assertEqual(F.linear(input=x, weight=w, bias=b).shape, (2, 4))
+        rm, rv = torch.zeros(3), torch.ones(3)
+        self.assertEqual(F.batch_norm(input=x, running_mean=rm, running_var=rv).shape, (2, 3))
+        r = torch.rand(2, 3, requires_grad=True)
+        self.assertTrue(r.requires_grad)
+        self.assertTrue(all(0.0 <= v < 1.0 for row in r.tolist() for v in row))
+        self.assertEqual(torch.randn((2, 5)).shape, (2, 5))
+        with self.assertRaises(NotImplementedError):
+            torch.rand(2, dtype=torch.int32)
+        with self.assertRaises(TypeError):  # torch.rand has no low/high, randn no std
+            torch.rand(2, low=-1.0)
+        with self.assertRaises(TypeError):
+            torch.randn(2, std=2.0)
+        self.assertFalse(hasattr(r, "zero_grad"))  # torch tensors have none
+
+    def test_no_stray_public_names(self):
+        import newch.callbacks
+        import newch.data
+        import newch.optim
+
+        for mod in (nn, F, torch.optim, newch.data, newch.callbacks, nn.init):
+            for name in mod.__all__:
+                self.assertTrue(hasattr(mod, name), f"{mod.__name__}.{name}")
+        self.assertNotIn("annotations", dir(F))
+        self.assertFalse(hasattr(torch.optim, "get"))
+        self.assertNotIn("Context", nn.__all__)
+
+
 if __name__ == "__main__":
     unittest.main()

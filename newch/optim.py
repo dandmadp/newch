@@ -21,6 +21,9 @@ from ._lib import lib
 from .tensor import Tensor, _to_buffer, _unsupported, float32, persistent, tensor_from_bytes
 
 
+__all__ = ["Adam", "AdamW", "Optimizer", "RMSprop", "SGD", "lr_scheduler"]
+
+
 class Optimizer:
     # per subclass: names of the engine's state slots 0 and 1 (torch's state keys), whether the
     # state carries torch's "step", and the torch arguments that must keep their default
@@ -228,7 +231,7 @@ class RMSprop(Optimizer):
 _BY_NAME = {"sgd": SGD, "adam": Adam, "adamw": AdamW, "rmsprop": RMSprop}
 
 
-def get(optimizer, params, lr: float | None = None) -> Optimizer:
+def _get(optimizer, params, lr: float | None = None) -> Optimizer:
     """Optimizer from a compile() name ("adam", "adamw", "sgd", "rmsprop") or an instance.
 
     A name builds the same class as nc.optim.<Name>(params) with its defaults; lr overrides the rate.

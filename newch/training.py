@@ -60,7 +60,7 @@ def compile_model(model, optimizer, loss, metrics, lr) -> None:
     classification = loss_fn is cross_entropy
     if metrics and not classification:
         raise ValueError("'accuracy' needs a classification loss (cross_entropy)")
-    model._compiled = Compiled(params[0].ctx, optim.get(optimizer, params, lr), loss_fn, classification,
+    model._compiled = Compiled(params[0].ctx, optim._get(optimizer, params, lr), loss_fn, classification,
                                bool(metrics))
 
 

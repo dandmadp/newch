@@ -11,8 +11,17 @@ from ..tensor import persistent as _persistent_mode
 from ..tensor import (Context, Tensor, _check_device, _is_numpy, _pair, _to_buffer, _unsupported, _window, avg_pool2d,
                      batch_norm, cross_entropy, mse_loss, nll_loss,
                      conv2d, default_context, dropout, full, gelu, hardsigmoid, hardswish, int32, leaky_relu, linear,
-                     load_tensors, log_softmax, max_pool2d, parameter, persistent, rand, randn, relu6, save_tensors,
+                     load_tensors, log_softmax, max_pool2d, parameter, persistent, randn, relu6, save_tensors,
                      silu, softmax, tensor, zeros)
+
+from ..tensor import _rand_uniform
+
+__all__ = [
+    "AvgPool2d", "BatchNorm1d", "BatchNorm2d", "Conv2d", "CrossEntropyLoss", "Dropout", "Embedding", "Flatten", "GELU",
+    "Hardsigmoid", "Hardswish", "Identity", "LeakyReLU", "Linear", "LogSoftmax", "MSELoss", "MaxPool2d", "Model",
+    "Module", "ModuleDict", "ModuleList", "NLLLoss", "QuantizedLinear", "ReLU", "ReLU6", "Sequential", "SiLU",
+    "Sigmoid", "Softmax", "Tanh", "clip_grad_norm_", "functional", "init", "quantize_", "utils",
+]
 
 IncompatibleKeys = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
 
@@ -202,7 +211,7 @@ class Module:
 
 
 def _uniform_param(shape, bound: float, ctx: Context) -> Tensor:
-    return parameter(rand(*shape, low=-bound, high=bound, ctx=ctx), ctx=ctx)
+    return parameter(_rand_uniform(shape, -bound, bound, ctx), ctx=ctx)
 
 
 # --------------------------------------------------------------------------

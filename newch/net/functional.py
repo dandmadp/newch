@@ -4,8 +4,6 @@ Every function runs as an engine (C) op; the names and arguments follow
 torch.nn.functional, and arguments that are not implemented raise when set.
 """
 
-from __future__ import annotations
-
 from ..tensor import (Tensor, _unsupported, avg_pool2d, batch_norm, conv2d, cross_entropy, dropout, gelu, hardsigmoid,
                       hardswish, leaky_relu, linear, log_softmax, max_pool2d, mse_loss, nll_loss, relu6, silu,
                       softmax)
