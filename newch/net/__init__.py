@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections import OrderedDict, namedtuple
 
@@ -14,13 +15,14 @@ from ..tensor import (Context, Tensor, _check_device, _is_numpy, _pair, _to_buff
                      load_tensors, log_softmax, max_pool2d, parameter, persistent, randn, relu6, save_tensors,
                      silu, softmax, tensor, zeros)
 
-from ..tensor import _rand_uniform
+from ..tensor import _apply_mask, _rand_uniform, layer_norm
 
 __all__ = [
     "AvgPool2d", "BatchNorm1d", "BatchNorm2d", "Conv2d", "CrossEntropyLoss", "Dropout", "Embedding", "Flatten", "GELU",
-    "Hardsigmoid", "Hardswish", "Identity", "LeakyReLU", "Linear", "LogSoftmax", "MSELoss", "MaxPool2d", "Model",
-    "Module", "ModuleDict", "ModuleList", "NLLLoss", "QuantizedLinear", "ReLU", "ReLU6", "Sequential", "SiLU",
-    "Sigmoid", "Softmax", "Tanh", "clip_grad_norm_", "functional", "init", "quantize_", "utils",
+    "Hardsigmoid", "Hardswish", "Identity", "LayerNorm", "LeakyReLU", "Linear", "LogSoftmax", "MSELoss", "MaxPool2d",
+    "Model", "Module", "ModuleDict", "ModuleList", "MultiheadAttention", "NLLLoss", "QuantizedLinear", "ReLU", "ReLU6",
+    "Sequential", "SiLU", "Sigmoid", "Softmax", "Tanh", "TransformerEncoder", "TransformerEncoderLayer",
+    "clip_grad_norm_", "functional", "init", "quantize_", "utils",
 ]
 
 IncompatibleKeys = namedtuple("IncompatibleKeys", ["missing_keys", "unexpected_keys"])
@@ -705,6 +707,175 @@ class MSELoss(Module):
 
     def forward(self, input, target):
         return mse_loss(input, target, reduction=self.reduction)
+
+
+
+# --------------------------------------------------------------------------
+# Transformer blocks (torch.nn names, arguments and parameter layout)
+# --------------------------------------------------------------------------
+
+
+class LayerNorm(Module):
+    """torch.nn.LayerNorm: normalizes over the trailing ``normalized_shape`` dims; weight 1, bias 0."""
+
+    def __init__(self, normalized_shape, eps: float = 1e-5, elementwise_affine: bool = True, bias: bool = True, *,
+                 ctx: Context | None = None):
+        ctx = ctx or default_context()
+        shape = (int(normalized_shape),) if isinstance(normalized_shape, int) else tuple(normalized_shape)
+        self.normalized_shape, self.eps, self.elementwise_affine = shape, eps, elementwise_affine
+        with persistent(ctx):
+            self.weight = parameter(full(shape, 1.0, ctx=ctx), ctx=ctx) if elementwise_affine else None
+            self.bias = parameter(shape, ctx=ctx) if elementwise_affine and bias else None
+
+    def forward(self, x: Tensor) -> Tensor:
+        return layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+
+    def extra_repr(self) -> str:
+        return f"{self.normalized_shape}, eps={self.eps}, elementwise_affine={self.elementwise_affine}"
+
+
+class MultiheadAttention(Module):
+    """torch.nn.MultiheadAttention: packed ``in_proj_weight`` [3E, E] / ``in_proj_bias`` and ``out_proj``,
+    so torch state_dicts load as they are. Inputs are (L, N, E), or (N, L, E) with batch_first.
+
+    Masks follow torch: an integer 0/1 ``attn_mask`` / ``key_padding_mask`` marks positions that may
+    NOT be attended (torch's True; newch has no bool dtype), a float mask is added to the scores.
+    ``kdim``/``vdim`` other than embed_dim, ``add_bias_kv`` and ``add_zero_attn`` raise.
+    """
+
+    def __init__(self, embed_dim: int, num_heads: int, dropout: float = 0.0, bias: bool = True,
+                 add_bias_kv: bool = False, add_zero_attn: bool = False, kdim=None, vdim=None,
+                 batch_first: bool = False, *, ctx: Context | None = None):
+        _unsupported(add_bias_kv=(add_bias_kv, False), add_zero_attn=(add_zero_attn, False),
+                     kdim=(kdim if kdim != embed_dim else None, None), vdim=(vdim if vdim != embed_dim else None, None))
+        if embed_dim % num_heads:
+            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+        ctx = ctx or default_context()
+        self.embed_dim, self.num_heads, self.dropout, self.batch_first = embed_dim, num_heads, dropout, batch_first
+        self.head_dim = embed_dim // num_heads
+        bound = math.sqrt(6.0 / (embed_dim + 3 * embed_dim))  # xavier_uniform_, as torch
+        self.in_proj_weight = _uniform_param((3 * embed_dim, embed_dim), bound, ctx)
+        self.in_proj_bias = parameter((3 * embed_dim,), ctx=ctx) if bias else None
+        self.out_proj = Linear(embed_dim, embed_dim, bias=bias, ctx=ctx)
+        if bias:
+            self.out_proj.bias.copy_([0.0] * embed_dim)
+
+    def _project(self, query, key, value):
+        E, W, b = self.embed_dim, self.in_proj_weight, self.in_proj_bias
+        if query is key and key is value:  # self-attention: one GEMM for q, k and v
+            L, N = query.shape[0], query.shape[1]
+            qkv = linear(query, W, b).reshape(L * N, 3, E).transpose(0, 1)  # [3, L*N, E]
+            return [qkv[i].reshape(L, N, E) for i in range(3)]
+        out = []
+        for i, x in enumerate((query, key, value)):
+            rows = list(range(i * E, (i + 1) * E))
+            out.append(linear(x, W[rows], b[rows] if b is not None else None))
+        return out
+
+    def forward(self, query: Tensor, key: Tensor, value: Tensor, key_padding_mask=None, need_weights: bool = True,
+                attn_mask=None, average_attn_weights: bool = True, is_causal: bool = False):
+        if is_causal and attn_mask is None:
+            raise RuntimeError("Need attn_mask if specifying the is_causal hint")  # as torch
+        unbatched = query.ndim == 2
+        if unbatched:
+            query, key, value = (x.unsqueeze(1) for x in (query, key, value))
+            if key_padding_mask is not None and isinstance(key_padding_mask, Tensor):
+                key_padding_mask = key_padding_mask.unsqueeze(0)
+        elif self.batch_first:
+            same = query is key and key is value
+            query = query.transpose(0, 1)
+            key, value = (query, query) if same else (key.transpose(0, 1), value.transpose(0, 1))
+        L, N, E = query.shape
+        S, H, D = key.shape[0], self.num_heads, self.head_dim
+        q, k, v = self._project(query, key, value)
+        q = q.reshape(L, N * H, D).transpose(0, 1) * (1.0 / math.sqrt(D))  # [N*H, L, D]
+        k = k.reshape(S, N * H, D).transpose(0, 1)
+        v = v.reshape(S, N * H, D).transpose(0, 1)
+        scores = q @ k.transpose(1, 2)  # [N*H, L, S]
+        if attn_mask is not None:
+            scores = _apply_mask(scores, attn_mask, keep=False)
+        if key_padding_mask is not None:
+            pad = key_padding_mask if isinstance(key_padding_mask, Tensor) else tensor(key_padding_mask, ctx=q.ctx)
+            scores = _apply_mask(scores.reshape(N, H, L, S), pad.reshape(N, 1, 1, S), keep=False).reshape(N * H, L, S)
+        attn = scores.softmax(-1)
+        if self.training and self.dropout > 0.0:
+            attn = dropout(attn, self.dropout, True)
+        out = (attn @ v).transpose(0, 1).reshape(L, N, E)  # heads back side by side
+        out = self.out_proj(out)
+        if unbatched:
+            out = out.squeeze(1)
+        elif self.batch_first:
+            out = out.transpose(0, 1)
+        if not need_weights:
+            return out, None
+        w = attn.reshape(N, H, L, S)
+        w = w.mean(1) if average_attn_weights else w
+        return out, (w.squeeze(0) if unbatched else w)
+
+    def extra_repr(self) -> str:
+        return f"embed_dim={self.embed_dim}, num_heads={self.num_heads}, batch_first={self.batch_first}"
+
+
+_ACTIVATIONS = {"relu": lambda x: x.relu(), "gelu": lambda x: gelu(x)}
+
+
+class TransformerEncoderLayer(Module):
+    """torch.nn.TransformerEncoderLayer: self-attention + feed-forward, each with a residual and LayerNorm
+    (post-norm by default, ``norm_first=True`` for pre-norm). Same sub-module names as torch."""
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1,
+                 activation="relu", layer_norm_eps: float = 1e-5, batch_first: bool = False, norm_first: bool = False,
+                 bias: bool = True, *, ctx: Context | None = None):
+        if isinstance(activation, str):
+            if activation not in _ACTIVATIONS:
+                raise RuntimeError(f"activation should be relu/gelu, not {activation}")
+            activation = _ACTIVATIONS[activation]
+        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout, bias=bias, batch_first=batch_first,
+                                            ctx=ctx)
+        self.linear1 = Linear(d_model, dim_feedforward, bias=bias, ctx=ctx)
+        self.dropout = Dropout(dropout)
+        self.linear2 = Linear(dim_feedforward, d_model, bias=bias, ctx=ctx)
+        self.norm_first = norm_first
+        self.norm1 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, ctx=ctx)
+        self.norm2 = LayerNorm(d_model, eps=layer_norm_eps, bias=bias, ctx=ctx)
+        self.dropout1 = Dropout(dropout)
+        self.dropout2 = Dropout(dropout)
+        self.activation = activation
+
+    def _sa_block(self, x, attn_mask, key_padding_mask, is_causal):
+        x = self.self_attn(x, x, x, attn_mask=attn_mask, key_padding_mask=key_padding_mask, need_weights=False,
+                           is_causal=is_causal)[0]
+        return self.dropout1(x)
+
+    def _ff_block(self, x):
+        return self.dropout2(self.linear2(self.dropout(self.activation(self.linear1(x)))))
+
+    def forward(self, src: Tensor, src_mask=None, src_key_padding_mask=None, is_causal: bool = False) -> Tensor:
+        x = src
+        if self.norm_first:
+            x = x + self._sa_block(self.norm1(x), src_mask, src_key_padding_mask, is_causal)
+            x = x + self._ff_block(self.norm2(x))
+        else:
+            x = self.norm1(x + self._sa_block(x, src_mask, src_key_padding_mask, is_causal))
+            x = self.norm2(x + self._ff_block(x))
+        return x
+
+
+class TransformerEncoder(Module):
+    """torch.nn.TransformerEncoder: ``num_layers`` independent copies (copy.deepcopy) of encoder_layer,
+    then an optional final norm. enable_nested_tensor and mask_check only tune torch's fast path."""
+
+    def __init__(self, encoder_layer: Module, num_layers: int, norm: Module | None = None,
+                 enable_nested_tensor: bool = True, mask_check: bool = True):
+        self.layers = ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
+        self.num_layers = num_layers
+        self.norm = norm
+
+    def forward(self, src: Tensor, mask=None, src_key_padding_mask=None, is_causal=None) -> Tensor:
+        x = src
+        for layer in self.layers:
+            x = layer(x, src_mask=mask, src_key_padding_mask=src_key_padding_mask, is_causal=bool(is_causal))
+        return self.norm(x) if self.norm is not None else x
 
 
 class Sequential(Model):

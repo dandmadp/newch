@@ -424,3 +424,192 @@ nc_tensor *nc_nll_loss(nc_tensor *logp, nc_tensor *labels, int sum) {
     nc_tensor *in[2] = {logp, labels};
     return nc__apply(&nc_op_nll_loss, in, 2, &p);
 }
+
+/* ------------------------------------------------------------------------ */
+/* layer_norm over the last D elements of each row (torch layer_norm).        */
+/* Inputs: x, then weight and bias [D] if present (p.i[1], p.i[2]).           */
+/* Saves mean and 1/std per row for backward.                                 */
+/* ------------------------------------------------------------------------ */
+
+static nc_status layer_norm_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
+    nc_tensor *x = n->in[0];
+    int k = (int)n->p.i[0];
+    for (int i = 0; i < n->n_in; i++)
+        if (!nc__expect_f32(n, i)) return NC_ERR_DTYPE;
+    if (k < 1 || k > x->ndim) {
+        nc__error(x->ctx, NC_ERR_SHAPE, "layer_norm: normalized_shape has %d dims, input only %d", k, x->ndim);
+        return NC_ERR_SHAPE;
+    }
+    int64_t D = nc__shape_numel(k, x->shape + x->ndim - k);
+    for (int i = 1; i < n->n_in; i++) {
+        if (nc_numel(n->in[i]) != D) {
+            nc__error(x->ctx, NC_ERR_SHAPE, "layer_norm: weight/bias need %lld elements, got %lld", (long long)D,
+                      (long long)nc_numel(n->in[i]));
+            return NC_ERR_SHAPE;
+        }
+    }
+    *dt = NC_F32;
+    *nd = x->ndim;
+    memcpy(shape, x->shape, sizeof(int64_t) * (size_t)x->ndim);
+    return NC_OK;
+}
+
+static int64_t ln_dim(const nc_node *n) {
+    const nc_tensor *x = n->in[0];
+    int k = (int)n->p.i[0];
+    return nc__shape_numel(k, x->shape + x->ndim - k);
+}
+
+static nc_status layer_norm_fwd(nc_node *n) {
+    nc_tensor *x = n->in[0];
+    int has_w = (int)n->p.i[1], has_b = (int)n->p.i[2];
+    const float *w = has_w ? nc__contig_f32(n->in[1]) : NULL;
+    const float *b = has_b ? nc__contig_f32(n->in[1 + has_w]) : NULL;
+    const float *X = nc__contig_f32(x);
+    int64_t D = ln_dim(n), R = D ? nc_numel(x) / D : 0;
+    float *stats = (float *)nc__arena_alloc(x->ctx, (size_t)(2 * R + 1) * sizeof(float)); /* mean, rstd */
+    if (!X || !stats || (has_w && !w) || (has_b && !b)) return NC_ERR_OOM;
+    float *Y = (float *)n->out->data, eps = n->p.f[0];
+    for (int64_t r = 0; r < R; r++) {
+        const float *xr = X + r * D;
+        double s = 0.0, ss = 0.0;
+        for (int64_t i = 0; i < D; i++) s += xr[i];
+        double mean = s / (double)D;
+        for (int64_t i = 0; i < D; i++) ss += (xr[i] - mean) * (xr[i] - mean);
+        float rstd = (float)(1.0 / sqrt(ss / (double)D + eps)); /* biased variance, as torch */
+        stats[2 * r] = (float)mean;
+        stats[2 * r + 1] = rstd;
+        float *yr = Y + r * D;
+        for (int64_t i = 0; i < D; i++) {
+            float v = (xr[i] - (float)mean) * rstd;
+            yr[i] = (w ? v * w[i] : v) + (b ? b[i] : 0.0f);
+        }
+    }
+    n->saved = stats;
+    return NC_OK;
+}
+
+static void layer_norm_bwd(nc_node *n) {
+    nc_tensor *x = n->in[0];
+    int has_w = (int)n->p.i[1], has_b = (int)n->p.i[2];
+    nc_tensor *wt = has_w ? n->in[1] : NULL, *bt = has_b ? n->in[1 + has_w] : NULL;
+    const float *X = nc__contig_f32(x), *w = wt ? nc__contig_f32(wt) : NULL, *stats = (const float *)n->saved;
+    const float *g = (const float *)n->out->grad->data;
+    int64_t D = ln_dim(n), R = D ? nc_numel(x) / D : 0;
+    if (!X || (wt && !w)) return;
+    nc_tensor *gx = nc__needs_grad(x) ? nc__grad_buf(x) : NULL;
+    nc_tensor *gw = wt && nc__needs_grad(wt) ? nc__grad_buf(wt) : NULL;
+    nc_tensor *gb = bt && nc__needs_grad(bt) ? nc__grad_buf(bt) : NULL;
+    for (int64_t r = 0; r < R; r++) {
+        const float *xr = X + r * D, *gr = g + r * D;
+        float mean = stats[2 * r], rstd = stats[2 * r + 1];
+        double sg = 0.0, sgx = 0.0; /* sums of g*w and g*w*xhat */
+        for (int64_t i = 0; i < D; i++) {
+            float xhat = (xr[i] - mean) * rstd, gi = w ? gr[i] * w[i] : gr[i];
+            sg += gi;
+            sgx += gi * xhat;
+            if (gw) ((float *)gw->data)[i] += gr[i] * xhat;
+            if (gb) ((float *)gb->data)[i] += gr[i];
+        }
+        if (gx) {
+            float *dx = (float *)gx->data + r * D, mg = (float)(sg / (double)D), mgx = (float)(sgx / (double)D);
+            for (int64_t i = 0; i < D; i++) {
+                float xhat = (xr[i] - mean) * rstd, gi = w ? gr[i] * w[i] : gr[i];
+                dx[i] += rstd * (gi - mg - xhat * mgx);
+            }
+        }
+    }
+}
+
+const nc_op_def nc_op_layer_norm = {"layer_norm", 0, 0, layer_norm_infer, NULL, layer_norm_fwd, layer_norm_bwd};
+
+nc_tensor *nc_layer_norm(nc_tensor *x, int normalized_ndim, nc_tensor *weight, nc_tensor *bias, float eps) {
+    nc_tensor *in[3] = {x, NULL, NULL};
+    int k = 1;
+    if (weight) in[k++] = weight;
+    if (bias) in[k++] = bias;
+    nc_op_params p;
+    memset(&p, 0, sizeof p);
+    p.i[0] = normalized_ndim;
+    p.i[1] = weight != NULL;
+    p.i[2] = bias != NULL;
+    p.f[0] = eps;
+    return nc__apply(&nc_op_layer_norm, in, k, &p);
+}
+
+/* ------------------------------------------------------------------------ */
+/* masked_fill: out = mask ? value : x, mask (i32 0/1) broadcast onto x.      */
+/* The value may be -inf (attention masks), which arithmetic cannot express.  */
+/* ------------------------------------------------------------------------ */
+
+static nc_status masked_fill_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
+    nc_tensor *x = n->in[0], *m = n->in[1];
+    if (!nc__expect_f32(n, 0)) return NC_ERR_DTYPE;
+    int ok = m->dtype == NC_I32 && m->ndim <= x->ndim;
+    for (int i = 0; ok && i < m->ndim; i++) {
+        int64_t dm = m->shape[i], dx = x->shape[x->ndim - m->ndim + i];
+        ok = dm == dx || dm == 1;
+    }
+    if (!ok) {
+        char sx[96], sm[96];
+        nc__error(x->ctx, NC_ERR_SHAPE, "masked_fill: mask %s %s does not broadcast to input %s",
+                  nc__dtype_name(m->dtype), nc__shape_str(m->ndim, m->shape, sm, sizeof sm),
+                  nc__shape_str(x->ndim, x->shape, sx, sizeof sx));
+        return NC_ERR_SHAPE;
+    }
+    *dt = NC_F32;
+    *nd = x->ndim;
+    memcpy(shape, x->shape, sizeof(int64_t) * (size_t)x->ndim);
+    return NC_OK;
+}
+
+static void row_masked_fill(int64_t n, float *const *p, const int64_t *s, const void *u) {
+    float v = *(const float *)u;
+    for (int64_t i = 0; i < n; i++) {
+        int32_t m = *(const int32_t *)(const void *)(p[1] + i * s[1]);
+        p[2][i * s[2]] = m ? v : p[0][i * s[0]];
+    }
+}
+
+static void row_masked_grad(int64_t n, float *const *p, const int64_t *s, const void *u) {
+    (void)u;
+    for (int64_t i = 0; i < n; i++) {
+        int32_t m = *(const int32_t *)(const void *)(p[1] + i * s[1]);
+        if (!m) p[2][i * s[2]] += p[0][i * s[0]];
+    }
+}
+
+static nc_status masked_fill_fwd(nc_node *n) {
+    nc_tensor *x = n->in[0], *m = n->in[1], *o = n->out;
+    int64_t st[3][NC_MAX_DIMS];
+    memcpy(st[0], x->stride, sizeof st[0]);
+    nc__bcast_strides(m, o->ndim, o->shape, st[1]);
+    memcpy(st[2], o->stride, sizeof st[2]);
+    float *base[3] = {(float *)x->data, (float *)m->data, (float *)o->data};
+    nc__iterate(3, base, (const int64_t(*)[NC_MAX_DIMS])st, o->ndim, o->shape, row_masked_fill, &n->p.f[0]);
+    return NC_OK;
+}
+
+static void masked_fill_bwd(nc_node *n) {
+    nc_tensor *x = n->in[0], *m = n->in[1], *o = n->out;
+    nc_tensor *gx = nc__grad_buf(x);
+    if (!gx) return;
+    int64_t st[3][NC_MAX_DIMS];
+    nc__contig_strides(o->ndim, o->shape, st[0]);
+    nc__bcast_strides(m, o->ndim, o->shape, st[1]);
+    nc__contig_strides(o->ndim, o->shape, st[2]);
+    float *base[3] = {(float *)o->grad->data, (float *)m->data, (float *)gx->data};
+    nc__iterate(3, base, (const int64_t(*)[NC_MAX_DIMS])st, o->ndim, o->shape, row_masked_grad, NULL);
+}
+
+const nc_op_def nc_op_masked_fill = {"masked_fill", 0, 0, masked_fill_infer, NULL, masked_fill_fwd,
+                                     masked_fill_bwd};
+
+nc_tensor *nc_masked_fill(nc_tensor *x, nc_tensor *mask, float value) {
+    if (mask && mask->dtype != NC_I32) mask = nc_to_dtype(mask, NC_I32); /* u8 / i8 masks */
+    nc_tensor *in[2] = {x, mask};
+    nc_op_params p;
+    memset(&p, 0, sizeof p);
+    p.f[0] = value;
+    return nc__apply(&nc_op_masked_fill, in, 2, &p);
+}

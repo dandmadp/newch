@@ -69,8 +69,9 @@ static float sum_f32(int64_t n, const float *x) {
 
 
 /* exp: x = n ln2 + r, e^r by a degree-6 polynomial, 2^n built in the exponent
- * bits. Inputs are clamped to the finite float range. */
-#define NC_EXP_HI 88.3762626f
+ * bits. Below the normal float range the result is 0 (libm: a denormal or 0,
+ * so exp(-inf) = 0 for attention masks), above it +inf; NaN stays NaN. */
+#define NC_EXP_HI 88.8f /* just past ln(FLT_MAX): larger inputs overflow to inf */
 #define NC_EXP_LO -87.3365448f
 #define NC_LOG2E 1.44269504088896341f
 #define NC_LN2_HI 0.693359375f
@@ -90,6 +91,7 @@ static float sum_f32(int64_t n, const float *x) {
 #define NC_TANH_T9 0.021869489f
 
 static inline float32x4_t exp4(float32x4_t x) {
+    const float32x4_t x0 = x;
     x = vminq_f32(vmaxq_f32(x, vdupq_n_f32(NC_EXP_LO)), vdupq_n_f32(NC_EXP_HI));
     float32x4_t fx = vmlaq_n_f32(vdupq_n_f32(0.5f), x, NC_LOG2E);
     /* floor without vrndm (ARMv7): truncate, then step down where that rounded up */
@@ -105,8 +107,15 @@ static inline float32x4_t exp4(float32x4_t x) {
     y = NC_FMA(vdupq_n_f32(NC_EXP_P4), y, x);
     y = NC_FMA(vdupq_n_f32(NC_EXP_P5), y, x);
     y = NC_FMA(vaddq_f32(x, vdupq_n_f32(1.0f)), y, vmulq_f32(x, x));
-    int32x4_t n = vshlq_n_s32(vaddq_s32(vcvtq_s32_f32(fx), vdupq_n_s32(127)), 23);
-    return vmulq_f32(y, vreinterpretq_f32_s32(n));
+    /* n reaches 128 near ln(FLT_MAX), which has no float exponent: use 2^127 * 2 there */
+    int32x4_t ni = vcvtq_s32_f32(fx);
+    uint32x4_t big = vcgtq_s32(ni, vdupq_n_s32(127));
+    ni = vaddq_s32(ni, vreinterpretq_s32_u32(big)); /* mask is -1 */
+    int32x4_t n = vshlq_n_s32(vaddq_s32(ni, vdupq_n_s32(127)), 23);
+    float32x4_t r = vmulq_f32(y, vreinterpretq_f32_s32(n));
+    r = vmulq_f32(r, vbslq_f32(big, vdupq_n_f32(2.0f), vdupq_n_f32(1.0f)));
+    r = vreinterpretq_f32_u32(vbicq_u32(vreinterpretq_u32_f32(r), vcltq_f32(x0, vdupq_n_f32(NC_EXP_LO))));
+    return vbslq_f32(vmvnq_u32(vceqq_f32(x0, x0)), x0, r);
 }
 
 static inline float32x4_t div4(float32x4_t a, float32x4_t b) {

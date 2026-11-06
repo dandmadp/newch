@@ -6,6 +6,7 @@ import array
 import contextlib
 import ctypes
 import json
+import math
 import warnings
 from typing import Sequence
 
@@ -66,6 +67,9 @@ class Context:
         if self._p:
             lib.nc_free_ctx(self._p)
             self._p = None
+
+    def __deepcopy__(self, memo):
+        return self  # copied modules keep using the same engine context
 
     def raise_error(self) -> None:
         msg = lib.nc_error(self._p).decode(errors="replace") or "unknown engine error"
@@ -292,6 +296,16 @@ class Tensor:
 
     def __init__(self, *args, **kwargs):
         raise TypeError("use newch.tensor(...), newch.zeros(...) etc. to create tensors")
+
+    def __deepcopy__(self, memo):
+        """copy.deepcopy (e.g. of a Module): a new tensor with the same values, persistent if
+        this one is, and still a parameter if this one requires grad. Grads are not copied."""
+        if self.is_persistent:
+            with persistent(self._ctx):
+                if self.requires_grad:
+                    return parameter(self, ctx=self._ctx)
+                return tensor(self, ctx=self._ctx)
+        return tensor(self.detach(), ctx=self._ctx)
 
     @property
     def ptr(self):
@@ -703,6 +717,16 @@ class Tensor:
     def contiguous(self): return self._view(lib.nc_contiguous(self.ptr))
     def detach(self): return self._view(lib.nc_detach(self.ptr))
 
+    def masked_fill(self, mask, value) -> "Tensor":
+        """Copy with ``value`` where ``mask`` is set (torch.Tensor.masked_fill). mask: an integer 0/1
+        tensor such as ``a == b`` gives (newch has no bool dtype), broadcast onto this tensor;
+        value may be ``float("-inf")`` for attention masks."""
+        if not isinstance(mask, Tensor):
+            mask = tensor(mask, dtype=int32, ctx=self._ctx)
+        elif mask.dtype == float32:
+            raise TypeError("masked_fill needs an integer 0/1 mask (e.g. from ==, <), got float32")
+        return self._w(lib.nc_masked_fill(self.ptr, mask.ptr, float(value)))
+
     def index_select(self, dim: int, index):
         """Rows along ``dim`` (only dim=0 is implemented); grads scatter-add back."""
         if dim not in (0, -self.ndim):
@@ -1035,6 +1059,59 @@ def batch_norm(input: Tensor, running_mean: Tensor, running_var: Tensor, weight:
         bias = zeros(c, ctx=input.ctx)
     return input._w(lib.nc_batch_norm(input.ptr, weight.ptr, bias.ptr, running_mean.ptr, running_var.ptr,
                                       int(training), float(momentum), float(eps)))
+
+
+def layer_norm(input: Tensor, normalized_shape, weight: Tensor | None = None, bias: Tensor | None = None,
+               eps: float = 1e-5) -> Tensor:
+    """Normalizes over the trailing ``normalized_shape`` dims (torch.nn.functional.layer_norm)."""
+    shape = (int(normalized_shape),) if isinstance(normalized_shape, int) else tuple(int(d) for d in normalized_shape)
+    if not shape or tuple(input.shape[len(input.shape) - len(shape):]) != shape or len(shape) > input.ndim:
+        raise RuntimeError(f"layer_norm: input {input.shape} does not end with normalized_shape {shape}")
+    return input._w(lib.nc_layer_norm(input.ptr, len(shape), weight.ptr if weight is not None else None,
+                                      bias.ptr if bias is not None else None, float(eps)))
+
+
+def _causal_keep(L: int, S: int, ctx) -> Tensor:
+    """int32 [L, S], 1 where key j <= query i (torch's top-left aligned causal mask)."""
+    rows = tensor(list(range(L)), dtype=int32, ctx=ctx).reshape(L, 1)
+    cols = tensor(list(range(S)), dtype=int32, ctx=ctx)
+    return cols <= rows
+
+
+def scaled_dot_product_attention(query: Tensor, key: Tensor, value: Tensor, attn_mask=None, dropout_p: float = 0.0,
+                                 is_causal: bool = False, scale: float | None = None,
+                                 enable_gqa: bool = False) -> Tensor:
+    """softmax(query @ key^T * scale + mask) @ value over the last two dims
+    (torch.nn.functional.scaled_dot_product_attention), batch dims broadcast.
+
+    attn_mask: an integer 0/1 tensor (nonzero = may attend, like torch's bool mask; newch has no
+    bool dtype) or a float tensor added to the scores. A row with nothing to attend gives NaN, as in torch.
+    """
+    _unsupported(enable_gqa=(enable_gqa, False))
+    L, S = query.shape[-2], key.shape[-2]
+    if scale is None:
+        scale = 1.0 / math.sqrt(query.shape[-1])
+    scores = (query @ key.transpose(-2, -1)) * float(scale)
+    if is_causal:
+        if attn_mask is not None:
+            raise ValueError("scaled_dot_product_attention: pass attn_mask or is_causal, not both")
+        attn_mask = _causal_keep(L, S, query.ctx)
+    if attn_mask is not None:
+        scores = _apply_mask(scores, attn_mask, keep=True)
+    attn = scores.softmax(-1)
+    if dropout_p > 0.0:
+        attn = dropout(attn, dropout_p, True)
+    return attn @ value
+
+
+def _apply_mask(scores: Tensor, mask, keep: bool) -> Tensor:
+    """Float masks are added; integer masks block with -inf where they are 0 (keep=True, SDPA's
+    convention) or where they are nonzero (keep=False, nn.MultiheadAttention's)."""
+    if not isinstance(mask, Tensor):
+        mask = tensor(mask, ctx=scores.ctx)
+    if mask.dtype == float32:
+        return scores + mask
+    return scores.masked_fill(mask == 0 if keep else mask, float("-inf"))
 
 
 def linear(input: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:

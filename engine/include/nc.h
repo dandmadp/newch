@@ -211,7 +211,8 @@ NC_API nc_tensor *nc_silu(nc_tensor *x);        /* x * sigmoid(x), a.k.a. swish 
  * approximate_tanh != 0 */
 NC_API nc_tensor *nc_gelu(nc_tensor *x, int approximate_tanh);
 
-/* Linear algebra. a: [..., M, K] (2-D for now), b: [K, N]. */
+/* Linear algebra. a [..., M, K] @ b [K, N], or batched a [..., M, K] @
+ * b [..., K, N] with broadcast batch dims (torch.matmul for 2-D+ operands). */
 NC_API nc_tensor *nc_matmul(nc_tensor *a, nc_tensor *b);
 /* y = x @ weight^T + bias. x [..., in], weight [out, in] (PyTorch layout),
  * bias [out] or NULL. Fused: one GEMM per pass, no transposed copies. */
@@ -251,6 +252,11 @@ NC_API nc_tensor *nc_batch_norm(nc_tensor *x, nc_tensor *weight, nc_tensor *bias
 /* NN functional. */
 NC_API nc_tensor *nc_log_softmax(nc_tensor *x); /* over the last axis */
 NC_API nc_tensor *nc_softmax(nc_tensor *x);     /* over the last axis */
+/* Normalizes over the last `normalized_ndim` dims (biased variance, as
+ * torch.nn.functional.layer_norm). weight / bias may be NULL. */
+NC_API nc_tensor *nc_layer_norm(nc_tensor *x, int normalized_ndim, nc_tensor *weight, nc_tensor *bias, float eps);
+/* mask ? value : x, with an integer 0/1 mask broadcast onto x (value may be -inf). */
+NC_API nc_tensor *nc_masked_fill(nc_tensor *x, nc_tensor *mask, float value);
 /* logits: [N, C] f32, labels: [N] i32. Returns mean loss, shape []. */
 NC_API nc_tensor *nc_cross_entropy(nc_tensor *logits, nc_tensor *labels);
 NC_API nc_tensor *nc_mse_loss(nc_tensor *pred, nc_tensor *target);

@@ -1,6 +1,7 @@
-/* Matrix multiply: a [..., M, K] @ b [K, N] -> [..., M, N].
- * Leading dims of `a` are folded into M. Transposed views are passed to GEMM
- * as transpose flags instead of being copied. */
+/* Matrix multiply. a [..., M, K] @ b [K, N] -> [..., M, N] folds the leading
+ * dims of `a` into M (one GEMM); a 3-D+ `b` goes to the batched op below.
+ * Transposed views are passed to GEMM as transpose flags instead of being
+ * copied. */
 #include "../core/nc_internal.h"
 
 #include <stdio.h>
@@ -86,9 +87,188 @@ static void matmul_bwd(nc_node *n) {
 
 const nc_op_def nc_op_matmul = {"matmul", 0, 0, matmul_infer, NULL, matmul_fwd, matmul_bwd};
 
+/* ------------------------------------------------------------------------ */
+/* Batched matmul: a [..., M, K] @ b [..., K, N] with broadcast batch dims    */
+/* (torch.matmul for 3-D+ operands). One GEMM per batch matrix; transposed    */
+/* views (k.transpose(-2, -1) in attention) go to GEMM as flags, not copies.  */
+/* ------------------------------------------------------------------------ */
+
+typedef struct {
+    int nb;                      /* batch dims of the output */
+    int64_t shape[NC_MAX_DIMS];  /* output batch shape */
+    int64_t count;               /* number of batch matrices */
+} batch_dims;
+
+static int batch_shape(const nc_tensor *a, const nc_tensor *b, batch_dims *bd) {
+    int na = a->ndim - 2, nb = b->ndim - 2;
+    bd->nb = na > nb ? na : nb;
+    bd->count = 1;
+    for (int i = 0; i < bd->nb; i++) {
+        int ia = i - (bd->nb - na), ib = i - (bd->nb - nb);
+        int64_t da = ia < 0 ? 1 : a->shape[ia], db = ib < 0 ? 1 : b->shape[ib];
+        if (da != db && da != 1 && db != 1) return 0;
+        bd->shape[i] = da == 1 ? db : da;
+        bd->count *= bd->shape[i];
+    }
+    return 1;
+}
+
+/* per output batch dim: element stride of t's batch matrices (0 = broadcast) */
+static void batch_strides(const nc_tensor *t, const int64_t *st, const batch_dims *bd, int64_t *out) {
+    int tb = t->ndim - 2;
+    for (int i = 0; i < bd->nb; i++) {
+        int j = i - (bd->nb - tb);
+        out[i] = (j < 0 || t->shape[j] == 1) ? 0 : st[j];
+    }
+}
+
+static int64_t batch_offset(const batch_dims *bd, const int64_t *st, int64_t idx) {
+    int64_t off = 0;
+    for (int i = bd->nb - 1; i >= 0; i--) {
+        off += (idx % bd->shape[i]) * st[i];
+        idx /= bd->shape[i];
+    }
+    return off;
+}
+
+typedef struct {
+    const float *p;
+    int trans;
+    int64_t ld;
+    int64_t bst[NC_MAX_DIMS];
+} bmm_operand;
+
+static int bmm_operand_of(nc_tensor *t, const batch_dims *bd, bmm_operand *o) {
+    int nd = t->ndim;
+    int64_t rows = t->shape[nd - 2], cols = t->shape[nd - 1];
+    const int64_t *st = t->stride;
+    int64_t cs[NC_MAX_DIMS];
+    if (t->stride[nd - 1] == 1 && t->stride[nd - 2] >= cols) {
+        o->p = (const float *)t->data, o->trans = 0, o->ld = t->stride[nd - 2];
+    } else if (t->stride[nd - 2] == 1 && t->stride[nd - 1] >= rows) {
+        o->p = (const float *)t->data, o->trans = 1, o->ld = t->stride[nd - 1];
+    } else {
+        o->p = nc__contig_f32(t), o->trans = 0, o->ld = cols;
+        if (!o->p) return 0;
+        nc__contig_strides(nd, t->shape, cs);
+        st = cs;
+    }
+    batch_strides(t, st, bd, o->bst);
+    return 1;
+}
+
+static nc_status bmm_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
+    nc_tensor *a = n->in[0], *b = n->in[1];
+    batch_dims bd;
+    if (!nc__expect_f32(n, 0) || !nc__expect_f32(n, 1)) return NC_ERR_DTYPE;
+    if (a->ndim < 2 || b->ndim < 2 || a->shape[a->ndim - 1] != b->shape[b->ndim - 2] || !batch_shape(a, b, &bd)) {
+        char sa[96], sb[96];
+        nc__error(a->ctx, NC_ERR_SHAPE, "matmul: cannot multiply %s by %s (expected [..., M, K] @ [..., K, N])",
+                  nc__shape_str(a->ndim, a->shape, sa, sizeof sa),
+                  nc__shape_str(b->ndim, b->shape, sb, sizeof sb));
+        return NC_ERR_SHAPE;
+    }
+    *dt = NC_F32;
+    *nd = bd.nb + 2;
+    memcpy(shape, bd.shape, sizeof(int64_t) * (size_t)bd.nb);
+    shape[bd.nb] = a->shape[a->ndim - 2];
+    shape[bd.nb + 1] = b->shape[b->ndim - 1];
+    return NC_OK;
+}
+
+/* Small batch matrices run one per thread (a plain GEMM each), large ones
+ * one after another with a threaded GEMM. Either way each output element is
+ * computed by a single thread, so results do not depend on the thread count. */
+typedef struct {
+    const nc_kernels *k;
+    const batch_dims *bd;
+    int ta, tb;
+    int64_t M, N, K, lda, ldb, ldc;
+    const float *A, *B;
+    const int64_t *sa, *sb, *sc; /* batch strides */
+    float *C;
+} bmm_job;
+
+static void bmm_range(void *arg, int64_t begin, int64_t end) {
+    const bmm_job *j = (const bmm_job *)arg;
+    for (int64_t i = begin; i < end; i++)
+        j->k->gemm_f32(j->ta, j->tb, j->M, j->N, j->K, 1.0f, j->A + batch_offset(j->bd, j->sa, i), j->lda,
+                       j->B + batch_offset(j->bd, j->sb, i), j->ldb, 1.0f, j->C + batch_offset(j->bd, j->sc, i),
+                       j->ldc);
+}
+
+/* C_i += op(A_i) @ op(B_i) for every batch index i. `split` = 0 when two
+ * indices may write the same C block (a broadcast grad): keep them serial. */
+static void bmm_run(nc_ctx *ctx, bmm_job *j, int split) {
+    double work = (double)j->M * (double)j->N * (double)(j->K ? j->K : 1);
+    if (split && j->bd->count > 1 && work < (double)(1 << 21) && ctx->n_threads > 1) {
+        int64_t grain = (int64_t)((double)(1 << 18) / (work + 1.0)) + 1;
+        nc__parallel_for(ctx, j->bd->count, grain, bmm_range, j);
+        return;
+    }
+    for (int64_t i = 0; i < j->bd->count; i++)
+        nc__gemm(ctx, j->ta, j->tb, j->M, j->N, j->K, 1.0f, j->A + batch_offset(j->bd, j->sa, i), j->lda,
+                 j->B + batch_offset(j->bd, j->sb, i), j->ldb, 1.0f, j->C + batch_offset(j->bd, j->sc, i), j->ldc);
+}
+
+static int any_broadcast(const batch_dims *bd, const int64_t *st) {
+    for (int i = 0; i < bd->nb; i++)
+        if (st[i] == 0 && bd->shape[i] > 1) return 1;
+    return 0;
+}
+
+static nc_status bmm_fwd(nc_node *n) {
+    nc_tensor *a = n->in[0], *b = n->in[1], *o = n->out;
+    batch_dims bd;
+    batch_shape(a, b, &bd);
+    bmm_operand A, B;
+    if (!bmm_operand_of(a, &bd, &A) || !bmm_operand_of(b, &bd, &B)) return NC_ERR_OOM;
+    int64_t M = o->shape[bd.nb], N = o->shape[bd.nb + 1], K = a->shape[a->ndim - 1];
+    int64_t sc[NC_MAX_DIMS];
+    batch_strides(o, o->stride, &bd, sc);
+    memset(o->data, 0, (size_t)nc_numel(o) * sizeof(float));
+    bmm_job j = {o->ctx->k, &bd, A.trans, B.trans, M, N, K, A.ld, B.ld, N, A.p, B.p, A.bst, B.bst, sc,
+                 (float *)o->data};
+    bmm_run(o->ctx, &j, 1);
+    return NC_OK;
+}
+
+static void bmm_bwd(nc_node *n) {
+    nc_tensor *a = n->in[0], *b = n->in[1], *o = n->out;
+    nc_ctx *ctx = o->ctx;
+    batch_dims bd;
+    batch_shape(a, b, &bd);
+    int64_t M = o->shape[bd.nb], N = o->shape[bd.nb + 1], K = a->shape[a->ndim - 1];
+    const float *g = (const float *)o->grad->data;
+    int64_t sg[NC_MAX_DIMS], cs[NC_MAX_DIMS], sgrad[NC_MAX_DIMS];
+    nc__contig_strides(o->ndim, o->shape, cs);
+    batch_strides(o, cs, &bd, sg);
+    bmm_operand A, B;
+    if (nc__needs_grad(a)) { /* dA_i (M x K) += dC_i @ B_i^T */
+        nc_tensor *ga = nc__grad_buf(a);
+        if (ga && bmm_operand_of(b, &bd, &B)) {
+            nc__contig_strides(a->ndim, a->shape, cs);
+            batch_strides(a, cs, &bd, sgrad);
+            bmm_job j = {ctx->k, &bd, 0, !B.trans, M, K, N, N, B.ld, K, g, B.p, sg, B.bst, sgrad, (float *)ga->data};
+            bmm_run(ctx, &j, !any_broadcast(&bd, sgrad));
+        }
+    }
+    if (nc__needs_grad(b)) { /* dB_i (K x N) += A_i^T @ dC_i */
+        nc_tensor *gb = nc__grad_buf(b);
+        if (gb && bmm_operand_of(a, &bd, &A)) {
+            nc__contig_strides(b->ndim, b->shape, cs);
+            batch_strides(b, cs, &bd, sgrad);
+            bmm_job j = {ctx->k, &bd, !A.trans, 0, K, N, M, A.ld, N, N, A.p, g, A.bst, sg, sgrad, (float *)gb->data};
+            bmm_run(ctx, &j, !any_broadcast(&bd, sgrad));
+        }
+    }
+}
+
+const nc_op_def nc_op_bmm = {"bmm", 0, 0, bmm_infer, NULL, bmm_fwd, bmm_bwd};
+
 nc_tensor *nc_matmul(nc_tensor *a, nc_tensor *b) {
     nc_tensor *in[2] = {a, b};
-    return nc__apply(&nc_op_matmul, in, 2, NULL);
+    return nc__apply(b && b->ndim > 2 ? &nc_op_bmm : &nc_op_matmul, in, 2, NULL);
 }
 
 /* ------------------------------------------------------------------------ */

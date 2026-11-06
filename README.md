@@ -110,6 +110,19 @@ model.fit(x, y, batch_size=16, validation_split=0.1, callbacks=[
 exp가 필요한 함수도 AVX2·NEON 벡터 커널로 ReLU와 비슷한 속도로 학습합니다. 비교 결과는
 [docs/PROGRESS.md](https://github.com/dandmadp/newch/blob/main/docs/PROGRESS.md)의 "활성화 함수 비교"에 있습니다.
 
+**트랜스포머:** `nn.MultiheadAttention`, `nn.TransformerEncoderLayer`, `nn.TransformerEncoder`, `nn.LayerNorm`,
+`F.scaled_dot_product_attention`과 배치 행렬곱(`q @ k.transpose(-2, -1)`)이 PyTorch와 같은 인수·파라미터 이름으로
+돌아갑니다. bool dtype이 없으므로 마스크는 `a > b` 같은 비교 결과(정수 0/1)를 씁니다.
+[examples/tiny_transformer.py](https://github.com/dandmadp/newch/blob/main/examples/tiny_transformer.py)는 문자 단위
+언어 모델을 학습합니다 (12스레드 x86 PC에서 300스텝 약 8초, 아레나 최대 29MiB).
+
+```python
+layer = nn.TransformerEncoderLayer(d_model=64, nhead=4, dim_feedforward=256, batch_first=True)
+encoder = nn.TransformerEncoder(layer, num_layers=2)
+causal = torch.tensor(list(range(T))) > torch.tensor(list(range(T))).reshape(T, 1)   # 1 = 미래 위치는 막음
+h = encoder(x, mask=causal, is_causal=True)
+```
+
 **int8 양자화 (추론):** `newch.quantize_(model)`은 모든 `Linear`를 int8 가중치로 바꿉니다 (가중치 메모리 1/4).
 
 **스레드:** 기본값은 모든 코어입니다. `newch.set_default_context(newch.Context(threads=2))`로 바꿀 수 있습니다.

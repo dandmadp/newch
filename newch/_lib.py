@@ -160,6 +160,8 @@ _SIGNATURES = {
     "nc_rmsprop": (P, [P, POINTER(c_void_p), c_int, OptimOpts, c_int]),
     "nc_optim_step": (None, [P]),
     "nc_optim_free": (None, [P]),
+    "nc_layer_norm": (P, [P, c_int, P, P, c_float]),
+    "nc_masked_fill": (P, [P, P, c_float]),
     "nc_optim_set_lr": (None, [P, c_float]),
     "nc_optim_state": (c_void_p, [P, c_int, c_int]),
     "nc_optim_get_step": (c_int64, [P]),

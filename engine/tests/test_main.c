@@ -202,6 +202,17 @@ static nc_tensor *f_matmul_3d(nc_tensor **x, nc_tensor *a) {
     (void)a;
     return nc_matmul(nc_reshape(x[0], 3, SHAPE(2, 2, 3)), x[1]);
 }
+static nc_tensor *f_bmm_t(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* q @ k^T as attention writes it: a transposed batched view */
+    return nc_matmul(x[0], nc_transpose(x[1], 1, 2));
+}
+static nc_tensor *f_ln(nc_tensor **x, nc_tensor *a) { (void)a; return nc_layer_norm(x[0], 1, x[1], x[2], 1e-5f); }
+static nc_tensor *f_ln2(nc_tensor **x, nc_tensor *a) { (void)a; return nc_layer_norm(x[0], 2, NULL, NULL, 1e-5f); }
+static nc_tensor *f_ln_t(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* strided input, bias only */
+    return nc_layer_norm(nc_transpose(x[0], 0, 1), 1, NULL, x[1], 1e-5f);
+}
+static nc_tensor *f_mfill(nc_tensor **x, nc_tensor *a) { return nc_masked_fill(nc_transpose(x[0], 0, 1), a, 0.5f); }
 static nc_tensor *f_linear(nc_tensor **x, nc_tensor *a) { (void)a; return nc_linear_fn(x[0], x[1], x[2]); }
 static nc_tensor *f_linear_nb(nc_tensor **x, nc_tensor *a) { (void)a; return nc_linear_fn(x[0], x[1], NULL); }
 static nc_tensor *f_sum0(nc_tensor **x, nc_tensor *a) { (void)a; return nc_sum(x[0], 0, 0); }
@@ -322,6 +333,30 @@ static void test_gradcheck(void) {
     gradcheck_case(ctx, "matmul T,T", f_matmul_tt, NULL, 2, in);
     in[0] = gparam(ctx, 0, 2, SHAPE(4, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(3, 2));
     gradcheck_case(ctx, "matmul 3d", f_matmul_3d, NULL, 2, in);
+
+    in[0] = gparam(ctx, 0, 3, SHAPE(2, 3, 4)), in[1] = gparam(ctx, 0, 3, SHAPE(2, 4, 5));
+    gradcheck_case(ctx, "bmm", f_matmul, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(2, 1, 3, 4)), in[1] = gparam(ctx, 0, 3, SHAPE(3, 4, 2));
+    gradcheck_case(ctx, "bmm bcast", f_matmul, NULL, 2, in); /* both operands broadcast */
+    in[0] = gparam(ctx, 0, 2, SHAPE(3, 4)), in[1] = gparam(ctx, 0, 3, SHAPE(2, 4, 5));
+    gradcheck_case(ctx, "bmm 2d@3d", f_matmul, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 3, SHAPE(2, 3, 4)), in[1] = gparam(ctx, 0, 3, SHAPE(2, 5, 4));
+    gradcheck_case(ctx, "bmm q@kT", f_bmm_t, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 3, SHAPE(2, 3, 5)), in[1] = gparam(ctx, 1, 1, SHAPE(5));
+    in[2] = gparam(ctx, 0, 1, SHAPE(5));
+    gradcheck_case(ctx, "layer_norm", f_ln, NULL, 3, in);
+    in[0] = gparam(ctx, 0, 3, SHAPE(2, 3, 4));
+    gradcheck_case(ctx, "layer_norm 2d", f_ln2, NULL, 1, in);
+    in[0] = gparam(ctx, 0, 2, SHAPE(4, 3)), in[1] = gparam(ctx, 0, 1, SHAPE(4));
+    gradcheck_case(ctx, "layer_norm T", f_ln_t, NULL, 2, in);
+    {
+        int32_t mv[4] = {1, 0, 0, 1}; /* [4] broadcast over the rows of a [3, 4] view */
+        nc_persistent_begin(ctx);
+        nc_tensor *mask = nc_from_data(ctx, NC_I32, mv, 1, SHAPE(4));
+        nc_persistent_end(ctx);
+        in[0] = gparam(ctx, 0, 2, SHAPE(4, 3));
+        gradcheck_case(ctx, "masked_fill", f_mfill, mask, 1, in);
+    }
 
     in[0] = gparam(ctx, 0, 2, SHAPE(4, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(5, 3));
     in[2] = gparam(ctx, 0, 1, SHAPE(5));
@@ -649,6 +684,64 @@ static void test_uint8(void) {
     nc_free_ctx(ctx);
 }
 
+/* Transformer building blocks: values beyond the gradchecks */
+static void test_transformer_ops(void) {
+    nc_ctx *ctx = new_ctx();
+    /* batched matmul == one 2-D matmul per batch matrix, broadcast included */
+    nc_manual_seed(ctx, 5);
+    nc_tensor *a = nc_randn(ctx, 1.0f, 3, SHAPE(3, 4, 6)), *b = nc_randn(ctx, 1.0f, 3, SHAPE(1, 6, 5));
+    nc_tensor *c = nc_matmul(a, b);
+    CHECK(c && nc_ndim(c) == 3 && nc_shape(c)[0] == 3 && nc_shape(c)[2] == 5);
+    nc_tensor *b2 = nc_reshape(b, 2, SHAPE(6, 5));
+    for (int64_t i = 0; i < 3; i++) {
+        nc_tensor *ai = nc_reshape(nc_index_select(a, nc_from_data(ctx, NC_I32, (int32_t[]){(int32_t)i}, 1, SHAPE(1))),
+                                   2, SHAPE(4, 6));
+        nc_tensor *ci = nc_matmul(ai, b2);
+        for (int64_t r = 0; r < 4; r++)
+            for (int64_t k = 0; k < 5; k++)
+                CHECK_NEAR(nc_get(c, (int64_t[]){i, r, k}), nc_get(ci, (int64_t[]){r, k}), 1e-5);
+    }
+    CHECK(nc_matmul(a, nc_randn(ctx, 1.0f, 3, SHAPE(2, 6, 5))) == NULL); /* batch 3 vs 2 */
+    CHECK(nc_status_code(ctx) == NC_ERR_SHAPE);
+    nc_clear_error(ctx);
+
+    /* many small matrices run one per thread: same bits with 1 or many threads */
+    nc_ctx *one = nc_init(&(nc_config){.threads = 1});
+    float *res[2];
+    nc_ctx *cs[2] = {one, ctx};
+    for (int k = 0; k < 2; k++) {
+        nc_manual_seed(cs[k], 9);
+        nc_tensor *q = nc_randn(cs[k], 1.0f, 3, SHAPE(64, 16, 8)), *kk = nc_randn(cs[k], 1.0f, 3, SHAPE(64, 16, 8));
+        res[k] = nc_data_f32(nc_matmul(q, nc_transpose(kk, 1, 2)));
+    }
+    CHECK(memcmp(res[0], res[1], 64 * 16 * 16 * sizeof(float)) == 0);
+    nc_free_ctx(one);
+
+    /* layer_norm: zero mean, unit (biased) variance per row */
+    float lv[4] = {1.0f, 2.0f, 3.0f, 6.0f};
+    nc_tensor *ln = nc_layer_norm(T(ctx, lv, 1, 4), 1, NULL, NULL, 0.0f);
+    double m = 0, v = 0;
+    for (int i = 0; i < 4; i++) m += nc_data_f32(ln)[i] / 4.0;
+    for (int i = 0; i < 4; i++) v += (nc_data_f32(ln)[i] - m) * (nc_data_f32(ln)[i] - m) / 4.0;
+    CHECK_NEAR(m, 0.0, 1e-6);
+    CHECK_NEAR(v, 1.0, 1e-5);
+    CHECK(nc_layer_norm(T(ctx, lv, 1, 4), 1, T(ctx, lv, 3), NULL, 1e-5f) == NULL); /* weight of 3 for D = 4 */
+    nc_clear_error(ctx);
+
+    /* masked_fill with -inf, then softmax: masked entries become exactly 0, no NaN */
+    float sv[4] = {0.5f, 1.0f, -2.0f, 3.0f};
+    uint8_t keep_out[4] = {0, 1, 0, 1}; /* u8 masks work too */
+    nc_tensor *mk = nc_from_data(ctx, NC_U8, keep_out, 1, SHAPE(4));
+    nc_tensor *p = nc_softmax(nc_masked_fill(T(ctx, sv, 1, 4), mk, -INFINITY));
+    CHECK_NEAR(nc_data_f32(p)[1], 0.0, 0);
+    CHECK_NEAR(nc_data_f32(p)[3], 0.0, 0);
+    CHECK_NEAR(nc_data_f32(p)[0] + nc_data_f32(p)[2], 1.0, 1e-6);
+    CHECK(nc_masked_fill(T(ctx, sv, 4), nc_from_data(ctx, NC_I32, (int32_t[]){1, 0}, 1, SHAPE(2)), 0.0f) == NULL);
+    nc_clear_error(ctx);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
 static void test_release(void) {
     nc_ctx *ctx = new_ctx();
     size_t base = nc_get_mem_stats(ctx).persistent_bytes;
@@ -726,6 +819,23 @@ static void test_kernel_parity(void) {
         }
     }
     printf("    exp/sigmoid/tanh max rel err vs libm: %.2g %.2g %.2g\n", worst[0], worst[1], worst[2]);
+    /* special values as libm: exp(-inf) = 0 (attention masks), exp(+inf) = inf, NaN stays NaN,
+     * and beyond the clamp edges exp is 0 / inf (libm gives denormals there: < 1.2e-38 apart) */
+    {
+        float sx[9] = {-INFINITY, INFINITY, NAN, -87.5f, -95.0f, -120.0f, 88.5f, 100.0f, 88.7f}, s0[9], s1[9];
+        for (int f = 0; f < 3; f++) {
+            void (*rf)(int64_t, const float *, float *) =
+                f == 0 ? ref->exp_f32 : f == 1 ? ref->sigmoid_f32 : ref->tanh_f32;
+            void (*kf)(int64_t, const float *, float *) = f == 0 ? k->exp_f32 : f == 1 ? k->sigmoid_f32 : k->tanh_f32;
+            rf(9, sx, s0);
+            kf(9, sx, s1);
+            for (int i = 0; i < 9; i++) {
+                if (isnan(s0[i])) CHECK(isnan(s1[i]));
+                else if (isinf(s0[i])) CHECK(s1[i] == s0[i]);
+                else CHECK(fabsf(s0[i] - s1[i]) <= fmaxf(1.2e-38f, 1e-6f * fabsf(s0[i])));
+            }
+        }
+    }
     CHECK(worst[0] < 1e-6f && worst[1] < 1e-6f && worst[2] < 1e-5f);
     ref->erf_f32(NT, tx, r0);
     k->erf_f32(NT, tx, r1);
@@ -1141,6 +1251,7 @@ int main(void) {
         {"inference_release", test_inference_release},
         {"optim_state", test_optim_state},
         {"uint8", test_uint8},
+        {"transformer_ops", test_transformer_ops},
         {"kernel_parity", test_kernel_parity},
         {"conv_pool_bn", test_conv_pool_bn},
         {"dropout", test_dropout},

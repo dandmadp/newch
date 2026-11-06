@@ -101,7 +101,8 @@ struct nc_node {
     X(reshape) X(transpose) X(contiguous) X(detach) X(index_select)            \
     X(log_softmax) X(softmax) X(cross_entropy)                                 \
     X(conv2d) X(max_pool2d) X(avg_pool2d) X(dropout) X(batch_norm)             \
-    X(linear_int8) X(nll_loss) X(compare) X(cat) X(to_dtype)
+    X(linear_int8) X(nll_loss) X(compare) X(cat) X(to_dtype)                   \
+    X(bmm) X(layer_norm) X(masked_fill)
 
 #define NC_DECLARE_OP(name) extern const nc_op_def nc_op_##name;
 NC_OP_LIST(NC_DECLARE_OP)

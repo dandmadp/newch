@@ -72,8 +72,9 @@ NC_AVX2 static float sum_f32(int64_t n, const float *x) {
 
 
 /* exp: x = n ln2 + r, e^r by a degree-6 polynomial, 2^n built in the exponent
- * bits. Inputs are clamped to the finite float range. */
-#define NC_EXP_HI 88.3762626f
+ * bits. Below the normal float range the result is 0 (libm: a denormal or 0,
+ * so exp(-inf) = 0 for attention masks), above it +inf; NaN stays NaN. */
+#define NC_EXP_HI 88.8f /* just past ln(FLT_MAX): larger inputs overflow to inf */
 #define NC_EXP_LO -87.3365448f
 #define NC_LOG2E 1.44269504088896341f
 #define NC_LN2_HI 0.693359375f
@@ -93,6 +94,7 @@ NC_AVX2 static float sum_f32(int64_t n, const float *x) {
 #define NC_TANH_T9 0.021869489f
 
 NC_AVX2 static inline __m256 exp8(__m256 x) {
+    const __m256 x0 = x;
     x = _mm256_min_ps(_mm256_max_ps(x, _mm256_set1_ps(NC_EXP_LO)), _mm256_set1_ps(NC_EXP_HI));
     __m256 fx = _mm256_floor_ps(_mm256_fmadd_ps(x, _mm256_set1_ps(NC_LOG2E), _mm256_set1_ps(0.5f)));
     x = _mm256_fnmadd_ps(fx, _mm256_set1_ps(NC_LN2_HI), x);
@@ -104,8 +106,15 @@ NC_AVX2 static inline __m256 exp8(__m256 x) {
     y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(NC_EXP_P4));
     y = _mm256_fmadd_ps(y, x, _mm256_set1_ps(NC_EXP_P5));
     y = _mm256_fmadd_ps(y, _mm256_mul_ps(x, x), _mm256_add_ps(x, _mm256_set1_ps(1.0f)));
-    __m256i n = _mm256_slli_epi32(_mm256_add_epi32(_mm256_cvttps_epi32(fx), _mm256_set1_epi32(127)), 23);
-    return _mm256_mul_ps(y, _mm256_castsi256_ps(n));
+    /* n reaches 128 near ln(FLT_MAX), which has no float exponent: use 2^127 * 2 there */
+    __m256i ni = _mm256_cvttps_epi32(fx);
+    __m256i big = _mm256_cmpgt_epi32(ni, _mm256_set1_epi32(127));
+    ni = _mm256_add_epi32(ni, big); /* mask is -1 */
+    __m256i n = _mm256_slli_epi32(_mm256_add_epi32(ni, _mm256_set1_epi32(127)), 23);
+    __m256 r = _mm256_mul_ps(y, _mm256_castsi256_ps(n));
+    r = _mm256_mul_ps(r, _mm256_blendv_ps(_mm256_set1_ps(1.0f), _mm256_set1_ps(2.0f), _mm256_castsi256_ps(big)));
+    r = _mm256_andnot_ps(_mm256_cmp_ps(x0, _mm256_set1_ps(NC_EXP_LO), _CMP_LT_OQ), r);
+    return _mm256_blendv_ps(r, x0, _mm256_cmp_ps(x0, x0, _CMP_UNORD_Q));
 }
 
 NC_AVX2 static inline __m256 sigmoid8(__m256 x) {
