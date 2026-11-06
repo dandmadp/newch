@@ -160,7 +160,7 @@ class TestData(Base):
         fx = FileArray.create(self.path("x.bin"), (row for row in xs), row_shape=(1, 8, 8))
         fy = FileArray.create(self.path("y.bin"), ([y] for y in ys), row_shape=(), dtype=nc.int32)
         self.assertEqual(fx.shape, (300, 1, 8, 8))
-        self.assertEqual(fy[5], [ys[5]])
+        self.assertEqual(fy[5], ys[5])  # 1-D rows are numbers, as in numpy
         loader = DataLoader(TensorDataset(fx, fy), batch_size=50, shuffle=True)
         self.assertEqual(len(loader), 6)
         xb, yb = next(iter(loader))

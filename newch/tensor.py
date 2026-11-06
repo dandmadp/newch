@@ -7,6 +7,7 @@ import contextlib
 import ctypes
 import json
 import math
+import numbers
 import warnings
 from typing import Sequence
 
@@ -21,6 +22,13 @@ uint8 = "uint8"  # compact storage for raw data (pixels, small labels); convert 
 
 class NcError(RuntimeError):
     """Raised when the engine reports an error (shape mismatch, bad index, ...)."""
+
+
+def _dtype_code(dtype) -> int:
+    try:
+        return L.DTYPE_CODES[dtype]
+    except (KeyError, TypeError):
+        raise ValueError(f"unsupported dtype {dtype!r}; newch has float32, int32, int8 and uint8") from None
 
 
 # --------------------------------------------------------------------------
@@ -174,10 +182,18 @@ def _flatten(data, shape: list, out: list, depth: int = 0) -> None:
             raise ValueError("ragged nested sequence: all rows must have the same length")
         for item in data:
             _flatten(item, shape, out, depth + 1)
+    elif isinstance(data, Tensor) or (_is_numpy(data) and getattr(data, "ndim", 0)):
+        _flatten(data.tolist(), shape, out, depth)  # e.g. tensor([t0, t1]) or a list of numpy rows
     else:
         if depth != len(shape):
             raise ValueError("ragged nested sequence: inconsistent depth")
         out.append(data)
+
+
+def _is_int(v) -> bool:
+    """Python ints and bools, numpy integer and bool scalars."""
+    return isinstance(v, numbers.Integral) or (_is_numpy(v) and getattr(v, "dtype", None) is not None
+                                               and v.dtype.kind in "biu")
 
 
 def _is_numpy(obj) -> bool:
@@ -202,7 +218,7 @@ def _to_buffer(data, dtype: str | None):
 
         if dtype is None:
             dtype = _numpy_dtype(data)
-        arr = np.ascontiguousarray(data, dtype=dtype)  # newch dtype names are numpy names
+        arr = np.asarray(data, dtype=dtype, order="C")  # newch dtype names are numpy names; keeps 0-d
         return arr, arr.ctypes.data, arr.shape, dtype
     if isinstance(data, array.array):
         if dtype is None:
@@ -215,7 +231,7 @@ def _to_buffer(data, dtype: str | None):
     flat: list = []
     _flatten(data, shape, flat)
     if dtype is None:
-        dtype = float32 if any(isinstance(v, float) for v in flat) else int32
+        dtype = float32 if any(type(v) is not int and not _is_int(v) for v in flat) else int32
         if not flat:
             dtype = float32
     buf = array.array(L.ARRAY_CODE[dtype], flat if dtype == float32 else (int(v) for v in flat))
@@ -237,7 +253,7 @@ def _unflatten(flat: Sequence, shape: Sequence[int]):
 # --------------------------------------------------------------------------
 
 
-Number = (int, float)
+Number = numbers.Number  # int, float, bool and numpy scalars
 _new_tensor = object.__new__
 
 
@@ -249,6 +265,8 @@ class Tensor:
     """
 
     __slots__ = ("_p", "_ctx", "_step", "_owner", "_base", "_free")
+    # numpy defers to Tensor for `ndarray + tensor` etc. (as for torch), so the result stays a Tensor
+    __array_priority__ = 1000
 
     @classmethod
     def _from_ptr(cls, ptr, ctx: Context, base: "Tensor | None" = None, persistent: "bool | None" = None) -> "Tensor":
@@ -460,6 +478,14 @@ class Tensor:
     def __float__(self) -> float:
         return float(self.item())
 
+    def __int__(self) -> int:
+        return int(self.item())
+
+    def __iter__(self):
+        if self.ndim == 0:
+            raise TypeError("iteration over a 0-d tensor")
+        return (self[i] for i in range(self.shape[0]))
+
     def __bool__(self) -> bool:
         n = self.numel()
         if n != 1:  # also what `t in [a, b]` and `if t:` hit, as in PyTorch
@@ -471,13 +497,19 @@ class Tensor:
     __hash__ = object.__hash__  # tensors stay usable as dict keys / in sets, as in PyTorch
 
     def _cmp(self, o, op: int):
-        if isinstance(o, bool):
-            o = int(o)
-        if isinstance(o, int):
-            o = tensor(o, dtype=int32, ctx=self._ctx)
-        elif isinstance(o, float):
+        if isinstance(o, Tensor):
+            pass
+        elif type(o) is float:  # fast paths before the numbers ABCs
             o = tensor(o, dtype=float32, ctx=self._ctx)
-        elif not isinstance(o, Tensor):
+        elif type(o) is int:
+            o = tensor(o, dtype=int32, ctx=self._ctx)
+        elif _is_int(o):
+            o = tensor(int(o), dtype=int32, ctx=self._ctx)
+        elif isinstance(o, numbers.Real):
+            o = tensor(float(o), dtype=float32, ctx=self._ctx)
+        elif _is_numpy(o):
+            o = tensor(o, ctx=self._ctx)
+        else:
             return NotImplemented
         return self._w(lib.nc_compare(self.ptr, o.ptr, op))
 
@@ -509,16 +541,14 @@ class Tensor:
         for a in args:
             if isinstance(a, Tensor):
                 dtype = a.dtype
-            elif a in L.DTYPE_CODES:
+            elif a in L.DTYPE_CODES or not _is_device(a):
                 dtype = a
             else:
                 device = a
         _check_device(device)
         if dtype is None or dtype == self.dtype:
             return self
-        if dtype not in L.DTYPE_CODES:
-            raise ValueError(f"unsupported dtype {dtype!r}")
-        return self._w(lib.nc_to_dtype(self.ptr, L.DTYPE_CODES[dtype]))
+        return self._w(lib.nc_to_dtype(self.ptr, _dtype_code(dtype)))
 
     def float(self) -> "Tensor": return self.to(float32)
     def int(self) -> "Tensor": return self.to(int32)
@@ -564,7 +594,7 @@ class Tensor:
     __rmul__ = __mul__
 
     def __truediv__(self, o):
-        if isinstance(o, Number):
+        if isinstance(o, Number) and abs(float(o)) >= 1e-38:  # 1/o fits in float32
             return self._w(lib.nc_scale(self.ptr, 1.0 / float(o)))
         o = self._other(o)  # keep the operand alive across the call
         return self._w(lib.nc_div(self.ptr, o.ptr))
@@ -609,7 +639,27 @@ class Tensor:
     # Reductions take PyTorch's `dim`; numpy's `axis` is accepted as an alias.
     def _reduce(self, fn, dim, keepdim, axis):
         dim = axis if dim is None else dim
+        if isinstance(dim, (tuple, list)):
+            return self._reduce_dims(fn, dim, keepdim)
         return self._w(fn(self.ptr, L.ALL_AXES if dim is None else int(dim), int(keepdim)))
+
+    def _reduce_dims(self, fn, dims, keepdim):
+        """dim=(d0, d1, ...): one reduction per dim, last dim first (a mean of means is the mean)."""
+        n = self.ndim
+        if not dims:
+            return self._reduce(fn, None, keepdim, None)
+        for d in dims:
+            if not -max(n, 1) <= int(d) < max(n, 1):
+                raise IndexError(f"dim {d} out of range for a {n}-d tensor")
+        norm = [int(d) % n if n else 0 for d in dims]
+        if len(set(norm)) != len(norm):
+            raise RuntimeError(f"dim {dims} lists a dimension more than once")
+        out = self
+        for d in sorted(norm, reverse=True):
+            out = out._w(fn(out.ptr, d, 1))
+        if keepdim:
+            return out
+        return out.reshape(*[s for i, s in enumerate(self.shape) if i not in norm])
 
     def sum(self, dim=None, keepdim=False, *, axis=None): return self._reduce(lib.nc_sum, dim, keepdim, axis)
     def mean(self, dim=None, keepdim=False, *, axis=None): return self._reduce(lib.nc_mean, dim, keepdim, axis)
@@ -746,8 +796,33 @@ class Tensor:
         if isinstance(key, slice):
             return self.index_select(0, list(range(*key.indices(self.shape[0]))))
         if isinstance(key, (list, Tensor)) or _is_numpy(key):
-            return self.index_select(0, key)
+            return self._take_rows(key)
         raise TypeError("only axis-0 indexing (int, slice, list, int32 tensor) is supported")
+
+    def _take_rows(self, key) -> "Tensor":
+        """self[key] for integer index lists/arrays/tensors of any shape; negative indices count from the end."""
+        n = self.shape[0] if self.ndim else 0
+        if isinstance(key, Tensor):
+            if key.dtype != int32:
+                raise IndexError(f"tensors used as indices must be int32, got {key.dtype} "
+                                 "(boolean masks are not supported)")
+            shape, flat = key.shape, key._flat()
+        else:
+            shape, flat = _to_buffer(key, None)[2], []
+            _flatten(key.tolist() if _is_numpy(key) else key, [], flat)
+            if any(isinstance(v, bool) or type(v).__name__ == "bool_" for v in flat):
+                raise IndexError("boolean masks are not supported as indices; use masked_fill or integer indices")
+            if any(not _is_int(v) for v in flat):
+                raise IndexError("indices must be integers")
+        if any(v < 0 for v in flat):
+            if any(v < -n for v in flat):
+                raise IndexError(f"index {min(flat)} out of range for axis 0 of size {n}")
+            flat = [v + n if v < 0 else v for v in flat]
+            key = None
+        if key is None or len(shape) != 1 or not isinstance(key, Tensor):
+            key = tensor(list(flat), dtype=int32, ctx=self._ctx)
+        out = self.index_select(0, key)
+        return out if len(shape) == 1 else out.reshape(*shape, *self.shape[1:])
 
     # ---- autograd --------------------------------------------------------
     def backward(self, gradient=None, retain_graph=None, create_graph: bool = False, inputs=None) -> None:
@@ -789,6 +864,8 @@ def tensor(data, dtype: str | None = None, requires_grad: bool = False, ctx: Con
 
     Integer data becomes int32, anything with floats becomes float32.
     """
+    if dtype is not None:
+        _dtype_code(dtype)  # clear error for float64, bool, ...
     if isinstance(data, Tensor):
         if data.dtype == float32 and dtype in (None, float32) and ctx in (None, data.ctx):
             src = data.detach()  # must outlive the call: a persistent temp is freed on GC
@@ -800,15 +877,14 @@ def tensor(data, dtype: str | None = None, requires_grad: bool = False, ctx: Con
         data = data.tolist()
     ctx = _ctx(ctx)
     if isinstance(data, Number):
-        dtype = dtype or (float32 if isinstance(data, float) else int32)
+        dtype = dtype or (int32 if _is_int(data) else float32)
         keep, addr, shape, dtype = _to_buffer([data], dtype)
         shape = ()
     else:
         keep, addr, shape, dtype = _to_buffer(data, dtype)
-    if dtype not in L.DTYPE_CODES:
-        raise ValueError(f"unsupported dtype {dtype!r}; use float32 or int32")
+    code = _dtype_code(dtype)
     n, arr = L.shape_arg(shape)
-    t = ctx.wrap(lib.nc_from_data(ctx._p, L.DTYPE_CODES[dtype], addr, n, arr))
+    t = ctx.wrap(lib.nc_from_data(ctx._p, code, addr, n, arr))
     del keep
     if requires_grad:
         t.requires_grad = True
@@ -818,7 +894,7 @@ def tensor(data, dtype: str | None = None, requires_grad: bool = False, ctx: Con
 def zeros(*shape, dtype: str = float32, ctx: Context | None = None) -> Tensor:
     ctx = _ctx(ctx)
     n, arr = L.shape_arg(_shape(shape))
-    return ctx.wrap(lib.nc_zeros(ctx._p, L.DTYPE_CODES[dtype], n, arr))
+    return ctx.wrap(lib.nc_zeros(ctx._p, _dtype_code(dtype), n, arr))
 
 
 def full(size, fill_value, *, dtype: str | None = None, ctx: Context | None = None) -> Tensor:
@@ -828,7 +904,8 @@ def full(size, fill_value, *, dtype: str | None = None, ctx: Context | None = No
     ctx = _ctx(ctx)
     size = tuple(size) if isinstance(size, (list, tuple)) else (size,)
     if dtype is None:
-        dtype = int32 if isinstance(fill_value, int) else float32
+        dtype = int32 if _is_int(fill_value) else float32
+    _dtype_code(dtype)
     if dtype == float32:
         n, arr = L.shape_arg(size)
         return ctx.wrap(lib.nc_full(ctx._p, float(fill_value), n, arr))
@@ -896,9 +973,10 @@ def release(t: Tensor) -> None:
 def tensor_from_bytes(buf: bytes, shape, dtype: str, ctx: Context | None = None) -> Tensor:
     """Tensor from raw little-endian row-major bytes (one copy, into the engine)."""
     ctx = _ctx(ctx)
+    code = _dtype_code(dtype)
     n, arr = L.shape_arg(shape)
     addr = ctypes.cast(ctypes.c_char_p(buf), ctypes.c_void_p) if buf else None
-    return ctx.wrap(lib.nc_from_data(ctx._p, L.DTYPE_CODES[dtype], addr, n, arr))
+    return ctx.wrap(lib.nc_from_data(ctx._p, code, addr, n, arr))
 
 
 # --------------------------------------------------------------------------
@@ -954,6 +1032,14 @@ def _implicit_dim(x: Tensor, dim, name: str) -> int:
     # PyTorch's legacy rule when dim is omitted (it warns as well)
     warnings.warn(f"{name}() without dim picks an axis implicitly; pass dim explicitly", stacklevel=3)
     return 0 if x.ndim in (0, 1, 3) else 1
+
+
+_DEVICES = {"cpu", "cuda", "mps", "xpu", "xla", "meta", "hip", "hpu", "ipu", "mtia", "vulkan", "privateuseone"}
+
+
+def _is_device(a) -> bool:
+    """A device string/object (cpu, cuda:0, torch.device(...)); other strings are dtype names."""
+    return not isinstance(a, str) or a.split(":")[0] in _DEVICES
 
 
 def _check_device(device) -> None:
@@ -1016,7 +1102,16 @@ def conv2d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride=1, 
     """NCHW convolution (torch.nn.functional.conv2d); dilation and groups must be 1."""
     _unsupported(dilation=(_pair(dilation, "dilation"), (1, 1)), groups=(groups, 1))
     (sh, sw), (ph, pw) = _pair(stride, "stride"), _pair(padding, "padding")
-    return input._w(lib.nc_conv2d(input.ptr, weight.ptr, bias.ptr if bias is not None else None, sh, sw, ph, pw))
+    return _unbatched(input, lambda x: x._w(lib.nc_conv2d(x.ptr, weight.ptr, bias.ptr if bias is not None else None,
+                                                          sh, sw, ph, pw)))
+
+
+def _unbatched(input: Tensor, fn) -> Tensor:
+    """Runs a 4-D [N, C, H, W] op on [C, H, W] input too (as torch does)."""
+    if input.ndim != 3:
+        return fn(input)
+    out = fn(input.unsqueeze(0))
+    return out.reshape(*out.shape[1:])
 
 
 def _window(kernel_size, stride, padding):
@@ -1030,7 +1125,8 @@ def max_pool2d(input: Tensor, kernel_size, stride=None, padding=0, dilation=1, c
                return_indices: bool = False) -> Tensor:
     _unsupported(dilation=(_pair(dilation, "dilation"), (1, 1)), ceil_mode=(ceil_mode, False),
                  return_indices=(return_indices, False))
-    return input._w(lib.nc_max_pool2d(input.ptr, *_window(kernel_size, stride, padding)))
+    win = _window(kernel_size, stride, padding)
+    return _unbatched(input, lambda x: x._w(lib.nc_max_pool2d(x.ptr, *win)))
 
 
 def avg_pool2d(input: Tensor, kernel_size, stride=None, padding=0, ceil_mode: bool = False,
@@ -1038,7 +1134,8 @@ def avg_pool2d(input: Tensor, kernel_size, stride=None, padding=0, ceil_mode: bo
     """Average pooling; padded cells count toward the average (count_include_pad=True)."""
     _unsupported(ceil_mode=(ceil_mode, False), count_include_pad=(count_include_pad, True),
                  divisor_override=(divisor_override, None))
-    return input._w(lib.nc_avg_pool2d(input.ptr, *_window(kernel_size, stride, padding)))
+    win = _window(kernel_size, stride, padding)
+    return _unbatched(input, lambda x: x._w(lib.nc_avg_pool2d(x.ptr, *win)))
 
 
 def dropout(input: Tensor, p: float = 0.5, training: bool = True, inplace: bool = False) -> Tensor:
@@ -1137,7 +1234,10 @@ def cross_entropy(input: Tensor, target, weight=None, size_average=None, ignore_
             raise ValueError("label_smoothing must be in [0, 1]")
         uniform = (input.log_softmax(-1).mean(-1)).mean() * -1.0  # mean over classes and rows
         loss = loss * (1.0 - label_smoothing) + uniform * label_smoothing
-    return loss * float(target.shape[0]) if reduction == "sum" else loss
+    if reduction == "sum":
+        n = target.shape[0]
+        return loss * float(n) if n else input.sum()  # torch: 0 for no rows (the mean is NaN)
+    return loss
 
 
 def nll_loss(input: Tensor, target, weight=None, size_average=None, ignore_index: int = -100, reduce=None,

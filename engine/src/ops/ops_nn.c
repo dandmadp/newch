@@ -126,7 +126,7 @@ static nc_status ce_fwd(nc_node *n) {
         loss -= p[lab[i]];
         ctx->k->exp_f32(C, p, p);
     }
-    *(float *)n->out->data = N ? (float)(loss / (double)N) : 0.0f;
+    *(float *)n->out->data = N ? (float)(loss / (double)N) : NAN; /* mean over no rows: 0/0, as in torch */
     sv->prob = prob;
     sv->lab = lab;
     n->saved = sv;
@@ -400,7 +400,7 @@ static nc_status nll_fwd(nc_node *n) {
         }
         loss -= x[i * C + lab[i]];
     }
-    *(float *)n->out->data = (float)(n->p.i[0] ? loss : (N ? loss / (double)N : 0.0));
+    *(float *)n->out->data = n->p.i[0] ? (float)loss : N ? (float)(loss / (double)N) : NAN;
     n->saved = lab;
     return NC_OK;
 }

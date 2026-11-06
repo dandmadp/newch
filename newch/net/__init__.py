@@ -9,7 +9,7 @@ from collections import OrderedDict, namedtuple
 from .. import _lib as L
 from .._lib import lib
 from ..tensor import persistent as _persistent_mode
-from ..tensor import (Context, Tensor, _check_device, _is_numpy, _pair, _to_buffer, _unsupported, _window, avg_pool2d,
+from ..tensor import (Context, Tensor, _check_device, _is_device, _is_numpy, _pair, _to_buffer, _unsupported, _window, avg_pool2d,
                      batch_norm, cross_entropy, mse_loss, nll_loss,
                      conv2d, default_context, dropout, full, gelu, hardsigmoid, hardswish, int32, leaky_relu, linear,
                      load_tensors, log_softmax, max_pool2d, parameter, persistent, randn, relu6, save_tensors,
@@ -100,7 +100,7 @@ class Module:
         if kwargs:
             raise TypeError(f"to() got unexpected arguments {sorted(kwargs)}")
         for a in args:
-            if a in L.DTYPE_CODES:
+            if a in L.DTYPE_CODES or not _is_device(a):
                 dtype = a
             else:
                 device = a
@@ -349,7 +349,7 @@ class BatchNorm2d(_BatchNorm):
 
 
 class Embedding(Module):
-    """Lookup table: int32 indices [B] -> rows [B, embedding_dim]; weight ~ N(0, 1)."""
+    """Lookup table: int32 indices of any shape [*] -> rows [*, embedding_dim]; weight ~ N(0, 1)."""
 
     def __init__(self, num_embeddings: int, embedding_dim: int, padding_idx=None, max_norm=None, *,
                  ctx: Context | None = None):
@@ -359,7 +359,12 @@ class Embedding(Module):
         self.weight = parameter(randn(num_embeddings, embedding_dim, ctx=ctx), ctx=ctx)
 
     def forward(self, idx) -> Tensor:
-        return self.weight.index_select(0, idx)
+        if not isinstance(idx, Tensor):
+            idx = tensor(idx, dtype=int32, ctx=self.weight.ctx)
+        if idx.ndim == 1:
+            return self.weight.index_select(0, idx)
+        flat = idx.reshape(-1)  # bound: must outlive the call
+        return self.weight.index_select(0, flat).reshape(*idx.shape, self.embedding_dim)
 
     def extra_repr(self) -> str:
         return f"{self.num_embeddings}, {self.embedding_dim}"

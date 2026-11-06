@@ -80,6 +80,10 @@ static nc_status reduce_fwd(nc_node *n) {
     if (kind == RED_SUM || kind == RED_MEAN) {
         float *y = (float *)n->out->data;
         float scale = kind == RED_MEAN ? 1.0f / (float)(d.R ? d.R : 1) : 1.0f;
+        if (kind == RED_MEAN && d.R == 0) { /* mean of nothing is 0/0, as in torch and numpy */
+            for (int64_t i = 0; i < d.outer * d.inner; i++) y[i] = NAN;
+            return NC_OK;
+        }
         if (d.inner == 1) {
             for (int64_t o = 0; o < d.outer; o++) y[o] = scale * k->sum_f32(d.R, x + o * d.R);
             return NC_OK;

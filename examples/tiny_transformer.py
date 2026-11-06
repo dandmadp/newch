@@ -44,7 +44,7 @@ class CharLM(nn.Module):
 
     def forward(self, idx):  # idx int32 [N, block]
         n, t = idx.shape
-        h = self.tok(idx.reshape(-1)).reshape(n, t, -1) + self.pos(torch.tensor(list(range(t))))
+        h = self.tok(idx) + self.pos(torch.tensor(list(range(t))))
         h = self.encoder(h, mask=self.causal, is_causal=True)
         return self.head(self.norm(h))  # [N, block, vocab]
 

@@ -129,6 +129,15 @@ static void test_reduce_values(void) {
     CHECK_NEAR(nc_get(mx, SHAPE(0)), 5, 0);
     CHECK(nc_get_dtype(am) == NC_I32);
     CHECK_NEAR(nc_get(am, SHAPE(1)), 2, 0);
+    /* means over nothing are 0/0 = NaN (torch, numpy); sums are 0 */
+    nc_tensor *E = nc_zeros(ctx, NC_F32, 2, SHAPE(0, 3));
+    nc_tensor *lab = nc_zeros(ctx, NC_I32, 1, SHAPE(0));
+    CHECK(isnan(nc_item(nc_mean(E, NC_ALL_AXES, 0))));
+    CHECK(isnan(nc_get(nc_mean(E, 0, 0), SHAPE(2))));
+    CHECK_NEAR(nc_get(nc_sum(E, 0, 0), SHAPE(2)), 0, 0);
+    CHECK(isnan(nc_item(nc_cross_entropy(E, lab))));
+    CHECK(isnan(nc_item(nc_nll_loss(E, lab, 0))));
+    CHECK_NEAR(nc_item(nc_nll_loss(E, lab, 1)), 0, 0);
     CHECK(nc_ok(ctx));
     nc_free_ctx(ctx);
 }

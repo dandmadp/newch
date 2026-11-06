@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ctypes
 import math
+import warnings
 
 from . import _lib as L
 from ._lib import lib
@@ -37,6 +38,9 @@ class Optimizer:
             raise ValueError("optimizer got an empty parameter list")
         if not all(isinstance(p, Tensor) for p in params):
             raise TypeError("optimizer parameters must be newch Tensors")
+        if len({id(p) for p in params}) != len(params):  # same warning as torch; each copy is stepped
+            warnings.warn("optimizer contains a parameter group with duplicate parameters", UserWarning, stacklevel=3)
+        _check_hyper(hyper)
         self.params = params  # keeps the Python wrappers alive
         self._ctx = params[0].ctx
         self._p = None
@@ -115,6 +119,7 @@ class Optimizer:
         if missing:
             raise ValueError(f"load_state_dict: parameter group lacks {missing}")
         hyper = {k: tuple(float(b) for b in group[k]) if k == "betas" else float(group[k]) for k in self._hyper}
+        _check_hyper(hyper)
         if "momentum" in hyper and (hyper["momentum"] != 0) != (self._hyper["momentum"] != 0):
             raise ValueError("load_state_dict: momentum cannot switch between zero and non-zero "
                              f"({self._hyper['momentum']} -> {hyper['momentum']}); create the optimizer with it")
@@ -156,6 +161,18 @@ class Optimizer:
             elif nbytes:
                 ctypes.memmove(buf, src[1], nbytes)
         lib.nc_optim_set_step(self._p, int(steps.pop()) if steps else 0)
+
+
+def _check_hyper(h: dict) -> None:
+    """The argument checks of torch.optim."""
+    checks = [("lr", "learning rate"), ("eps", "epsilon value"), ("weight_decay", "weight_decay value"),
+              ("momentum", "momentum value"), ("alpha", "alpha value")]
+    for key, what in checks:
+        if key in h and not float(h[key]) >= 0.0:
+            raise ValueError(f"Invalid {what}: {h[key]}")
+    for i, b in enumerate(h.get("betas", ())):
+        if not 0.0 <= float(b) < 1.0:
+            raise ValueError(f"Invalid beta parameter at index {i}: {b}")
 
 
 class SGD(Optimizer):
