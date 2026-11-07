@@ -75,6 +75,8 @@ filtered pipeline once hid a failing test that then got pushed.
   `functional`/`init`), new ops (nll_loss, compare, cat, to_dtype, i32 sum), backward memory release (-48% reserved), inference memory
   release, optimizer/scheduler `state_dict` with nested `save_tensors` checkpoints, `uint8` data dtype,
   transformer blocks (batched matmul, layer_norm, masked_fill, SDPA, MultiheadAttention, TransformerEncoder),
+  stage-3 work (2026-11-08): slice view op + strided reshape views, numpy-style multi-axis indexing, softmax any dim,
+  int->float promotion, grouped/depthwise/dilated conv, threaded elementwise/im2col/pooling, RNN/LSTM/GRU,
   lower Python call overhead, and the dedupe cleanup listed at the top of `docs/PROGRESS.md` (torch style is the
   base; Keras reduced to `fit()`; `newch.ml` removed; NN functions only in `F`; one save path).
 - API surface is frozen at this level: do not add more library-mirroring APIs without discussing it first.

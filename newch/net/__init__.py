@@ -15,12 +15,13 @@ from ..tensor import (Context, Tensor, _check_device, _is_device, _is_numpy, _pa
                      load_tensors, log_softmax, max_pool2d, parameter, persistent, randn, relu6, save_tensors,
                      silu, softmax, tensor, zeros)
 
-from ..tensor import _apply_mask, _conv_padding, _rand_uniform, layer_norm
+from ..tensor import _apply_mask, _conv_padding, _rand_uniform, cat, layer_norm, stack
 
 __all__ = [
     "AvgPool2d", "BatchNorm1d", "BatchNorm2d", "Conv2d", "CrossEntropyLoss", "Dropout", "Embedding", "Flatten", "GELU",
-    "Hardsigmoid", "Hardswish", "Identity", "LayerNorm", "LeakyReLU", "Linear", "LogSoftmax", "MSELoss", "MaxPool2d",
-    "Model", "Module", "ModuleDict", "ModuleList", "MultiheadAttention", "NLLLoss", "QuantizedLinear", "ReLU", "ReLU6",
+    "GRU", "GRUCell", "Hardsigmoid", "Hardswish", "Identity", "LSTM", "LSTMCell", "LayerNorm", "LeakyReLU", "Linear",
+    "LogSoftmax", "MSELoss", "MaxPool2d", "Model", "Module", "ModuleDict", "ModuleList", "MultiheadAttention",
+    "NLLLoss", "QuantizedLinear", "RNN", "RNNCell", "ReLU", "ReLU6",
     "Sequential", "SiLU", "Sigmoid", "Softmax", "Tanh", "TransformerEncoder", "TransformerEncoderLayer",
     "clip_grad_norm_", "functional", "init", "quantize_", "utils",
 ]
@@ -892,6 +893,239 @@ class TransformerEncoder(Module):
         for layer in self.layers:
             x = layer(x, src_mask=mask, src_key_padding_mask=src_key_padding_mask, is_causal=bool(is_causal))
         return self.norm(x) if self.norm is not None else x
+
+
+# --------------------------------------------------------------------------
+# Recurrent layers (torch.nn.RNN / LSTM / GRU and their cells)
+# --------------------------------------------------------------------------
+# Same parameter names, shapes, gate order (LSTM: i, f, g, o; GRU: r, z, n), init
+# U(-1/sqrt(H), 1/sqrt(H)) and formulas as torch, so a torch state_dict loads as is.
+# The input projection of every time step is one GEMM per layer and direction; each
+# step then adds h @ W_hh^T. Gate slices are views of that result.
+
+def _rnn_cell(mode: str, x_proj: Tensor, h: Tensor, c, w_hh: Tensor, b_hh, nonlinearity: str = "tanh"):
+    """One step. x_proj = x @ W_ih^T + b_ih for this step. Returns (h', c')."""
+    gh = linear(h, w_hh, b_hh)
+    H = h.shape[-1]
+    if mode == "LSTM":
+        gates = x_proj + gh
+        s = gates.sigmoid()  # i, f, o use it; g uses tanh below
+        i, f, o = s[..., :H], s[..., H:2 * H], s[..., 3 * H:]
+        g = gates[..., 2 * H:3 * H].tanh()
+        c = f * c + i * g
+        return o * c.tanh(), c
+    if mode == "GRU":
+        rz = (x_proj[..., :2 * H] + gh[..., :2 * H]).sigmoid()
+        r, z = rz[..., :H], rz[..., H:]
+        n = (x_proj[..., 2 * H:] + r * gh[..., 2 * H:]).tanh()
+        return n + z * (h - n), None  # (1 - z) * n + z * h
+    pre = x_proj + gh
+    return (pre.tanh() if nonlinearity == "tanh" else pre.relu()), None
+
+
+class _RNNBase(Module):
+    _GATES = {"RNN_TANH": 1, "RNN_RELU": 1, "LSTM": 4, "GRU": 3}
+
+    def __init__(self, mode: str, input_size: int, hidden_size: int, num_layers: int = 1, bias: bool = True,
+                 batch_first: bool = False, dropout: float = 0.0, bidirectional: bool = False, proj_size: int = 0,
+                 *, ctx: Context | None = None):
+        _unsupported(proj_size=(proj_size, 0))
+        if not 0.0 <= dropout <= 1.0:
+            raise ValueError("dropout should be a number in range [0, 1]")
+        if hidden_size <= 0 or num_layers <= 0:
+            raise ValueError("hidden_size and num_layers must be positive")
+        ctx = ctx or default_context()
+        self.mode, self.input_size, self.hidden_size, self.num_layers = mode, input_size, hidden_size, num_layers
+        self.bias, self.batch_first, self.dropout, self.bidirectional = bias, batch_first, float(dropout), bidirectional
+        self.proj_size = 0
+        gate = self._GATES[mode] * hidden_size
+        bound = 1.0 / math.sqrt(hidden_size)
+        D = 2 if bidirectional else 1
+        self._flat = []
+        for layer in range(num_layers):
+            for d in range(D):
+                sfx = f"_l{layer}" + ("_reverse" if d else "")
+                in_size = input_size if layer == 0 else hidden_size * D
+                names = [("weight_ih", (gate, in_size)), ("weight_hh", (gate, hidden_size))]
+                if bias:
+                    names += [("bias_ih", (gate,)), ("bias_hh", (gate,))]
+                for name, shape in names:
+                    setattr(self, name + sfx, _uniform_param(shape, bound, ctx))
+                self._flat.append(sfx)
+
+    def _cell_mode(self):
+        return "LSTM" if self.mode == "LSTM" else "GRU" if self.mode == "GRU" else "RNN"
+
+    def forward(self, input: Tensor, hx=None):
+        lstm = self.mode == "LSTM"
+        batched = input.ndim == 3
+        if input.ndim not in (2, 3):
+            raise ValueError(f"{type(self).__name__}: expected 2-D (unbatched) or 3-D input, got {input.ndim}-D")
+        if input.shape[-1] != self.input_size:
+            raise ValueError(f"input.size(-1) must be equal to input_size. Expected {self.input_size}, "
+                             f"got {input.shape[-1]}")
+        x = input if batched else input.unsqueeze(1)
+        if batched and self.batch_first:
+            x = x.transpose(0, 1)
+        L, N = x.shape[0], x.shape[1]
+        D = 2 if self.bidirectional else 1
+        H = self.hidden_size
+        want = (D * self.num_layers, N, H)
+        if hx is None:
+            h0 = zeros(*want, ctx=input.ctx)
+            c0 = zeros(*want, ctx=input.ctx) if lstm else None
+        else:
+            h0, c0 = hx if lstm else (hx, None)
+            if not batched:
+                h0 = h0.unsqueeze(1)
+                c0 = c0.unsqueeze(1) if lstm else None
+            for t, name in ((h0, "h0"), (c0, "c0")):
+                if t is not None and tuple(t.shape) != want:
+                    raise RuntimeError(f"Expected hidden size {want}, got {tuple(t.shape)} for {name}")
+        mode, nonlin = self._cell_mode(), "relu" if self.mode == "RNN_RELU" else "tanh"
+        h_n, c_n = [], []
+        for layer in range(self.num_layers):
+            outs = []
+            for d in range(D):
+                sfx = f"_l{layer}" + ("_reverse" if d else "")
+                w_ih, w_hh = getattr(self, "weight_ih" + sfx), getattr(self, "weight_hh" + sfx)
+                b_ih = getattr(self, "bias_ih" + sfx) if self.bias else None
+                b_hh = getattr(self, "bias_hh" + sfx) if self.bias else None
+                proj = linear(x, w_ih, b_ih)  # [L, N, G*H]: every step's input projection at once
+                k = layer * D + d
+                h, c = h0[k], (c0[k] if lstm else None)
+                steps = [None] * L
+                for t in (range(L - 1, -1, -1) if d else range(L)):
+                    h, c = _rnn_cell(mode, proj[t], h, c, w_hh, b_hh, nonlin)
+                    steps[t] = h
+                outs.append(stack(steps) if L else zeros(0, N, H, ctx=input.ctx))
+                h_n.append(h)
+                if lstm:
+                    c_n.append(c)
+            x = outs[0] if D == 1 else cat(outs, -1)
+            if self.dropout and self.training and layer < self.num_layers - 1:
+                x = dropout(x, self.dropout, True)
+        out = x
+        if batched and self.batch_first:
+            out = out.transpose(0, 1)
+        hn = stack(h_n)
+        cn = stack(c_n) if lstm else None
+        if not batched:
+            out = out.reshape(L, D * H)
+            hn = hn.reshape(D * self.num_layers, H)
+            cn = cn.reshape(D * self.num_layers, H) if lstm else None
+        return (out, (hn, cn)) if lstm else (out, hn)
+
+    def extra_repr(self) -> str:
+        s = f"{self.input_size}, {self.hidden_size}"
+        if self.num_layers != 1:
+            s += f", num_layers={self.num_layers}"
+        if not self.bias:
+            s += ", bias=False"
+        if self.batch_first:
+            s += ", batch_first=True"
+        if self.dropout:
+            s += f", dropout={self.dropout}"
+        if self.bidirectional:
+            s += ", bidirectional=True"
+        return s
+
+
+class RNN(_RNNBase):
+    """Elman RNN: h' = tanh(x W_ih^T + b_ih + h W_hh^T + b_hh) (nonlinearity "tanh" or "relu")."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, nonlinearity: str = "tanh",
+                 bias: bool = True, batch_first: bool = False, dropout: float = 0.0, bidirectional: bool = False,
+                 *, ctx: Context | None = None):
+        if nonlinearity not in ("tanh", "relu"):
+            raise ValueError(f"Unknown nonlinearity '{nonlinearity}'. Select from 'tanh' or 'relu'.")
+        self.nonlinearity = nonlinearity
+        super().__init__("RNN_TANH" if nonlinearity == "tanh" else "RNN_RELU", input_size, hidden_size, num_layers,
+                         bias, batch_first, dropout, bidirectional, ctx=ctx)
+
+
+class LSTM(_RNNBase):
+    """Long short-term memory. forward(input, (h0, c0)) -> output, (h_n, c_n). proj_size is not supported."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, bias: bool = True,
+                 batch_first: bool = False, dropout: float = 0.0, bidirectional: bool = False, proj_size: int = 0,
+                 *, ctx: Context | None = None):
+        super().__init__("LSTM", input_size, hidden_size, num_layers, bias, batch_first, dropout, bidirectional,
+                         proj_size, ctx=ctx)
+
+
+class GRU(_RNNBase):
+    """Gated recurrent unit (torch's formulation: r applies to h W_hn^T + b_hn)."""
+
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, bias: bool = True,
+                 batch_first: bool = False, dropout: float = 0.0, bidirectional: bool = False,
+                 *, ctx: Context | None = None):
+        super().__init__("GRU", input_size, hidden_size, num_layers, bias, batch_first, dropout, bidirectional,
+                         ctx=ctx)
+
+
+class _CellBase(Module):
+    _GATES = 1
+
+    def __init__(self, input_size: int, hidden_size: int, bias: bool = True, *, ctx: Context | None = None):
+        ctx = ctx or default_context()
+        self.input_size, self.hidden_size, self.bias_on = input_size, hidden_size, bias
+        bound = 1.0 / math.sqrt(hidden_size)
+        g = self._GATES * hidden_size
+        self.weight_ih = _uniform_param((g, input_size), bound, ctx)
+        self.weight_hh = _uniform_param((g, hidden_size), bound, ctx)
+        self.bias_ih = _uniform_param((g,), bound, ctx) if bias else None
+        self.bias_hh = _uniform_param((g,), bound, ctx) if bias else None
+
+    def _prep(self, input: Tensor, hx):
+        if input.ndim not in (1, 2):
+            raise ValueError(f"{type(self).__name__}: expected input to be 1-D or 2-D, got {input.ndim}-D")
+        batched = input.ndim == 2
+        x = input if batched else input.unsqueeze(0)
+        return x, batched
+
+    def extra_repr(self) -> str:
+        return f"{self.input_size}, {self.hidden_size}" + ("" if self.bias_on else ", bias=False")
+
+
+class RNNCell(_CellBase):
+    def __init__(self, input_size: int, hidden_size: int, bias: bool = True, nonlinearity: str = "tanh",
+                 *, ctx: Context | None = None):
+        if nonlinearity not in ("tanh", "relu"):
+            raise ValueError(f"Unknown nonlinearity: {nonlinearity}")
+        self.nonlinearity = nonlinearity
+        super().__init__(input_size, hidden_size, bias, ctx=ctx)
+
+    def forward(self, input: Tensor, hx=None) -> Tensor:
+        x, batched = self._prep(input, hx)
+        h = zeros(x.shape[0], self.hidden_size, ctx=input.ctx) if hx is None else (hx if batched else hx.unsqueeze(0))
+        h, _ = _rnn_cell("RNN", linear(x, self.weight_ih, self.bias_ih), h, None, self.weight_hh, self.bias_hh,
+                         self.nonlinearity)
+        return h if batched else h.reshape(self.hidden_size)
+
+
+class LSTMCell(_CellBase):
+    _GATES = 4
+
+    def forward(self, input: Tensor, hx=None):
+        x, batched = self._prep(input, hx)
+        if hx is None:
+            h = zeros(x.shape[0], self.hidden_size, ctx=input.ctx)
+            c = zeros(x.shape[0], self.hidden_size, ctx=input.ctx)
+        else:
+            h, c = hx if batched else (hx[0].unsqueeze(0), hx[1].unsqueeze(0))
+        h, c = _rnn_cell("LSTM", linear(x, self.weight_ih, self.bias_ih), h, c, self.weight_hh, self.bias_hh)
+        return (h, c) if batched else (h.reshape(self.hidden_size), c.reshape(self.hidden_size))
+
+
+class GRUCell(_CellBase):
+    _GATES = 3
+
+    def forward(self, input: Tensor, hx=None) -> Tensor:
+        x, batched = self._prep(input, hx)
+        h = zeros(x.shape[0], self.hidden_size, ctx=input.ctx) if hx is None else (hx if batched else hx.unsqueeze(0))
+        h, _ = _rnn_cell("GRU", linear(x, self.weight_ih, self.bias_ih), h, None, self.weight_hh, self.bias_hh)
+        return h if batched else h.reshape(self.hidden_size)
 
 
 class Sequential(Model):

@@ -123,6 +123,12 @@ causal = torch.tensor(list(range(T))) > torch.tensor(list(range(T))).reshape(T, 
 h = encoder(x, mask=causal, is_causal=True)
 ```
 
+**순환 신경망:** `nn.RNN`, `nn.LSTM`, `nn.GRU`(다층, 양방향, `batch_first`, 층 사이 dropout)와 `RNNCell`·`LSTMCell`·`GRUCell`.
+파라미터 이름·게이트 순서·공식이 PyTorch와 같아 torch `state_dict`가 그대로 들어갑니다.
+
+**합성곱:** `nn.Conv2d`는 `groups`(depthwise 포함, MobileNet류), `dilation`, `padding="same"`을 지원합니다. depthwise는
+im2col을 거치지 않는 전용 커널로 같은 크기의 일반 합성곱보다 약 7배 빠릅니다.
+
 **int8 양자화 (추론):** `newch.quantize_(model)`은 모든 `Linear`를 int8 가중치로 바꿉니다 (가중치 메모리 1/4).
 
 **스레드:** 기본값은 모든 코어입니다. `newch.set_default_context(newch.Context(threads=2))`로 바꿀 수 있습니다.

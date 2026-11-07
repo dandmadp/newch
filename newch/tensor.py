@@ -1159,13 +1159,15 @@ def cat(tensors, dim: int = 0) -> Tensor:
     if not tensors:
         raise ValueError("cat() needs at least one tensor")
     ctx = tensors[0].ctx
-    while True:  # the engine op takes up to 6 inputs per call
-        group, rest = tensors[:6], tensors[6:]
-        ptrs = L.ptr_array(t.ptr for t in group)
-        out = ctx.wrap(lib.nc_cat(len(group), ptrs, int(dim)))
-        if not rest:
-            return out
-        tensors = [out] + rest
+    while True:  # the engine op takes up to 6 inputs per call: join in a tree (each element copied log6(n) times)
+        joined = []
+        for i in range(0, len(tensors), 6):
+            group = tensors[i:i + 6]
+            ptrs = L.ptr_array(t.ptr for t in group)
+            joined.append(ctx.wrap(lib.nc_cat(len(group), ptrs, int(dim))))
+        if len(joined) == 1:
+            return joined[0]
+        tensors = joined
 
 
 def stack(tensors, dim: int = 0) -> Tensor:
