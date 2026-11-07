@@ -473,3 +473,72 @@ class TestGroupedConv(Base):
         x, y = batch(200)
         acc = (model(x).argmax(1) == y).float().mean().item()
         self.assertGreater(acc, 0.9)
+
+
+@unittest.skipIf(np is None, "numpy not installed")
+class TestCallbacks(Base):
+    def test_restore_best_weights_includes_buffers(self):
+        """BatchNorm running stats come back with the parameters (Keras restores non-trainable weights)."""
+        from newch import callbacks
+        torch.manual_seed(0)
+        m = nn.Sequential(nn.Linear(2, 8), nn.BatchNorm1d(8), nn.ReLU(), nn.Linear(8, 1))
+        m.compile("adam", "mse", lr=0.05)
+        rs = np.random.RandomState(0)
+        x = rs.randn(64, 2).astype(np.float32)
+        y = (x[:, :1] * 2).astype(np.float32)
+        xv, yv = rs.randn(32, 2).astype(np.float32) * 3, rs.randn(32, 1).astype(np.float32) * 10
+        snaps = {}
+
+        class Snap(callbacks.Callback):
+            def on_epoch_end(self, epoch, logs):
+                snaps[epoch] = {k: v.numpy().copy() for k, v in self.model.state_dict().items()}
+        es = callbacks.EarlyStopping(monitor="val_loss", patience=2, restore_best_weights=True)
+        m.fit(x, y, epochs=10, verbose=0, validation_data=(xv, yv), callbacks=[Snap(), es])
+        self.assertGreater(len(snaps) - 1, es.best_epoch)  # training went past the best epoch
+        for k, v in m.state_dict().items():
+            np.testing.assert_array_equal(v.numpy(), snaps[es.best_epoch][k], err_msg=k)
+
+
+class TestCreationArguments(Base):
+    def test_device_and_requires_grad_everywhere(self):
+        x = torch.ones(2, 3)
+        self.assertEqual(x.device, "cpu")
+        self.assertEqual((x.device.type, x.device.index, str(x.device)), ("cpu", None, "cpu"))
+        for make in (lambda **k: torch.tensor([1., 2.], **k), lambda **k: torch.zeros(2, **k),
+                     lambda **k: torch.ones(2, **k), lambda **k: torch.full((2,), 0.5, **k),
+                     lambda **k: torch.rand(2, **k), lambda **k: torch.randn(2, **k)):
+            self.assertEqual(make(device=x.device).shape, (2,))
+            self.assertTrue(make(requires_grad=True).requires_grad)
+            with self.assertRaises(NotImplementedError):
+                make(device="cuda")
+        self.assertEqual(x.to(x.device).shape, (2, 3))
+        self.assertIs(nn.Linear(1, 1).to(x.device).__class__, nn.Linear)
+        w = torch.zeros(3, requires_grad=True)
+        (w * 2).sum().backward()
+        self.assertEqual(w.grad.tolist(), [2., 2., 2.])
+        for bad in (lambda: torch.zeros(2, dtype=torch.int32, requires_grad=True),
+                    lambda: torch.full((2,), 3, requires_grad=True)):
+            with self.assertRaises(RuntimeError):
+                bad()
+
+
+class TestContextLifetime(unittest.TestCase):
+    def test_dropped_context_is_closed(self):
+        """A Context nobody uses frees its engine memory and worker threads; tensors keep theirs alive."""
+        import gc
+        closed = []
+
+        class Probe(torch.Context):
+            def close(self):
+                if self._p:
+                    closed.append(True)
+                super().close()
+        c = Probe(threads=2)
+        t = torch.randn(1000, ctx=c)
+        del c
+        gc.collect()
+        self.assertEqual(closed, [])  # t still uses it
+        self.assertGreater(t.exp().sum().item(), 0)
+        del t
+        gc.collect()
+        self.assertEqual(closed, [True])

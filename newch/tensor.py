@@ -8,6 +8,7 @@ import ctypes
 import json
 import math
 import numbers
+import os
 import warnings
 from typing import Sequence
 
@@ -75,6 +76,14 @@ class Context:
         if self._p:
             lib.nc_free_ctx(self._p)
             self._p = None
+
+    def __del__(self):
+        # Every tensor, optimizer and module keeps its Context alive, so by the time this runs
+        # nothing uses the engine context any more: free its memory and worker threads.
+        try:
+            self.close()
+        except Exception:  # interpreter shutdown
+            pass
 
     def __deepcopy__(self, memo):
         return self  # copied modules keep using the same engine context
@@ -559,6 +568,11 @@ class Tensor:
 
     def cpu(self) -> "Tensor": return self
 
+    @property
+    def device(self) -> "_Device":
+        """Always the CPU (``x.device.type == "cpu"``); usable as ``device=x.device`` and in ``to()``."""
+        return _CPU
+
     def dim(self) -> int: return self.ndim
 
     # ---- arithmetic ------------------------------------------------------
@@ -957,11 +971,13 @@ def _shape(shape) -> tuple:
     return tuple(shape)
 
 
-def tensor(data, dtype: str | None = None, requires_grad: bool = False, ctx: Context | None = None) -> Tensor:
+def tensor(data, dtype: str | None = None, requires_grad: bool = False, ctx: Context | None = None, *,
+           device=None) -> Tensor:
     """Creates a tensor by copying ``data`` (nested lists, array.array, numpy, Tensor).
 
     Integer data becomes int32, anything with floats becomes float32.
     """
+    _check_device(device)
     if dtype is not None:
         _dtype_code(dtype)  # clear error for float64, bool, ...
     if isinstance(data, Tensor):
@@ -989,14 +1005,20 @@ def tensor(data, dtype: str | None = None, requires_grad: bool = False, ctx: Con
     return t
 
 
-def zeros(*shape, dtype: str = float32, ctx: Context | None = None) -> Tensor:
+def zeros(*shape, dtype: str = float32, requires_grad: bool = False, ctx: Context | None = None,
+          device=None) -> Tensor:
+    _check_device(device)
     ctx = _ctx(ctx)
     n, arr = L.shape_arg(_shape(shape))
-    return ctx.wrap(lib.nc_zeros(ctx._p, _dtype_code(dtype), n, arr))
+    return _random(ctx.wrap(lib.nc_zeros(ctx._p, _dtype_code(dtype), n, arr)), None, requires_grad)
 
 
-def full(size, fill_value, *, dtype: str | None = None, ctx: Context | None = None) -> Tensor:
+def full(size, fill_value, *, dtype: str | None = None, requires_grad: bool = False, ctx: Context | None = None,
+         device=None) -> Tensor:
     """Tensor filled with fill_value. dtype follows the value when not given (int -> int32)."""
+    _check_device(device)
+    if requires_grad:
+        return _random(full(size, fill_value, dtype=dtype, ctx=ctx), None, True)
     if isinstance(fill_value, bool):
         raise TypeError("bool tensors are not supported; use 0 / 1")
     ctx = _ctx(ctx)
@@ -1014,8 +1036,9 @@ def full(size, fill_value, *, dtype: str | None = None, ctx: Context | None = No
     return tensor_from_bytes(buf.tobytes(), size, dtype, ctx)
 
 
-def ones(*size, dtype: str = float32, ctx: Context | None = None) -> Tensor:
-    return full(_shape(size), 1, dtype=dtype, ctx=ctx)
+def ones(*size, dtype: str = float32, requires_grad: bool = False, ctx: Context | None = None,
+         device=None) -> Tensor:
+    return full(_shape(size), 1, dtype=dtype, requires_grad=requires_grad, ctx=ctx, device=device)
 
 
 def _randn(shape, std: float, ctx: Context | None) -> Tensor:
@@ -1030,21 +1053,28 @@ def _rand_uniform(shape, low: float, high: float, ctx: Context | None) -> Tensor
     return ctx.wrap(lib.nc_rand_uniform(ctx._p, float(low), float(high), n, arr))
 
 
-def _random(t: Tensor, dtype: str, requires_grad: bool) -> Tensor:
-    if dtype != float32:
+def _random(t: Tensor, dtype: str | None, requires_grad: bool) -> Tensor:
+    """Checks a random tensor's dtype (dtype None: any) and applies requires_grad."""
+    if dtype is not None and dtype != float32:
         raise NotImplementedError(f"dtype={dtype!r} is not supported for random tensors (only float32)")
     if requires_grad:
+        if t.dtype != float32:
+            raise RuntimeError("only float32 tensors can require gradients")
         t.requires_grad = True
     return t
 
 
-def randn(*size, dtype: str = float32, requires_grad: bool = False, ctx: Context | None = None) -> Tensor:
+def randn(*size, dtype: str = float32, requires_grad: bool = False, ctx: Context | None = None,
+          device=None) -> Tensor:
     """Samples from N(0, 1) (torch.randn). Other spreads: ``randn(...) * std + mean``."""
+    _check_device(device)
     return _random(_randn(_shape(size), 1.0, ctx), dtype, requires_grad)
 
 
-def rand(*size, dtype: str = float32, requires_grad: bool = False, ctx: Context | None = None) -> Tensor:
+def rand(*size, dtype: str = float32, requires_grad: bool = False, ctx: Context | None = None,
+         device=None) -> Tensor:
     """Samples from U[0, 1) (torch.rand). Other ranges: ``rand(...) * (high - low) + low``."""
+    _check_device(device)
     return _random(_rand_uniform(_shape(size), 0.0, 1.0, ctx), dtype, requires_grad)
 
 
@@ -1072,6 +1102,11 @@ def tensor_from_bytes(buf: bytes, shape, dtype: str, ctx: Context | None = None)
     """Tensor from raw little-endian row-major bytes (one copy, into the engine)."""
     ctx = _ctx(ctx)
     code = _dtype_code(dtype)
+    shape = tuple(int(d) for d in shape)
+    if len(shape) > 6 or any(d < 0 for d in shape):
+        raise ValueError(f"tensor_from_bytes: invalid shape {shape}")
+    if len(buf) != math.prod(shape) * L.DTYPE_SIZE[dtype]:  # the engine copies exactly that many bytes
+        raise ValueError(f"tensor_from_bytes: {len(buf)} bytes do not fit shape {shape} {dtype}")
     n, arr = L.shape_arg(shape)
     addr = ctypes.cast(ctypes.c_char_p(buf), ctypes.c_void_p) if buf else None
     return ctx.wrap(lib.nc_from_data(ctx._p, code, addr, n, arr))
@@ -1132,6 +1167,17 @@ def _implicit_dim(x: Tensor, dim, name: str) -> int:
     return 0 if x.ndim in (0, 1, 3) else 1
 
 
+class _Device(str):
+    """torch.device("cpu") stand-in: compares equal to "cpu" and has .type / .index."""
+
+    type = "cpu"
+    index = None
+
+    def __repr__(self) -> str:
+        return "device(type='cpu')"
+
+
+_CPU = _Device("cpu")
 _DEVICES = {"cpu", "cuda", "mps", "xpu", "xla", "meta", "hip", "hpu", "ipu", "mtia", "vulkan", "privateuseone"}
 
 
@@ -1495,23 +1541,44 @@ def load_tensors(path, ctx: Context | None = None) -> dict:
 
     ctx = _ctx(ctx)
     out = {}
+    corrupt = f"load_tensors: '{path}' is truncated or corrupt"
     with open(path, "rb") as f:
+        size = os.fstat(f.fileno()).st_size
+
+        def read(n):
+            if n > size:  # never allocate more than the file can hold
+                raise NcError(corrupt)
+            b = f.read(n)
+            if len(b) != n:
+                raise NcError(corrupt)
+            return b
         if f.read(4) != b"NCW1":
             raise NcError(f"load_tensors: '{path}' is not an NCW1 tensor file")
-        version, count = struct.unpack("<II", f.read(8))
+        version, count = struct.unpack("<II", read(8))
         if version != 1:
             raise NcError(f"load_tensors: unsupported version {version}")
         with persistent(ctx):
             for _ in range(count):
-                (name_len,) = struct.unpack("<I", f.read(4))
-                name = f.read(name_len).decode("utf-8")
-                code, ndim = struct.unpack("<II", f.read(8))
-                shape = struct.unpack(f"<{ndim}q", f.read(8 * ndim))
-                (nbytes,) = struct.unpack("<Q", f.read(8))
-                data = f.read(nbytes)
-                if len(data) != nbytes or code not in L.DTYPE_NAMES:
-                    raise NcError(f"load_tensors: '{path}' is truncated or corrupt")
-                out[name] = tensor_from_bytes(data, shape, L.DTYPE_NAMES[code], ctx)
+                (name_len,) = struct.unpack("<I", read(4))
+                try:
+                    name = read(name_len).decode("utf-8")
+                except UnicodeDecodeError:
+                    raise NcError(corrupt) from None
+                code, ndim = struct.unpack("<II", read(8))
+                if code not in L.DTYPE_NAMES or ndim > 6:
+                    raise NcError(corrupt)
+                shape = struct.unpack(f"<{ndim}q", read(8 * ndim))
+                (nbytes,) = struct.unpack("<Q", read(8))
+                dtype = L.DTYPE_NAMES[code]
+                if any(d < 0 for d in shape) or nbytes != math.prod(shape) * L.DTYPE_SIZE[dtype]:
+                    raise NcError(corrupt)
+                if name in out:
+                    raise NcError(f"load_tensors: '{path}' has the name '{name}' twice")
+                out[name] = tensor_from_bytes(read(nbytes), shape, dtype, ctx)
     if _TREE in out:
-        return _tree_decode(json.loads(out.pop(_TREE)._flat().tobytes()), out)
+        try:
+            tree = json.loads(out.pop(_TREE)._flat().tobytes())
+            return _tree_decode(tree, out)
+        except (ValueError, KeyError, TypeError, AttributeError):
+            raise NcError(f"load_tensors: '{path}' has a corrupt checkpoint layout") from None
     return out

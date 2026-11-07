@@ -182,6 +182,73 @@ class TestNestedSave(unittest.TestCase):
             nc.save_tensors({"k": {1.5: nc.ones(1)}}, self.path)
 
 
+class TestCorruptFiles(unittest.TestCase):
+    """A damaged or hostile checkpoint raises NcError; it must never read or write past a buffer
+    (a data size larger than the shape once crashed the process)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    @staticmethod
+    def entry(name, code, shape, data, nbytes=None):
+        import struct
+        nb = name if isinstance(name, bytes) else name.encode()
+        return (struct.pack("<I", len(nb)) + nb + struct.pack("<II", code, len(shape))
+                + struct.pack(f"<{len(shape)}q", *shape) + struct.pack("<Q", len(data) if nbytes is None else nbytes)
+                + data)
+
+    def write(self, body, count):
+        import struct
+        path = os.path.join(self.tmp.name, "bad.ncw")
+        with open(path, "wb") as f:
+            f.write(b"NCW1" + struct.pack("<II", 1, count) + body)
+        return path
+
+    def test_python_loader(self):
+        import struct
+        e = self.entry
+        cases = {
+            "shape bigger than data": (e("a", 0, (1000000,), b"\x00" * 4), 1),
+            "shape smaller than data": (e("a", 0, (1,), b"\x00" * 64), 1),
+            "negative dim": (e("a", 0, (-1,), b""), 1),
+            "huge ndim": (struct.pack("<I", 1) + b"a" + struct.pack("<II", 0, 10**9), 1),
+            "huge nbytes": (e("a", 0, (1,), b"\x00" * 4, nbytes=2**62), 1),
+            "huge name": (struct.pack("<I", 2**31), 1),
+            "more entries announced": (e("a", 0, (1,), b"\x00" * 4), 5),
+            "bad utf-8 name": (e(b"\xff", 0, (1,), b"\x00" * 4), 1),
+            "too many dims": (e("a", 0, (1,) * 9, b"\x00" * 4), 1),
+            "unknown dtype": (e("a", 77, (1,), b"\x00" * 4), 1),
+            "name twice": (e("a", 0, (1,), b"\x00" * 4) * 2, 2),
+            "bad layout json": (e("__newch_tree__", 4, (3,), b"{x}"), 1),
+            "layout points nowhere": (e("__newch_tree__", 4, (11,), b'{"T": "zz"}'), 1),
+        }
+        for what, (body, count) in cases.items():
+            with self.subTest(what), self.assertRaises(nc.NcError):
+                nc.load_tensors(self.write(body, count))
+
+    def test_engine_loader(self):
+        """nc_load (C) checks the byte count against the destination tensor."""
+        from newch import _lib as L
+        from newch._lib import lib
+        path = self.write(self.entry("w", 0, (1,), b"A" * 64), 1)
+        w = nc.parameter(nc.zeros(1))
+        ctx = w.ctx
+        st = lib.nc_load(ctx._p, path.encode(), 1, L.name_array(["w"]), L.ptr_array([w.ptr]))
+        self.assertNotEqual(st, 0)
+        lib.nc_clear_error(ctx._p)
+        self.assertEqual(w.tolist(), [0.0])
+
+    def test_tensor_from_bytes_checks_length(self):
+        from newch.tensor import tensor_from_bytes
+        for buf, shape in ((b"\x00" * 3, (1,)), (b"\x00" * 4, (-1,)), (b"\x00" * 8, (1,)), (b"", (1,) * 7)):
+            with self.assertRaises(ValueError):
+                tensor_from_bytes(buf, shape, "float32")
+        self.assertEqual(tensor_from_bytes(b"", (0, 3), "float32").shape, (0, 3))
+
+
 class TestUint8(unittest.TestCase):
     def test_tensor_basics(self):
         t = nc.tensor(array.array("B", [0, 7, 255]))

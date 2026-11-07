@@ -6,7 +6,6 @@ a LambdaCallback, e.g. ``LambdaCallback(on_epoch_end=lambda e, logs: sched.step(
 
 from __future__ import annotations
 
-import ctypes
 import math
 import warnings
 
@@ -58,14 +57,15 @@ def _value(cb, logs: dict):
 
 
 def _weights(model) -> list:
-    return [p._flat() for p in model.parameters()]
+    """Copies of every parameter and buffer (BatchNorm running stats too, as Keras restores
+    non-trainable weights): restoring only the parameters would pair the best weights with
+    the last epoch's normalization statistics."""
+    return [t._flat() for t in model.state_dict().values()]
 
 
 def _set_weights(model, saved: list) -> None:
-    from ._lib import lib
-
-    for p, buf in zip(model.parameters(), saved):
-        ctypes.memmove(lib.nc_data_f32(p.ptr), buf.buffer_info()[0], len(buf) * buf.itemsize)
+    for t, buf in zip(model.state_dict().values(), saved):
+        t.copy_(buf)
 
 
 class EarlyStopping(Callback):

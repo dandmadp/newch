@@ -1105,7 +1105,36 @@ static void test_save_load(void) {
     CHECK(nc_load(ctx, path, 1, missing, out) == NC_ERR_ARG);
     nc_clear_error(ctx);
     CHECK(nc_load(ctx, "does_not_exist.ncw", 1, names, out) == NC_ERR_ARG);
+    nc_clear_error(ctx);
     remove(path);
+    /* a file whose byte count exceeds the tensor must not overrun it */
+    {
+        FILE *f = fopen(path, "wb");
+        uint32_t hdr[2] = {1, 1}, len = 1, dt = NC_F32, nd = 1;
+        int64_t dim = 1;
+        uint64_t bytes = 64;
+        unsigned char junk[64];
+        memset(junk, 0x41, sizeof junk);
+        fwrite("NCW1", 1, 4, f);
+        fwrite(hdr, 4, 2, f);
+        fwrite(&len, 4, 1, f);
+        fwrite("w", 1, 1, f);
+        fwrite(&dt, 4, 1, f);
+        fwrite(&nd, 4, 1, f);
+        fwrite(&dim, 8, 1, f);
+        fwrite(&bytes, 8, 1, f);
+        fwrite(junk, 1, sizeof junk, f);
+        fclose(f);
+        nc_persistent_begin(ctx);
+        nc_tensor *one = nc_zeros(ctx, NC_F32, 1, SHAPE(1));
+        nc_persistent_end(ctx);
+        const char *wn[1] = {"w"};
+        CHECK(nc_load(ctx, path, 1, wn, &one) == NC_ERR_ARG);
+        CHECK(strstr(nc_error(ctx), "corrupt") != NULL);
+        CHECK(nc_data_f32(one)[0] == 0.0f);
+        nc_clear_error(ctx);
+        remove(path);
+    }
     nc_free_ctx(ctx);
 }
 
