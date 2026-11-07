@@ -102,7 +102,7 @@ struct nc_node {
     X(log_softmax) X(softmax) X(cross_entropy)                                 \
     X(conv2d) X(max_pool2d) X(avg_pool2d) X(dropout) X(batch_norm)             \
     X(linear_int8) X(nll_loss) X(compare) X(cat) X(to_dtype)                   \
-    X(bmm) X(layer_norm) X(masked_fill)
+    X(bmm) X(layer_norm) X(masked_fill) X(slice)
 
 #define NC_DECLARE_OP(name) extern const nc_op_def nc_op_##name;
 NC_OP_LIST(NC_DECLARE_OP)

@@ -229,3 +229,145 @@ class TestOptimizer(Base):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipIf(np is None, "numpy not installed")
+class TestBasicIndexing(Base):
+    """x[...] against numpy, values and gradients (the grad of x[key].sum() counts how often each
+    element was picked)."""
+
+    KEYS = [
+        (slice(None), 0), (0, slice(1, 3)), (Ellipsis, 1), (slice(None, None, 2),), (1, 2, 3),
+        (None, 0), (slice(None), None, slice(1, None)), (slice(1, None), slice(None), slice(None, None, 3)),
+        (-1, Ellipsis, slice(0, 4, 2)), ([2, 0, -1],), (slice(None), [1, 1]), (0, [1, 2]),
+        (slice(None), slice(None), [[0, 3], [2, 2]]), ([0, 1], slice(None), 0), (1, slice(None), [0, 2]),
+        (slice(5, 9),), (slice(None), slice(2, 2)), (),
+    ]
+
+    def test_against_numpy(self):
+        ref = np.arange(3 * 3 * 4, dtype=np.float32).reshape(3, 3, 4)
+        for key in self.KEYS:
+            with self.subTest(key=key):
+                x = torch.tensor(ref, requires_grad=True)
+                out = x[key]
+                want = ref[tuple(np.array(k) if isinstance(k, list) else k for k in key)]
+                self.assertEqual(out.shape, want.shape)
+                np.testing.assert_array_equal(out.numpy(), want)
+                if out.numel():
+                    out.sum().backward()
+                    count = np.zeros_like(ref)
+                    np.add.at(count, tuple(np.array(k) if isinstance(k, list) else k for k in key), 1)
+                    np.testing.assert_array_equal(x.grad.numpy(), count)
+                torch.step_end()
+
+    def test_int_and_slice_are_views(self):
+        x = torch.zeros(64, 64)
+        before = torch.mem_stats()["arena_bytes_in_use"]
+        row, col, block = x[1], x[:, 2], x[8:40, ::2]
+        self.assertEqual((row.shape, col.shape, block.shape), ((64,), (64,), (32, 32)))
+        self.assertLess(torch.mem_stats()["arena_bytes_in_use"] - before, 4 * 32 * 32)  # headers only: no copies
+        self.assertEqual(x[2:5].sum().item(), 0.0)
+
+    def test_errors(self):
+        x = torch.zeros(2, 3)
+        for key, exc in [((0, 0, 0), IndexError), ((slice(None, None, -1),), ValueError), ((0, 3), IndexError),
+                         ((Ellipsis, Ellipsis), IndexError), (([0], [1]), NotImplementedError),
+                         ((1.5,), TypeError), ((slice(None), True), IndexError)]:
+            with self.subTest(key=key), self.assertRaises(exc):
+                x[key]
+
+    def test_persistent_indexing_copies(self):
+        with torch.persistent():
+            x = torch.tensor([[1., 2.], [3., 4.]])
+            col = x[:, 1]
+        torch.step_end()
+        self.assertEqual(col.tolist(), [2., 4.])
+
+
+@unittest.skipIf(np is None, "numpy not installed")
+class TestSoftmaxAnyDim(Base):
+    def test_values_and_grad(self):
+        ref = np.random.RandomState(0).randn(2, 3, 4).astype(np.float32)
+        for dim in (0, 1, -1, -3):
+            x = torch.tensor(ref, requires_grad=True)
+            e = np.exp(ref - ref.max(dim, keepdims=True))
+            want = e / e.sum(dim, keepdims=True)
+            np.testing.assert_allclose(x.softmax(dim).numpy(), want, rtol=1e-5, atol=1e-6)
+            np.testing.assert_allclose(F.log_softmax(x, dim).numpy(), np.log(want), rtol=1e-4, atol=1e-5)
+            w = np.arange(24, dtype=np.float32).reshape(2, 3, 4)
+            (x.softmax(dim) * torch.tensor(w)).sum().backward()
+            g = want * (w - (want * w).sum(dim, keepdims=True))  # softmax Jacobian-vector product
+            np.testing.assert_allclose(x.grad.numpy(), g, rtol=1e-4, atol=1e-5)
+            torch.step_end()
+        with self.assertRaises(IndexError):
+            torch.zeros(2, 2).softmax(2)
+
+
+class TestIntegerPromotion(Base):
+    def test_int_with_float_gives_float(self):
+        a = torch.tensor([1, 2, 4])
+        f = torch.tensor([0.5, 0.5, 0.5])
+        for out, want in [(a / 2, [0.5, 1., 2.]), (a * 0.5, [0.5, 1., 2.]), (a + 0.5, [1.5, 2.5, 4.5]),
+                          (a - 0.5, [0.5, 1.5, 3.5]), (a + f, [1.5, 2.5, 4.5]), (f * a, [0.5, 1., 2.]),
+                          (a / a, [1., 1., 1.]), (1 / a, [1., 0.5, 0.25]), (a ** 0.5, [1., 2 ** 0.5, 2.]),
+                          (2.0 - a, [1., 0., -2.])]:
+            self.assertEqual(out.dtype, torch.float32)
+            for got, w in zip(out.tolist(), want):
+                self.assertAlmostEqual(got, w, places=6)
+        u8 = torch.tensor([0, 255], dtype=torch.uint8)
+        self.assertEqual((u8 / 255).tolist(), [0.0, 1.0])
+
+    def test_int_with_int_raises(self):
+        a = torch.tensor([1, 2])
+        for op in (lambda: a + 1, lambda: a * a, lambda: 2 - a, lambda: -a, lambda: a ** 2, lambda: a @ a):
+            with self.assertRaises(torch.NcError) as cm:
+                op()
+            self.assertIn(".float()", str(cm.exception))
+        self.assertEqual((a.float() + 1).tolist(), [2., 3.])  # the sticky engine error was cleared
+
+    def test_other_errors_unchanged(self):
+        with self.assertRaises(torch.NcError) as cm:
+            torch.zeros(2, 3) + torch.zeros(4)
+        self.assertNotIn(".float()", str(cm.exception))
+
+
+@unittest.skipIf(np is None, "numpy not installed")
+class TestLossLayouts(Base):
+    def np_ce(self, logits, probs):
+        z = logits - logits.max(-1, keepdims=True)
+        logp = z - np.log(np.exp(z).sum(-1, keepdims=True))
+        return -(probs * logp).sum(-1)
+
+    def test_probability_targets(self):
+        rs = np.random.RandomState(1)
+        logits = rs.randn(4, 3).astype(np.float32)
+        probs = rs.dirichlet(np.ones(3), 4).astype(np.float32)
+        x = torch.tensor(logits, requires_grad=True)
+        loss = F.cross_entropy(x, torch.tensor(probs))
+        self.assertAlmostEqual(loss.item(), float(self.np_ce(logits, probs).mean()), places=5)
+        self.assertAlmostEqual(F.cross_entropy(x, torch.tensor(probs), reduction="sum").item(),
+                               float(self.np_ce(logits, probs).sum()), places=4)
+        smooth = probs * 0.9 + 0.1 / 3
+        self.assertAlmostEqual(F.cross_entropy(x, torch.tensor(probs), label_smoothing=0.1).item(),
+                               float(self.np_ce(logits, smooth).mean()), places=5)
+        loss.backward()
+        sm = np.exp(logits) / np.exp(logits).sum(-1, keepdims=True)
+        np.testing.assert_allclose(x.grad.numpy(), (sm - probs) / 4, atol=1e-6)
+        # one-hot probabilities = class indices
+        onehot = np.eye(3, dtype=np.float32)[[0, 2, 1, 1]]
+        self.assertAlmostEqual(F.cross_entropy(x, torch.tensor(onehot)).item(),
+                               F.cross_entropy(x, torch.tensor([0, 2, 1, 1])).item(), places=5)
+
+    def test_unbatched_and_kdim(self):
+        rs = np.random.RandomState(2)
+        logits = rs.randn(2, 3, 4, 5).astype(np.float32)  # [N, C, d1, d2]
+        labels = rs.randint(0, 3, (2, 4, 5))
+        rows = logits.transpose(0, 2, 3, 1).reshape(-1, 3)
+        want = self.np_ce(rows, np.eye(3, dtype=np.float32)[labels.reshape(-1)]).mean()
+        x = torch.tensor(logits)
+        self.assertAlmostEqual(F.cross_entropy(x, torch.tensor(labels)).item(), float(want), places=5)
+        self.assertAlmostEqual(F.nll_loss(x.log_softmax(1), torch.tensor(labels)).item(), float(want), places=5)
+        self.assertAlmostEqual(F.cross_entropy(torch.tensor(logits[0, :, 0, 0]), torch.tensor(int(labels[0, 0, 0])))
+                               .item(), float(self.np_ce(rows[:1], np.eye(3)[labels[:1, 0, 0]]).mean()), places=5)
+        with self.assertRaises(ValueError):
+            F.cross_entropy(x, torch.tensor(labels[:, :, :4]))

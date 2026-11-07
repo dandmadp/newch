@@ -70,10 +70,38 @@ static nc_status reshape_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape
     return NC_OK;
 }
 
+/* Strides that show x's elements in row-major order as `shape`, if they exist (ATen's computeStride):
+ * dims of x that are laid out back to back form chunks; each chunk must split into whole new dims. */
+static int view_strides(const nc_tensor *x, int ndim, const int64_t *shape, int64_t *st) {
+    if (nc_is_contiguous(x) || nc_numel(x) == 0) {
+        nc__contig_strides(ndim, shape, st);
+        return 1;
+    }
+    int on = x->ndim;
+    const int64_t *os = x->shape, *ost = x->stride;
+    int vd = ndim - 1;
+    int64_t base = ost[on - 1], tn = 1, vn = 1;
+    for (int td = on - 1; td >= 0; td--) {
+        tn *= os[td];
+        if (td == 0 || (os[td - 1] != 1 && ost[td - 1] != tn * base)) {
+            while (vd >= 0 && (vn < tn || shape[vd] == 1)) {
+                st[vd] = vn * base;
+                vn *= shape[vd];
+                vd--;
+            }
+            if (vn != tn) return 0;
+            if (td > 0) {
+                base = ost[td - 1];
+                tn = vn = 1;
+            }
+        }
+    }
+    return vd == -1;
+}
+
 static int reshape_view(nc_node *n, int ndim, const int64_t *shape) {
-    if (!nc_is_contiguous(n->in[0])) return 0;
     int64_t st[NC_MAX_DIMS];
-    nc__contig_strides(ndim, shape, st);
+    if (!view_strides(n->in[0], ndim, shape, st)) return 0;
     return alias_with(n, ndim, shape, st) != NULL;
 }
 
@@ -161,6 +189,85 @@ nc_tensor *nc_transpose(nc_tensor *x, int axis0, int axis1) {
     p.i[0] = axis0;
     p.i[1] = axis1;
     return nc__apply(&nc_op_transpose, &x, 1, &p);
+}
+
+/* ------------------------------------------------------------------------ */
+/* slice: x[..., start:start+len*step:step, ...] along one axis (a view)     */
+/* p.i = {axis, start, len, step}                                            */
+/* ------------------------------------------------------------------------ */
+
+static nc_status slice_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
+    nc_tensor *x = n->in[0];
+    int a = nc__norm_axis((int)n->p.i[0], x->ndim);
+    int64_t start = n->p.i[1], len = n->p.i[2], step = n->p.i[3];
+    if (a < 0) {
+        nc__error(x->ctx, NC_ERR_ARG, "slice: axis %d out of range for %d-d tensor", (int)n->p.i[0], x->ndim);
+        return NC_ERR_ARG;
+    }
+    if (step < 1 || len < 0 || start < 0 || start > x->shape[a] || (len > 0 && start + (len - 1) * step >= x->shape[a])) {
+        nc__error(x->ctx, NC_ERR_ARG, "slice: start %lld, length %lld, step %lld do not fit axis %d of size %lld",
+                  (long long)start, (long long)len, (long long)step, a, (long long)x->shape[a]);
+        return NC_ERR_ARG;
+    }
+    n->p.i[0] = a;
+    *dt = x->dtype;
+    *nd = x->ndim;
+    memcpy(shape, x->shape, sizeof(int64_t) * (size_t)x->ndim);
+    shape[a] = len;
+    return NC_OK;
+}
+
+/* x seen through the slice: same memory, shifted start, scaled stride */
+static void sliced(const nc_node *n, nc_tensor *t) {
+    const nc_tensor *x = n->in[0];
+    int a = (int)n->p.i[0];
+    *t = *x;
+    t->shape[a] = n->p.i[2];
+    if (t->shape[a] > 0)
+        t->data = (char *)x->data + (size_t)(n->p.i[1] * x->stride[a]) * nc__dtype_size(x->dtype);
+    t->stride[a] = x->stride[a] * n->p.i[3];
+}
+
+static int slice_view(nc_node *n, int ndim, const int64_t *shape) {
+    nc_tensor t;
+    sliced(n, &t);
+    nc_tensor *out = alias_with(n, ndim, shape, t.stride);
+    if (!out) return 0;
+    out->data = t.data;
+    return 1;
+}
+
+static nc_status slice_fwd(nc_node *n) {
+    nc_tensor t;
+    sliced(n, &t);
+    nc__copy_strided(&t, n->out->data);
+    return NC_OK;
+}
+
+static void slice_bwd(nc_node *n) {
+    nc_tensor *x = n->in[0], *o = n->out;
+    nc_tensor *gt = nc__grad_buf(x);
+    if (!gt) return;
+    int a = (int)n->p.i[0];
+    if (o->shape[a] == 0) return;
+    int64_t st[2][NC_MAX_DIMS];
+    nc__contig_strides(o->ndim, o->shape, st[0]);
+    nc__contig_strides(x->ndim, x->shape, st[1]);
+    float *base[2] = {(float *)o->grad->data, (float *)gt->data + n->p.i[1] * st[1][a]};
+    st[1][a] *= n->p.i[3];
+    nc__iterate(2, base, (const int64_t(*)[NC_MAX_DIMS])st, o->ndim, o->shape, row_acc1, NULL);
+}
+
+const nc_op_def nc_op_slice = {"slice", NC_OPF_VIEW, 0, slice_infer, slice_view, slice_fwd, slice_bwd};
+
+nc_tensor *nc_slice(nc_tensor *x, int axis, int64_t start, int64_t length, int64_t step) {
+    nc_op_params p;
+    memset(&p, 0, sizeof p);
+    p.i[0] = axis;
+    p.i[1] = start;
+    p.i[2] = length;
+    p.i[3] = step;
+    return nc__apply(&nc_op_slice, &x, 1, &p);
 }
 
 /* ------------------------------------------------------------------------ */

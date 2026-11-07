@@ -162,6 +162,7 @@ _SIGNATURES = {
     "nc_optim_free": (None, [P]),
     "nc_layer_norm": (P, [P, c_int, P, P, c_float]),
     "nc_masked_fill": (P, [P, P, c_float]),
+    "nc_slice": (P, [P, c_int, c_int64, c_int64, c_int64]),
     "nc_optim_set_lr": (None, [P, c_float]),
     "nc_optim_state": (c_void_p, [P, c_int, c_int]),
     "nc_optim_get_step": (c_int64, [P]),

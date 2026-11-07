@@ -77,8 +77,8 @@ class TestTensor(Base):
         self.assertEqual(nc.net.Flatten()(b).shape, (4, 6))
         with self.assertRaises(NotImplementedError):
             b.T
-        with self.assertRaises(NotImplementedError):
-            a.softmax(dim=0)
+        col = a.softmax(dim=0).tolist()  # any dim (moved last and back)
+        self.assertAlmostEqual(col[0][0] + col[1][0], 1.0, places=6)
         with self.assertRaises(NotImplementedError):
             a.index_select(1, [0])
         self.assertEqual(a.view(3, 2).shape, (3, 2))  # never copies, as in PyTorch ...

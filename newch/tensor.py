@@ -562,57 +562,93 @@ class Tensor:
     def dim(self) -> int: return self.ndim
 
     # ---- arithmetic ------------------------------------------------------
+    # The engine computes in float32. When it refuses an integer operand (the NULL result below),
+    # _promoted applies torch's type promotion: int with float, and true division, give float32;
+    # int with int would give an integer tensor in torch, which is not supported and raises.
     def __add__(self, o):
         if type(o) is Tensor:  # fast path: no conversion needed
-            return self._w(lib.nc_add(self.ptr, o.ptr))
-        if isinstance(o, Number):
-            return self._w(lib.nc_add_scalar(self.ptr, float(o)))
-        o = self._other(o)  # keep the operand alive across the call
-        return self._w(lib.nc_add(self.ptr, o.ptr))
+            p = lib.nc_add(self.ptr, o.ptr)
+        elif isinstance(o, Number):
+            p = lib.nc_add_scalar(self.ptr, float(o))
+        else:
+            o = self._other(o)  # keep the operand alive across the call
+            p = lib.nc_add(self.ptr, o.ptr)
+        return self._w(p) if p else self._promoted(Tensor.__add__, o)
 
     __radd__ = __add__
 
     def __sub__(self, o):
         if type(o) is Tensor:
-            return self._w(lib.nc_sub(self.ptr, o.ptr))
-        if isinstance(o, Number):
-            return self._w(lib.nc_add_scalar(self.ptr, -float(o)))
-        o = self._other(o)  # keep the operand alive across the call
-        return self._w(lib.nc_sub(self.ptr, o.ptr))
+            p = lib.nc_sub(self.ptr, o.ptr)
+        elif isinstance(o, Number):
+            p = lib.nc_add_scalar(self.ptr, -float(o))
+        else:
+            o = self._other(o)  # keep the operand alive across the call
+            p = lib.nc_sub(self.ptr, o.ptr)
+        return self._w(p) if p else self._promoted(Tensor.__sub__, o)
 
     def __rsub__(self, o):
+        if isinstance(o, Number) and _is_int(o) and self.dtype != float32:
+            self._int_arith_error()
         return self._other(o) - self
 
     def __mul__(self, o):
         if type(o) is Tensor:
-            return self._w(lib.nc_mul(self.ptr, o.ptr))
-        if isinstance(o, Number):
-            return self._w(lib.nc_scale(self.ptr, float(o)))
-        o = self._other(o)  # keep the operand alive across the call
-        return self._w(lib.nc_mul(self.ptr, o.ptr))
+            p = lib.nc_mul(self.ptr, o.ptr)
+        elif isinstance(o, Number):
+            p = lib.nc_scale(self.ptr, float(o))
+        else:
+            o = self._other(o)  # keep the operand alive across the call
+            p = lib.nc_mul(self.ptr, o.ptr)
+        return self._w(p) if p else self._promoted(Tensor.__mul__, o)
 
     __rmul__ = __mul__
 
     def __truediv__(self, o):
         if isinstance(o, Number) and abs(float(o)) >= 1e-38:  # 1/o fits in float32
-            return self._w(lib.nc_scale(self.ptr, 1.0 / float(o)))
-        o = self._other(o)  # keep the operand alive across the call
-        return self._w(lib.nc_div(self.ptr, o.ptr))
+            p = lib.nc_scale(self.ptr, 1.0 / float(o))
+        else:
+            o = self._other(o)  # keep the operand alive across the call
+            p = lib.nc_div(self.ptr, o.ptr)
+        return self._w(p) if p else self._promoted(Tensor.__truediv__, o, true_div=True)
 
     def __rtruediv__(self, o):
         return self._other(o) / self
 
     def __neg__(self):
-        return self._w(lib.nc_neg(self.ptr))
+        p = lib.nc_neg(self.ptr)
+        return self._w(p) if p else self._promoted(lambda a, _: -a, None)
 
     def __pow__(self, p):
         if not isinstance(p, Number):
             raise TypeError("only scalar exponents are supported")
-        return self._w(lib.nc_pow_scalar(self.ptr, float(p)))
+        r = lib.nc_pow_scalar(self.ptr, float(p))
+        return self._w(r) if r else self._promoted(Tensor.__pow__, p)
 
     def __matmul__(self, o):
         o = self._other(o)  # keep the operand alive across the call
-        return self._w(lib.nc_matmul(self.ptr, o.ptr))
+        p = lib.nc_matmul(self.ptr, o.ptr)
+        return self._w(p) if p else self._promoted(Tensor.__matmul__, o)
+
+    def _promoted(self, op, o, true_div: bool = False) -> "Tensor":
+        """Called after the engine refused the operands: retry in float32 where torch promotes."""
+        a_int = self.dtype != float32
+        if isinstance(o, Tensor):
+            b_int = o.dtype != float32
+        else:
+            b_int = o is None or _is_int(o)
+        if not a_int and not b_int:
+            self._ctx.raise_error()  # not a dtype problem: the engine's own message
+        lib.nc_clear_error(self._ctx._p)
+        if b_int and a_int and not true_div:
+            self._int_arith_error()
+        a = self.float() if a_int else self
+        b = o.float() if isinstance(o, Tensor) and b_int else o
+        return op(a, b)
+
+    def _int_arith_error(self):
+        raise NcError(f"arithmetic on {self.dtype} tensors is not supported (torch would keep an integer "
+                      "result; the engine computes in float32): convert with .float() first")
 
     def __rmatmul__(self, o):
         return self._other(o) @ self
@@ -624,17 +660,22 @@ class Tensor:
     def relu(self): return self._w(lib.nc_relu(self.ptr))
     def sigmoid(self): return self._w(lib.nc_sigmoid(self.ptr))
     def tanh(self): return self._w(lib.nc_tanh(self.ptr))
-    def _last_dim(self, dim: int, what: str) -> None:
-        if dim not in (-1, self.ndim - 1):
-            raise NotImplementedError(f"{what} is only implemented over the last dimension (dim=-1)")
+    def _over_dim(self, dim: int, fn) -> "Tensor":
+        """Runs a last-dim engine op over any dim (moved last and back: transposes are views)."""
+        n = self.ndim
+        if not -max(n, 1) <= dim < max(n, 1):
+            raise IndexError(f"dim {dim} out of range for a {n}-d tensor")
+        d = dim % n if n else 0
+        if d == n - 1 or n == 0:
+            return self._w(fn(self.ptr))
+        moved = self.transpose(d, -1)
+        return moved._w(fn(moved.ptr)).transpose(d, -1)
 
     def softmax(self, dim: int):
-        self._last_dim(dim, "softmax")
-        return self._w(lib.nc_softmax(self.ptr))
+        return self._over_dim(dim, lib.nc_softmax)
 
     def log_softmax(self, dim: int):
-        self._last_dim(dim, "log_softmax")
-        return self._w(lib.nc_log_softmax(self.ptr))
+        return self._over_dim(dim, lib.nc_log_softmax)
 
     # Reductions take PyTorch's `dim`; numpy's `axis` is accepted as an alias.
     def _reduce(self, fn, dim, keepdim, axis):
@@ -786,18 +827,75 @@ class Tensor:
         return self._w(lib.nc_index_select(self.ptr, index.ptr))
 
     def __getitem__(self, key):
-        """Indexing along axis 0: int, slice, list of ints or an int32 tensor."""
-        if isinstance(key, int):
-            n = self.shape[0]
-            if not -n <= key < n:
-                raise IndexError(f"index {key} out of range for axis 0 of size {n}")
-            row = self.index_select(0, [key % n])
-            return row.reshape(*self.shape[1:])
-        if isinstance(key, slice):
-            return self.index_select(0, list(range(*key.indices(self.shape[0]))))
-        if isinstance(key, (list, Tensor)) or _is_numpy(key):
-            return self._take_rows(key)
-        raise TypeError("only axis-0 indexing (int, slice, list, int32 tensor) is supported")
+        """torch/numpy basic indexing: ints, slices (step >= 1), None, ``...``, plus one integer index
+        list / numpy array / int32 tensor. Ints and slices give views (no copy); an index list copies."""
+        if type(key) is int and self.ndim:  # fast path: x[i]
+            return self._select(0, key)
+        if not isinstance(key, tuple):
+            key = (key,)
+        key = [int(k) if isinstance(k, Tensor) and k.ndim == 0 and k.dtype != float32 else k for k in key]
+        if sum(k is Ellipsis for k in key) > 1:
+            raise IndexError("an index can only have a single ellipsis ('...')")
+        real = sum(1 for k in key if k is not None and k is not Ellipsis)
+        if real > self.ndim:
+            raise IndexError(f"too many indices for a {self.ndim}-d tensor: {real} were given")
+        if Ellipsis in key:
+            i = key.index(Ellipsis)
+            key[i:i + 1] = [slice(None)] * (self.ndim - real)
+        out, d = self, 0
+        adv = None          # (axis in out, index) of the one index list / tensor
+        picks = []          # positions in key of ints and the index list (numpy's "advanced" indices)
+        for pos, k in enumerate(key):
+            if k is None:
+                out = out.unsqueeze(d)
+                d += 1
+            elif isinstance(k, slice):
+                size = out.shape[d]
+                start, stop, step = k.indices(size)
+                if step < 1:
+                    raise ValueError("step must be greater than zero")
+                length = len(range(start, stop, step))
+                if (start, length, step) != (0, size, 1):
+                    out = out._view(lib.nc_slice(out.ptr, d, start, length, step))
+                d += 1
+            elif isinstance(k, bool) or type(k).__name__ == "bool_":
+                raise IndexError("boolean indices are not supported; use masked_fill or integer indices")
+            elif _is_int(k):
+                out = out._select(d, int(k))
+                picks.append(pos)
+            elif isinstance(k, (list, Tensor)) or _is_numpy(k):
+                if adv is not None:
+                    raise NotImplementedError("only one index list / tensor per indexing expression is supported")
+                adv = (d, k)
+                picks.append(pos)
+                d += 1
+            else:
+                raise TypeError(f"unsupported index type {type(k).__name__}")
+        if adv is None:
+            return out
+        a, k = adv
+        n = out.ndim
+        moved = out if a == 0 else out.permute(a, *[i for i in range(n) if i != a])
+        res = moved._take_rows(k)
+        if a == 0:
+            return res
+        # numpy rule: the index dims stay in place when ints and the list are adjacent in the key,
+        # otherwise they go first
+        if picks != list(range(picks[0], picks[0] + len(picks))):
+            return res
+        k_nd = res.ndim - (n - 1)
+        rest = list(range(k_nd, res.ndim))
+        return res.permute(*rest[:a], *range(k_nd), *rest[a:])
+
+    def _select(self, dim: int, i: int) -> "Tensor":
+        """x.select(dim, i): a view without axis dim."""
+        size = self.shape[dim]
+        if not -size <= i < size:
+            raise IndexError(f"index {i} out of range for dim {dim} of size {size}")
+        part = self._view(lib.nc_slice(self.ptr, dim, i % size, 1, 1))
+        shape = list(self.shape)
+        del shape[dim]
+        return part.reshape(*shape)
 
     def _take_rows(self, key) -> "Tensor":
         """self[key] for integer index lists/arrays/tensors of any shape; negative indices count from the end."""
@@ -1218,7 +1316,8 @@ def linear(input: Tensor, weight: Tensor, bias: Tensor | None = None) -> Tensor:
 
 def cross_entropy(input: Tensor, target, weight=None, size_average=None, ignore_index: int = -100, reduce=None,
                   reduction: str = "mean", label_smoothing: float = 0.0) -> Tensor:
-    """Cross-entropy of logits input [N, C] and int32 class indices target [N].
+    """Cross-entropy of logits input [N, C] (also [C] and [N, C, d1, ...]) and either int32 class
+    indices target [N] ([], [N, d1, ...]) or class probabilities with input's shape (float32).
 
     reduction "mean" or "sum"; label_smoothing mixes in the uniform distribution.
     Labels outside [0, C) raise (so ignore_index only works as the default -100).
@@ -1227,11 +1326,19 @@ def cross_entropy(input: Tensor, target, weight=None, size_average=None, ignore_
                  ignore_index=(ignore_index, -100))
     if reduction not in ("mean", "sum"):
         raise NotImplementedError(f"reduction={reduction!r} is not supported (use 'mean' or 'sum')")
-    target = _class_indices(target, input)
+    if not 0.0 <= label_smoothing <= 1.0:
+        raise ValueError("label_smoothing must be in [0, 1]")
+    if not isinstance(target, Tensor):
+        target = tensor(target, ctx=input.ctx)
+    if target.dtype == float32:  # class probabilities
+        input, target = _class_rows(input, target, probs=True)
+        if label_smoothing:
+            target = target * (1.0 - label_smoothing) + label_smoothing / input.shape[-1]
+        per_row = (target * input.log_softmax(-1)).sum(-1) * -1.0
+        return per_row.sum() if reduction == "sum" else per_row.mean()
+    input, target = _class_rows(input, _class_indices(target, input), probs=False)
     loss = input._w(lib.nc_cross_entropy(input.ptr, target.ptr))
     if label_smoothing:
-        if not 0.0 <= label_smoothing <= 1.0:
-            raise ValueError("label_smoothing must be in [0, 1]")
         uniform = (input.log_softmax(-1).mean(-1)).mean() * -1.0  # mean over classes and rows
         loss = loss * (1.0 - label_smoothing) + uniform * label_smoothing
     if reduction == "sum":
@@ -1242,13 +1349,33 @@ def cross_entropy(input: Tensor, target, weight=None, size_average=None, ignore_
 
 def nll_loss(input: Tensor, target, weight=None, size_average=None, ignore_index: int = -100, reduce=None,
              reduction: str = "mean") -> Tensor:
-    """Negative log-likelihood of log-probabilities input [N, C] and class indices target [N]."""
+    """Negative log-likelihood of log-probabilities input [N, C] (also [C], [N, C, d1, ...]) and class
+    indices target [N] ([], [N, d1, ...])."""
     _unsupported(weight=(weight, None), size_average=(size_average, None), reduce=(reduce, None),
                  ignore_index=(ignore_index, -100))
     if reduction not in ("mean", "sum"):
         raise NotImplementedError(f"reduction={reduction!r} is not supported (use 'mean' or 'sum')")
-    target = _class_indices(target, input)
+    input, target = _class_rows(input, _class_indices(target, input), probs=False)
     return input._w(lib.nc_nll_loss(input.ptr, target.ptr, int(reduction == "sum")))
+
+
+def _class_rows(input: Tensor, target: Tensor, probs: bool):
+    """torch's loss layouts as rows [M, C]: unbatched [C] -> [1, C]; [N, C, d1, ...] -> [N*d1*..., C]
+    (class axis moved last). Targets follow: indices [M], probabilities [M, C]."""
+    if input.ndim == 1:
+        input = input.unsqueeze(0)
+        target = target.unsqueeze(0)
+    elif input.ndim > 2:
+        c, n = input.shape[1], input.ndim
+        want = input.shape if probs else input.shape[:1] + input.shape[2:]
+        if target.shape != want:
+            raise ValueError(f"target {target.shape} does not match input {input.shape} (expected {want})")
+        order = (0, *range(2, n), 1)
+        input = input.permute(*order).reshape(-1, c)
+        target = target.permute(*order).reshape(-1, c) if probs else target.reshape(-1)
+    if probs and target.shape != input.shape:
+        raise ValueError(f"probability target {target.shape} must have the input's shape {input.shape}")
+    return input, target
 
 
 def _class_indices(target, input: Tensor) -> Tensor:

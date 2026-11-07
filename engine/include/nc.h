@@ -226,6 +226,8 @@ NC_API nc_tensor *nc_max(nc_tensor *x, int axis, int keepdim); /* grad to first 
 /* Shape ops. reshape/transpose return views when possible. */
 NC_API nc_tensor *nc_reshape(nc_tensor *x, int ndim, const int64_t *shape); /* one dim may be -1 */
 NC_API nc_tensor *nc_transpose(nc_tensor *x, int axis0, int axis1);
+/* x[..., start : start + length*step : step, ...] along axis (step >= 1): a view, copied only in persistent mode */
+NC_API nc_tensor *nc_slice(nc_tensor *x, int axis, int64_t start, int64_t length, int64_t step);
 NC_API nc_tensor *nc_contiguous(nc_tensor *x);
 /* Rows of x along axis 0: x [N, ...], idx i32 [B] -> [B, ...].
  * Batch gathering and embedding lookup; grads scatter-add back into x. */

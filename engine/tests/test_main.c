@@ -241,6 +241,12 @@ static nc_tensor *f_contig(nc_tensor **x, nc_tensor *a) {
     return nc_reshape(nc_contiguous(nc_transpose(x[0], 0, 1)), 1, SHAPE(-1));
 }
 static nc_tensor *f_index(nc_tensor **x, nc_tensor *a) { return nc_index_select(x[0], a); }
+static nc_tensor *f_slice(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* steps and offsets on a transposed view, then a reshape that stays a strided view */
+    nc_tensor *v = nc_slice(nc_slice(nc_transpose(x[0], 0, 1), 1, 1, 3, 2), 0, 2, 2, 1);
+    nc_tensor *r = nc_reshape(v, 3, SHAPE(2, 3, 1));
+    return nc_mul(r, nc_reshape(nc_slice(x[0], 0, 0, 3, 2), 3, SHAPE(1, 3, 5)));
+}
 static nc_tensor *f_logsm(nc_tensor **x, nc_tensor *a) { (void)a; return nc_log_softmax(x[0]); }
 static nc_tensor *f_sm(nc_tensor **x, nc_tensor *a) { (void)a; return nc_softmax(x[0]); }
 static nc_tensor *f_ce(nc_tensor **x, nc_tensor *a) { return nc_cross_entropy(x[0], a); }
@@ -382,6 +388,7 @@ static void test_gradcheck(void) {
     in[0] = gparam(ctx, 0, 2, SHAPE(2, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(3, 2));
     gradcheck_case(ctx, "transpose", f_transpose, NULL, 2, in);
     GC1("contiguous", f_contig, 0, 3, 4);
+    GC1("slice", f_slice, 0, 6, 5);
     GC1("log_softmax", f_logsm, 0, 3, 5);
     GC1("softmax", f_sm, 0, 3, 5);
 
