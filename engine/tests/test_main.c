@@ -902,6 +902,22 @@ static nc_tensor *gdistinct(nc_ctx *ctx, int ndim, const int64_t *shape) {
 static nc_tensor *g_rm, *g_rv;
 static nc_tensor *f_conv(nc_tensor **x, nc_tensor *a) { (void)a; return nc_conv2d(x[0], x[1], x[2], 1, 1, 1, 1); }
 static nc_tensor *f_conv_s2(nc_tensor **x, nc_tensor *a) { (void)a; return nc_conv2d(x[0], x[1], NULL, 2, 2, 0, 0); }
+static nc_tensor *f_conv_g2(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* 2 groups of 2 -> 3 channels, stride 2, padding 1 */
+    return nc_conv2d_ex(x[0], x[1], x[2], 2, 1, 1, 1, 1, 1, 2);
+}
+static nc_tensor *f_conv_dw(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* depthwise (direct kernel), dilation 2, stride 2, bias */
+    return nc_conv2d_ex(x[0], x[1], x[2], 2, 1, 2, 1, 2, 1, 3);
+}
+static nc_tensor *f_conv_dwm(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* depthwise with channel multiplier 2 (grouped GEMM path) */
+    return nc_conv2d_ex(x[0], x[1], NULL, 1, 1, 1, 1, 1, 1, 2);
+}
+static nc_tensor *f_conv_dil(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* plain conv with dilation (2, 3) */
+    return nc_conv2d_ex(x[0], x[1], NULL, 1, 1, 2, 1, 2, 3, 1);
+}
 static nc_tensor *f_maxpool(nc_tensor **x, nc_tensor *a) { (void)a; return nc_max_pool2d(x[0], 2, 2, 2, 2, 0, 0); }
 static nc_tensor *f_maxpool_p(nc_tensor **x, nc_tensor *a) { (void)a; return nc_max_pool2d(x[0], 3, 3, 1, 1, 1, 1); }
 static nc_tensor *f_avgpool(nc_tensor **x, nc_tensor *a) { (void)a; return nc_avg_pool2d(x[0], 3, 3, 2, 2, 1, 1); }
@@ -937,6 +953,43 @@ static void test_conv_pool_bn(void) {
     gradcheck_case(ctx, "conv2d", f_conv, NULL, 3, in);
     in[0] = gparam(ctx, 0, 4, SHAPE(1, 2, 6, 7)), in[1] = gparam(ctx, 0, 4, SHAPE(2, 2, 2, 3));
     gradcheck_case(ctx, "conv2d s2", f_conv_s2, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(2, 4, 5, 4)), in[1] = gparam(ctx, 0, 4, SHAPE(6, 2, 3, 2));
+    in[2] = gparam(ctx, 0, 1, SHAPE(6));
+    gradcheck_case(ctx, "conv2d groups", f_conv_g2, NULL, 3, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(2, 3, 7, 6)), in[1] = gparam(ctx, 0, 4, SHAPE(3, 1, 3, 3));
+    in[2] = gparam(ctx, 0, 1, SHAPE(3));
+    gradcheck_case(ctx, "conv2d depthwise", f_conv_dw, NULL, 3, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(1, 2, 4, 4)), in[1] = gparam(ctx, 0, 4, SHAPE(4, 1, 3, 3));
+    gradcheck_case(ctx, "conv2d dw x2", f_conv_dwm, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(1, 2, 6, 7)), in[1] = gparam(ctx, 0, 4, SHAPE(2, 2, 3, 2));
+    gradcheck_case(ctx, "conv2d dilation", f_conv_dil, NULL, 2, in);
+    /* depthwise == grouped GEMM path on the same weights; bad groups are errors */
+    {
+        nc_manual_seed(ctx, 9);
+        nc_tensor *xx = nc_randn(ctx, 1.0f, 4, SHAPE(2, 4, 9, 8)), *ww = nc_randn(ctx, 1.0f, 4, SHAPE(4, 1, 3, 3));
+        nc_tensor *direct = nc_conv2d_ex(xx, ww, NULL, 2, 2, 1, 1, 2, 1, 4);
+        /* as 4 separate single-channel convs through the im2col path */
+        int64_t oh = nc_shape(direct)[2], ow = nc_shape(direct)[3];
+        double worst = 0;
+        for (int c = 0; c < 4; c++) {
+            nc_tensor *xc = nc_slice(xx, 1, c, 1, 1), *wc = nc_slice(ww, 0, c, 1, 1);
+            nc_tensor *yc = nc_conv2d_ex(xc, wc, NULL, 2, 2, 1, 1, 2, 1, 1);
+            for (int64_t s2 = 0; s2 < 2; s2++)
+                for (int64_t i = 0; i < oh; i++)
+                    for (int64_t j = 0; j < ow; j++) {
+                        double d = fabs(nc_get(yc, SHAPE(s2, 0, i, j)) - nc_get(direct, SHAPE(s2, c, i, j)));
+                        if (d > worst) worst = d;
+                    }
+        }
+        CHECK(worst < 1e-5);
+        CHECK(!nc_conv2d_ex(xx, ww, NULL, 1, 1, 0, 0, 1, 1, 3)); /* 4 channels into 3 groups */
+        CHECK(nc_status_code(ctx) == NC_ERR_SHAPE);
+        nc_clear_error(ctx);
+        CHECK(!nc_conv2d_ex(xx, ww, NULL, 1, 1, 0, 0, 0, 1, 4));
+        CHECK(nc_status_code(ctx) == NC_ERR_ARG);
+        nc_clear_error(ctx);
+        nc_step_end(ctx);
+    }
     in[0] = gdistinct(ctx, 4, SHAPE(2, 2, 4, 4));
     gradcheck_case(ctx, "max_pool2d", f_maxpool, NULL, 1, in);
     in[0] = gdistinct(ctx, 4, SHAPE(1, 2, 4, 5));

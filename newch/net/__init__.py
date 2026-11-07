@@ -15,7 +15,7 @@ from ..tensor import (Context, Tensor, _check_device, _is_device, _is_numpy, _pa
                      load_tensors, log_softmax, max_pool2d, parameter, persistent, randn, relu6, save_tensors,
                      silu, softmax, tensor, zeros)
 
-from ..tensor import _apply_mask, _rand_uniform, layer_norm
+from ..tensor import _apply_mask, _conv_padding, _rand_uniform, layer_norm
 
 __all__ = [
     "AvgPool2d", "BatchNorm1d", "BatchNorm2d", "Conv2d", "CrossEntropyLoss", "Dropout", "Embedding", "Flatten", "GELU",
@@ -239,26 +239,37 @@ class Linear(Module):
 
 
 class Conv2d(Module):
-    """NCHW convolution, weight [out, in, kh, kw] (torch.nn.Conv2d; dilation and groups must be 1)."""
+    """NCHW convolution, weight [out, in/groups, kh, kw] (torch.nn.Conv2d). groups=in_channels gives a
+    depthwise convolution (MobileNet); padding may be "same" or "valid"."""
 
     def __init__(self, in_channels: int, out_channels: int, kernel_size, stride=1, padding=0, dilation=1,
                  groups: int = 1, bias: bool = True, padding_mode: str = "zeros", *, ctx: Context | None = None):
-        _unsupported(dilation=(_pair(dilation, "dilation"), (1, 1)), groups=(groups, 1),
-                     padding_mode=(padding_mode, "zeros"))
+        _unsupported(padding_mode=(padding_mode, "zeros"))
+        if groups < 1 or in_channels % groups or out_channels % groups:
+            raise ValueError(f"in_channels ({in_channels}) and out_channels ({out_channels}) must be divisible "
+                             f"by groups ({groups})")
         ctx = ctx or default_context()
-        self.in_channels, self.out_channels = in_channels, out_channels
+        self.in_channels, self.out_channels, self.groups = in_channels, out_channels, groups
         self.kernel_size = _pair(kernel_size, "kernel_size")
-        self.stride, self.padding = _pair(stride, "stride"), _pair(padding, "padding")
-        bound = 1.0 / math.sqrt(in_channels * self.kernel_size[0] * self.kernel_size[1])
-        self.weight = _uniform_param((out_channels, in_channels, *self.kernel_size), bound, ctx)
+        self.stride, self.dilation = _pair(stride, "stride"), _pair(dilation, "dilation")
+        self.padding = padding if isinstance(padding, str) else _pair(padding, "padding")
+        _conv_padding(self.padding, self.kernel_size, self.dilation, self.stride)  # validate now
+        fan_in = in_channels // groups * self.kernel_size[0] * self.kernel_size[1]
+        bound = 1.0 / math.sqrt(fan_in)  # torch's default (kaiming_uniform with a=sqrt(5))
+        self.weight = _uniform_param((out_channels, in_channels // groups, *self.kernel_size), bound, ctx)
         self.bias = _uniform_param((out_channels,), bound, ctx) if bias else None
 
     def forward(self, x: Tensor) -> Tensor:
-        return conv2d(x, self.weight, self.bias, self.stride, self.padding)
+        return conv2d(x, self.weight, self.bias, self.stride, self.padding, self.dilation, self.groups)
 
     def extra_repr(self) -> str:
-        return (f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
-                f"stride={self.stride}, padding={self.padding}")
+        s = (f"{self.in_channels}, {self.out_channels}, kernel_size={self.kernel_size}, "
+             f"stride={self.stride}, padding={self.padding}")
+        if self.dilation != (1, 1):
+            s += f", dilation={self.dilation}"
+        if self.groups != 1:
+            s += f", groups={self.groups}"
+        return s
 
 
 class _Pool2d(Module):

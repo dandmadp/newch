@@ -73,8 +73,9 @@ class TestLayers(Base):
         drop = net.Dropout(0.5)
         drop.eval()
         self.assertIs(drop(x), x)  # identity in eval mode
+        self.assertEqual(net.Conv2d(3, 4, 3, padding="same")(x).shape, (2, 4, 9, 9))
         with self.assertRaises(NotImplementedError):
-            net.Conv2d(3, 4, 3, padding="same")
+            net.Conv2d(3, 4, 2, padding="same")  # torch pads one side more; newch pads both equally
 
     def test_batchnorm_buffers(self):
         bn = net.BatchNorm1d(2, momentum=1.0)

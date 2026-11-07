@@ -371,3 +371,105 @@ class TestLossLayouts(Base):
                                .item(), float(self.np_ce(rows[:1], np.eye(3)[labels[:1, 0, 0]]).mean()), places=5)
         with self.assertRaises(ValueError):
             F.cross_entropy(x, torch.tensor(labels[:, :, :4]))
+
+
+def np_conv2d(x, w, b, stride, padding, dilation, groups):
+    """torch.nn.functional.conv2d written out in numpy (reference)."""
+    N, C, H, W = x.shape
+    OC, Cg, KH, KW = w.shape
+    (sh, sw), (ph, pw), (dh, dw) = stride, padding, dilation
+    xp = np.pad(x, ((0, 0), (0, 0), (ph, ph), (pw, pw)))
+    OH = (H + 2 * ph - dh * (KH - 1) - 1) // sh + 1
+    OW = (W + 2 * pw - dw * (KW - 1) - 1) // sw + 1
+    out = np.zeros((N, OC, OH, OW), np.float64)
+    ocg = OC // groups
+    for o in range(OC):
+        g = o // ocg
+        for ki in range(KH):
+            for kj in range(KW):
+                patch = xp[:, g * Cg:(g + 1) * Cg, ki * dh: ki * dh + sh * (OH - 1) + 1: sh,
+                           kj * dw: kj * dw + sw * (OW - 1) + 1: sw]
+                out[:, o] += np.einsum("nchw,c->nhw", patch, w[o, :, ki, kj])
+        if b is not None:
+            out[:, o] += b[o]
+    return out
+
+
+@unittest.skipIf(np is None, "numpy not installed")
+class TestGroupedConv(Base):
+    CASES = [  # (C, OC, groups, kernel, stride, padding, dilation)
+        (4, 6, 2, (3, 3), (1, 1), (1, 1), (1, 1)),
+        (6, 6, 6, (3, 3), (2, 2), (1, 1), (1, 1)),     # depthwise (direct kernel)
+        (3, 6, 3, (3, 3), (1, 1), (1, 1), (1, 1)),     # depthwise, channel multiplier 2
+        (4, 4, 4, (5, 3), (1, 2), (4, 1), (2, 1)),     # depthwise, dilated
+        (2, 3, 1, (3, 2), (1, 1), (2, 0), (2, 3)),     # dilation only
+        (8, 4, 4, (1, 1), (1, 1), (0, 0), (1, 1)),     # grouped pointwise
+    ]
+
+    def test_against_numpy(self):
+        rs = np.random.RandomState(3)
+        for C, OC, G, k, s, p, d in self.CASES:
+            with self.subTest(C=C, OC=OC, groups=G, k=k, s=s, p=p, d=d):
+                x = rs.randn(2, C, 9, 8).astype(np.float32)
+                w = rs.randn(OC, C // G, *k).astype(np.float32)
+                b = rs.randn(OC).astype(np.float32)
+                want = np_conv2d(x, w, b, s, p, d, G)
+                xt, wt, bt = (torch.tensor(v, requires_grad=True) for v in (x, w, b))
+                out = F.conv2d(xt, wt, bt, s, p, d, G)
+                np.testing.assert_allclose(out.numpy(), want, rtol=1e-4, atol=1e-4)
+                # gradients by a directional finite difference of the reference
+                gy = rs.randn(*want.shape)
+                (out * torch.tensor(gy.astype(np.float32))).sum().backward()
+                for t, v, name in ((xt, x, "x"), (wt, w, "w"), (bt, b, "b")):
+                    dv = rs.randn(*v.shape)
+                    eps = 1e-3
+                    args = {"x": x, "w": w, "b": b}
+                    plus = dict(args, **{name: v + eps * dv})
+                    minus = dict(args, **{name: v - eps * dv})
+                    num = ((np_conv2d(plus["x"], plus["w"], plus["b"], s, p, d, G) -
+                            np_conv2d(minus["x"], minus["w"], minus["b"], s, p, d, G)) * gy).sum() / (2 * eps)
+                    self.assertAlmostEqual(float((t.grad.numpy() * dv).sum()), float(num), delta=1e-2 * (1 + abs(num)))
+                torch.step_end()
+
+    def test_module(self):
+        dw = nn.Conv2d(8, 8, 3, padding="same", groups=8, bias=False)
+        self.assertEqual(dw.weight.shape, (8, 1, 3, 3))
+        self.assertEqual(dw(torch.randn(2, 8, 5, 5)).shape, (2, 8, 5, 5))
+        self.assertIn("groups=8", repr(dw))
+        self.assertEqual(nn.Conv2d(4, 4, 3, dilation=2, padding="same")(torch.randn(1, 4, 9, 9)).shape, (1, 4, 9, 9))
+        self.assertEqual(nn.Conv2d(4, 4, 3, padding="valid")(torch.randn(1, 4, 9, 9)).shape, (1, 4, 7, 7))
+        for bad in (lambda: nn.Conv2d(4, 6, 3, groups=4), lambda: nn.Conv2d(3, 6, 3, groups=2)):
+            with self.assertRaises(ValueError):
+                bad()
+        with self.assertRaises(ValueError):
+            nn.Conv2d(4, 4, 3, stride=2, padding="same")
+
+    def test_mobilenet_block_learns(self):
+        """Depthwise-separable blocks (MobileNet) train on a toy task: is the bright spot left or right."""
+        torch.manual_seed(0)
+
+        def block(cin, cout, stride):
+            return [nn.Conv2d(cin, cin, 3, stride, 1, groups=cin, bias=False), nn.BatchNorm2d(cin), nn.ReLU6(),
+                    nn.Conv2d(cin, cout, 1, bias=False), nn.BatchNorm2d(cout), nn.ReLU6()]
+        model = nn.Sequential(nn.Conv2d(1, 8, 3, 2, 1), nn.ReLU6(), *block(8, 16, 2), *block(16, 16, 1),
+                              nn.Flatten(), nn.Linear(16 * 4 * 4, 2))
+        opt = torch.optim.Adam(model.parameters(), lr=0.01)
+        rs = np.random.RandomState(0)
+
+        def batch(n):
+            x = rs.rand(n, 1, 16, 16).astype(np.float32) * 0.2
+            y = rs.randint(0, 2, n)
+            for i in range(n):
+                col = rs.randint(0, 6) + (10 if y[i] else 0)
+                x[i, 0, rs.randint(0, 14):, col] += 1.0
+            return torch.tensor(x), torch.tensor(y)
+        for _ in range(60):
+            x, y = batch(32)
+            opt.zero_grad()
+            F.cross_entropy(model(x), y).backward()
+            opt.step()
+            torch.step_end()
+        model.eval()
+        x, y = batch(200)
+        acc = (model(x).argmax(1) == y).float().mean().item()
+        self.assertGreater(acc, 0.9)

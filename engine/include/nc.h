@@ -238,6 +238,10 @@ NC_API nc_tensor *nc_index_select(nc_tensor *x, nc_tensor *idx);
  * padded cells (PyTorch's count_include_pad=True). */
 NC_API nc_tensor *nc_conv2d(nc_tensor *x, nc_tensor *weight, nc_tensor *bias, int stride_h, int stride_w,
                      int pad_h, int pad_w);
+/* conv2d with dilation and groups (torch.nn.functional.conv2d): weight [OC, C/groups, KH, KW];
+ * depthwise (groups == C == OC) runs a direct per-plane kernel */
+NC_API nc_tensor *nc_conv2d_ex(nc_tensor *x, nc_tensor *weight, nc_tensor *bias, int stride_h, int stride_w,
+                               int pad_h, int pad_w, int dilation_h, int dilation_w, int groups);
 NC_API nc_tensor *nc_max_pool2d(nc_tensor *x, int k_h, int k_w, int stride_h, int stride_w, int pad_h, int pad_w);
 NC_API nc_tensor *nc_avg_pool2d(nc_tensor *x, int k_h, int k_w, int stride_h, int stride_w, int pad_h, int pad_w);
 

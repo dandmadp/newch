@@ -195,8 +195,9 @@ class TestApiCompat(Base):
         self.assertEqual(lin.weight.grad.tolist(), [[0.0, 0.0]])
 
     def test_layers_reject_unsupported(self):
+        self.assertEqual(net.Conv2d(3, 8, 3, 1, 1, 2).dilation, (2, 2))  # 6th positional is dilation, as in torch
         with self.assertRaises(NotImplementedError):
-            net.Conv2d(3, 8, 3, 1, 1, 2)  # 6th positional is dilation, as in torch
+            net.Conv2d(3, 8, 3, padding_mode="reflect")
         net.Conv2d(3, 8, 3, 1, 1, 1, 1, False)  # bias is 8th
         with self.assertRaises(NotImplementedError):
             net.MaxPool2d(2, ceil_mode=True)

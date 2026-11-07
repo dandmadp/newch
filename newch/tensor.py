@@ -1197,11 +1197,29 @@ def _pair(v, name: str) -> tuple:
 
 def conv2d(input: Tensor, weight: Tensor, bias: Tensor | None = None, stride=1, padding=0, dilation=1,
            groups: int = 1) -> Tensor:
-    """NCHW convolution (torch.nn.functional.conv2d); dilation and groups must be 1."""
-    _unsupported(dilation=(_pair(dilation, "dilation"), (1, 1)), groups=(groups, 1))
-    (sh, sw), (ph, pw) = _pair(stride, "stride"), _pair(padding, "padding")
-    return _unbatched(input, lambda x: x._w(lib.nc_conv2d(x.ptr, weight.ptr, bias.ptr if bias is not None else None,
-                                                          sh, sw, ph, pw)))
+    """NCHW convolution (torch.nn.functional.conv2d) with stride, padding (ints or "valid" / "same"),
+    dilation and groups: weight [OC, C/groups, KH, KW]. groups == C == OC is a depthwise convolution."""
+    (sh, sw), (dh, dw) = _pair(stride, "stride"), _pair(dilation, "dilation")
+    ph, pw = _conv_padding(padding, weight.shape[2:], (dh, dw), (sh, sw))
+    return _unbatched(input, lambda x: x._w(lib.nc_conv2d_ex(x.ptr, weight.ptr, bias.ptr if bias is not None else None,
+                                                             sh, sw, ph, pw, dh, dw, int(groups))))
+
+
+def _conv_padding(padding, kernel, dilation, stride) -> tuple:
+    """torch's padding argument: ints, "valid" (none) or "same" (stride 1; output size = input size)."""
+    if padding == "valid":
+        return 0, 0
+    if padding == "same":
+        if stride != (1, 1):
+            raise ValueError("padding='same' is not supported for strided convolutions")
+        totals = [d * (k - 1) for k, d in zip(kernel, dilation)]
+        if any(t % 2 for t in totals):
+            raise NotImplementedError("padding='same' needs an odd (dilated) kernel here: newch pads both sides "
+                                      "equally, torch would pad one extra row/column at the end")
+        return totals[0] // 2, totals[1] // 2
+    if isinstance(padding, str):
+        raise ValueError(f"invalid padding string {padding!r}, should be one of {{'valid', 'same'}}")
+    return _pair(padding, "padding")
 
 
 def _unbatched(input: Tensor, fn) -> Tensor:

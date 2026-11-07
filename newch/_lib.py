@@ -134,6 +134,7 @@ _SIGNATURES = {
     "nc_leaky_relu": (P, [P, c_float]),
     "nc_gelu": (P, [P, c_int]),
     "nc_conv2d": (P, [P, P, P, c_int, c_int, c_int, c_int]),
+    "nc_conv2d_ex": (P, [P, P, P, c_int, c_int, c_int, c_int, c_int, c_int, c_int]),
     "nc_max_pool2d": (P, [P, c_int, c_int, c_int, c_int, c_int, c_int]),
     "nc_avg_pool2d": (P, [P, c_int, c_int, c_int, c_int, c_int, c_int]),
     "nc_dropout": (P, [P, c_float]),
