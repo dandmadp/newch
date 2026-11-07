@@ -6,6 +6,12 @@
 
 enum { BIN_ADD, BIN_SUB, BIN_MUL, BIN_DIV };
 
+/* Elementwise work is split into chunks of at least NC_EW_GRAIN elements across the
+ * thread pool; every element is computed by exactly one thread, so results do not
+ * depend on the thread count. */
+#define NC_EW_GRAIN 32768
+
+
 /* ------------------------------------------------------------------------ */
 /* Row functions for nc__iterate                                             */
 /* ------------------------------------------------------------------------ */
@@ -72,6 +78,33 @@ static nc_status binary_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape)
     return NC_OK;
 }
 
+typedef struct {
+    void (*f)(int64_t, const float *, const float *, float *);
+    const float *a, *b;
+    float *o;
+} bin_job;
+
+static void bin_fwd_range(void *arg, int64_t b, int64_t e) {
+    const bin_job *j = (const bin_job *)arg;
+    j->f(e - b, j->a + b, j->b + b, j->o + b);
+}
+
+/* backward rows over a flat range when every operand has the output's contiguous layout */
+typedef struct {
+    nc_row_fn fn;
+    int nops;
+    float *base[4];
+    const void *user;
+} flat_job;
+
+static void flat_range(void *arg, int64_t b, int64_t e) {
+    const flat_job *j = (const flat_job *)arg;
+    float *p[4];
+    int64_t st[4] = {1, 1, 1, 1};
+    for (int k = 0; k < j->nops; k++) p[k] = j->base[k] + b;
+    j->fn(e - b, p, st, j->user);
+}
+
 static nc_status binary_fwd(nc_node *n) {
     nc_tensor *a = n->in[0], *b = n->in[1], *o = n->out;
     const nc_kernels *k = o->ctx->k;
@@ -79,7 +112,8 @@ static nc_status binary_fwd(nc_node *n) {
     if (nc__same_shape(a, b) && nc_is_contiguous(a) && nc_is_contiguous(b)) {
         void (*f)(int64_t, const float *, const float *, float *) =
             kind == BIN_ADD ? k->add_f32 : kind == BIN_SUB ? k->sub_f32 : kind == BIN_MUL ? k->mul_f32 : k->div_f32;
-        f(nc_numel(o), (const float *)a->data, (const float *)b->data, (float *)o->data);
+        bin_job j = {f, (const float *)a->data, (const float *)b->data, (float *)o->data};
+        nc__parallel_for(o->ctx, nc_numel(o), NC_EW_GRAIN, bin_fwd_range, &j);
         return NC_OK;
     }
     int64_t st[3][NC_MAX_DIMS];
@@ -101,11 +135,23 @@ static void binary_bwd(nc_node *n) {
     nc__bcast_strides(a, nd, o->shape, sa);
     nc__bcast_strides(b, nd, o->shape, sb);
 
+    int flat = nc__same_shape(a, o) && nc__same_shape(b, o) && nc_is_contiguous(a) && nc_is_contiguous(b);
     for (int which = 0; which < 2; which++) {
         nc_tensor *x = n->in[which];
         if (!nc__needs_grad(x)) continue;
         nc_tensor *gx = nc__grad_buf(x);
         if (!gx) return;
+        if (flat && kind != BIN_ADD && kind != BIN_SUB) {
+            flat_job j;
+            if (kind == BIN_MUL || which == 0) {
+                j = (flat_job){kind == BIN_MUL ? row_acc_mul : row_acc_div, 3,
+                               {g, (float *)(which == 0 ? b : a)->data, (float *)gx->data, NULL}, NULL};
+            } else {
+                j = (flat_job){row_acc_div_b, 4, {g, (float *)a->data, (float *)b->data, (float *)gx->data}, NULL};
+            }
+            nc__parallel_for(o->ctx, nc_numel(o), NC_EW_GRAIN, flat_range, &j);
+            continue;
+        }
         int64_t st[4][NC_MAX_DIMS];
         memcpy(st[0], sg, sizeof sg);
         int64_t sgx[NC_MAX_DIMS];
@@ -180,14 +226,8 @@ static nc_status unary_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) 
     return NC_OK;
 }
 
-static nc_status unary_fwd(nc_node *n) {
-    const nc_kernels *k = n->out->ctx->k;
-    const float *x = nc__contig_f32(n->in[0]);
-    if (!x) return NC_ERR_OOM;
-    float *y = (float *)n->out->data;
-    int64_t N = nc_numel(n->out);
-    float s = n->p.f[0];
-    switch (n->op->kind) {
+static void unary_fwd_span(const nc_kernels *k, int kind, float s, const float *x, float *y, int64_t N) {
+    switch (kind) {
     case UN_NEG: k->scale_f32(N, -1.0f, x, y); break;
     case UN_EXP: k->exp_f32(N, x, y); break;
     case UN_LOG: for (int64_t i = 0; i < N; i++) y[i] = logf(x[i]); break;
@@ -223,40 +263,43 @@ static nc_status unary_fwd(nc_node *n) {
         for (int64_t i = 0; i < N; i++) y[i] = 0.5f * x[i] * (1.0f + y[i]);
         break;
     }
+}
+
+typedef struct {
+    const nc_kernels *k;
+    int kind;
+    float s;
+    const float *x, *y, *g;
+    float *out, *gi, *tmp, *tmp2;
+} un_job;
+
+static void unary_fwd_range(void *arg, int64_t b, int64_t e) {
+    const un_job *j = (const un_job *)arg;
+    unary_fwd_span(j->k, j->kind, j->s, j->x + b, j->out + b, e - b);
+}
+
+static nc_status unary_fwd(nc_node *n) {
+    const float *x = nc__contig_f32(n->in[0]);
+    if (!x) return NC_ERR_OOM;
+    un_job j = {n->out->ctx->k, n->op->kind, n->p.f[0], x, NULL, NULL, (float *)n->out->data, NULL, NULL, NULL};
+    nc__parallel_for(n->out->ctx, nc_numel(n->out), NC_EW_GRAIN, unary_fwd_range, &j);
     return NC_OK;
 }
 
-static void unary_bwd(nc_node *n) {
-    nc_tensor *in = n->in[0];
-    nc_tensor *gt = nc__grad_buf(in);
-    const float *x = nc__contig_f32(in);
-    if (!gt || !x) return;
-    const nc_kernels *k = in->ctx->k;
-    const float *y = (const float *)n->out->data;
-    const float *g = (const float *)n->out->grad->data;
-    float *gi = (float *)gt->data;
-    int64_t N = nc_numel(in);
-    float s = n->p.f[0];
-    float *tmp = NULL, *tmp2 = NULL; /* sigmoid / erf / tanh values recomputed for SiLU and GELU */
-    int kind = n->op->kind;
-    if (kind == UN_SILU || kind == UN_GELU || kind == UN_GELU_TANH) {
-        tmp = (float *)nc__arena_alloc(in->ctx, (size_t)(N ? N : 1) * sizeof(float));
-        if (!tmp) return;
-        if (kind == UN_SILU) {
-            k->sigmoid_f32(N, x, tmp);
-        } else if (kind == UN_GELU) {
-            tmp2 = (float *)nc__arena_alloc(in->ctx, (size_t)(N ? N : 1) * sizeof(float));
-            if (!tmp2) return;
-            k->scale_f32(N, NC_SQRT1_2, x, tmp);
-            k->erf_f32(N, tmp, tmp);
-            for (int64_t i = 0; i < N; i++) tmp2[i] = -0.5f * x[i] * x[i];
-            k->exp_f32(N, tmp2, tmp2);
-        } else {
-            for (int64_t i = 0; i < N; i++) tmp[i] = NC_SQRT_2_PI * (x[i] + NC_GELU_C * x[i] * x[i] * x[i]);
-            k->tanh_f32(N, tmp, tmp);
-        }
+static void unary_bwd_span(const nc_kernels *k, int kind, float s, const float *x, const float *y,
+                           const float *g, float *gi, float *tmp, float *tmp2, int64_t N) {
+    if (kind == UN_SILU) {
+        k->sigmoid_f32(N, x, tmp);
+    } else if (kind == UN_GELU) {
+        k->scale_f32(N, NC_SQRT1_2, x, tmp);
+        k->erf_f32(N, tmp, tmp);
+        for (int64_t i = 0; i < N; i++) tmp2[i] = -0.5f * x[i] * x[i];
+        k->exp_f32(N, tmp2, tmp2);
+    } else if (kind == UN_GELU_TANH) {
+        for (int64_t i = 0; i < N; i++) tmp[i] = NC_SQRT_2_PI * (x[i] + NC_GELU_C * x[i] * x[i] * x[i]);
+        k->tanh_f32(N, tmp, tmp);
     }
-    switch (n->op->kind) {
+    switch (kind) {
     case UN_NEG: k->axpy_f32(N, -1.0f, g, gi); break;
     case UN_EXP: for (int64_t i = 0; i < N; i++) gi[i] += g[i] * y[i]; break;
     case UN_LOG: for (int64_t i = 0; i < N; i++) gi[i] += g[i] / x[i]; break;
@@ -292,6 +335,33 @@ static void unary_bwd(nc_node *n) {
         }
         break;
     }
+}
+
+static void unary_bwd_range(void *arg, int64_t b, int64_t e) {
+    const un_job *j = (const un_job *)arg;
+    unary_bwd_span(j->k, j->kind, j->s, j->x + b, j->y + b, j->g + b, j->gi + b, j->tmp ? j->tmp + b : NULL,
+                   j->tmp2 ? j->tmp2 + b : NULL, e - b);
+}
+
+static void unary_bwd(nc_node *n) {
+    nc_tensor *in = n->in[0];
+    nc_tensor *gt = nc__grad_buf(in);
+    const float *x = nc__contig_f32(in);
+    if (!gt || !x) return;
+    int64_t N = nc_numel(in);
+    int kind = n->op->kind;
+    float *tmp = NULL, *tmp2 = NULL; /* sigmoid / erf / tanh values recomputed for SiLU and GELU */
+    if (kind == UN_SILU || kind == UN_GELU || kind == UN_GELU_TANH) {
+        tmp = (float *)nc__arena_alloc(in->ctx, (size_t)(N ? N : 1) * sizeof(float));
+        if (!tmp) return;
+        if (kind == UN_GELU) {
+            tmp2 = (float *)nc__arena_alloc(in->ctx, (size_t)(N ? N : 1) * sizeof(float));
+            if (!tmp2) return;
+        }
+    }
+    un_job j = {in->ctx->k, kind, n->p.f[0], x, (const float *)n->out->data, (const float *)n->out->grad->data,
+                NULL, (float *)gt->data, tmp, tmp2};
+    nc__parallel_for(in->ctx, N, NC_EW_GRAIN, unary_bwd_range, &j);
 }
 
 #define UNARY_OP(nm, KIND) \

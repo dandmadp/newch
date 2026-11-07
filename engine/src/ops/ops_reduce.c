@@ -115,6 +115,33 @@ static nc_status reduce_fwd(nc_node *n) {
     return NC_OK;
 }
 
+/* sum / mean backward: every input row (o, r) gets the output row o; rows split across threads,
+ * one writer per element. inner == 1 (e.g. a full reduction) fills runs instead of calling a
+ * kernel per element. */
+typedef struct {
+    const nc_kernels *k;
+    const red_dims *d;
+    float scale;
+    const float *g;
+    float *gi;
+} red_bwd_job;
+
+static void red_bwd_rows(void *arg, int64_t begin, int64_t end) {
+    const red_bwd_job *j = (const red_bwd_job *)arg;
+    int64_t R = j->d->R, inner = j->d->inner;
+    for (int64_t row = begin; row < end;) {
+        int64_t o = row / R, stop = (o + 1) * R < end ? (o + 1) * R : end;
+        const float *gs = j->g + o * inner;
+        if (inner == 1) {
+            float v = j->scale * gs[0], *p = j->gi;
+            for (int64_t r = row; r < stop; r++) p[r] += v;
+        } else {
+            for (int64_t r = row; r < stop; r++) j->k->axpy_f32(inner, j->scale, gs, j->gi + r * inner);
+        }
+        row = stop;
+    }
+}
+
 static void reduce_bwd(nc_node *n) {
     nc_tensor *gt = nc__grad_buf(n->in[0]);
     if (!gt) return;
@@ -130,9 +157,9 @@ static void reduce_bwd(nc_node *n) {
         return;
     }
     float scale = n->op->kind == RED_MEAN ? 1.0f / (float)(d.R ? d.R : 1) : 1.0f;
-    for (int64_t o = 0; o < d.outer; o++)
-        for (int64_t r = 0; r < d.R; r++)
-            k->axpy_f32(d.inner, scale, g + o * d.inner, gi + (o * d.R + r) * d.inner);
+    red_bwd_job j = {k, &d, scale, g, gi};
+    int64_t grain = d.inner >= 32768 ? 1 : 32768 / (d.inner ? d.inner : 1);
+    nc__parallel_for(gt->ctx, d.outer * d.R, grain, red_bwd_rows, &j);
 }
 
 const nc_op_def nc_op_sum = {"sum", NC_OPF_REDUCTION, RED_SUM, reduce_infer, NULL, reduce_fwd, reduce_bwd};

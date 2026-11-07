@@ -62,10 +62,10 @@ static nc_status check_window(nc_node *n, int64_t kh, int64_t kw) {
     return NC_OK;
 }
 
-/* col [Cg*KH*KW, OH*OW] from Cg channels x [Cg, H, W] of one image */
-static void im2col(const conv_geom *g, int64_t Cg, const float *x, float *col) {
+/* col [Cg*KH*KW, OH*OW] from Cg channels x [Cg, H, W] of one image; channels [c0, c1) */
+static void im2col_part(const conv_geom *g, const float *x, float *col, int64_t c0, int64_t c1) {
     int64_t L = g->OH * g->OW;
-    for (int64_t c = 0; c < Cg; c++)
+    for (int64_t c = c0; c < c1; c++)
         for (int64_t ki = 0; ki < g->KH; ki++)
             for (int64_t kj = 0; kj < g->KW; kj++) {
                 float *row = col + ((c * g->KH + ki) * g->KW + kj) * L;
@@ -85,10 +85,10 @@ static void im2col(const conv_geom *g, int64_t Cg, const float *x, float *col) {
             }
 }
 
-/* accumulate col back into dx [Cg, H, W] */
-static void col2im(const conv_geom *g, int64_t Cg, const float *col, float *dx) {
+/* accumulate col back into dx [Cg, H, W]; channels [c0, c1) (each writes only its own plane) */
+static void col2im_part(const conv_geom *g, const float *col, float *dx, int64_t c0, int64_t c1) {
     int64_t L = g->OH * g->OW;
-    for (int64_t c = 0; c < Cg; c++)
+    for (int64_t c = c0; c < c1; c++)
         for (int64_t ki = 0; ki < g->KH; ki++)
             for (int64_t kj = 0; kj < g->KW; kj++) {
                 const float *row = col + ((c * g->KH + ki) * g->KW + kj) * L;
@@ -103,6 +103,37 @@ static void col2im(const conv_geom *g, int64_t Cg, const float *col, float *dx) 
                     }
                 }
             }
+}
+
+typedef struct {
+    const conv_geom *g;
+    const float *src;
+    float *dst;
+} col_job;
+
+static void im2col_range(void *arg, int64_t b, int64_t e) {
+    const col_job *j = (const col_job *)arg;
+    im2col_part(j->g, j->src, j->dst, b, e);
+}
+
+static void col2im_range(void *arg, int64_t b, int64_t e) {
+    const col_job *j = (const col_job *)arg;
+    col2im_part(j->g, j->src, j->dst, b, e);
+}
+
+static int64_t col_grain(const conv_geom *g) {
+    int64_t per_channel = g->KH * g->KW * g->OH * g->OW;
+    return per_channel >= 32768 ? 1 : 32768 / (per_channel ? per_channel : 1);
+}
+
+static void im2col(nc_ctx *ctx, const conv_geom *g, int64_t Cg, const float *x, float *col) {
+    col_job j = {g, x, col};
+    nc__parallel_for(ctx, Cg, col_grain(g), im2col_range, &j);
+}
+
+static void col2im(nc_ctx *ctx, const conv_geom *g, int64_t Cg, const float *col, float *dx) {
+    col_job j = {g, col, dx};
+    nc__parallel_for(ctx, Cg, col_grain(g), col2im_range, &j);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -274,7 +305,7 @@ static nc_status conv_fwd(nc_node *n) {
     for (int64_t s = 0; s < g.N; s++) {
         for (int64_t gi = 0; gi < g.G; gi++) {
             float *y = Y + (s * g.OC + gi * OCg) * L;
-            im2col(&g, Cg, X + (s * g.C + gi * Cg) * g.H * g.W, col);
+            im2col(ctx, &g, Cg, X + (s * g.C + gi * Cg) * g.H * g.W, col);
             if (B)
                 for (int64_t o = 0; o < OCg; o++)
                     for (int64_t l = 0; l < L; l++) y[o * L + l] = B[gi * OCg + o];
@@ -310,13 +341,13 @@ static void conv_bwd(nc_node *n) {
             const float *xs = X + (s * g.C + gi * Cg) * g.H * g.W;
             if (gw) {
                 /* dW_g [OCg, CKK] += dY_g [OCg, L] @ col^T */
-                im2col(&g, Cg, xs, col);
+                im2col(ctx, &g, Cg, xs, col);
                 nc__gemm(ctx, 0, 1, OCg, CKK, L, 1.0f, gs, L, col, L, 1.0f, (float *)gw->data + gi * OCg * CKK, CKK);
             }
             if (gx) {
                 /* dcol [CKK, L] = W_g^T @ dY_g, then scatter back into dx */
                 nc__gemm(ctx, 1, 0, CKK, L, OCg, 1.0f, Wt + gi * OCg * CKK, CKK, gs, L, 0.0f, col, L);
-                col2im(&g, Cg, col, (float *)gx->data + (s * g.C + gi * Cg) * g.H * g.W);
+                col2im(ctx, &g, Cg, col, (float *)gx->data + (s * g.C + gi * Cg) * g.H * g.W);
             }
         }
         if (gb)
@@ -348,6 +379,24 @@ nc_tensor *nc_conv2d(nc_tensor *x, nc_tensor *weight, nc_tensor *bias, int strid
 
 enum { POOL_MAX, POOL_AVG };
 
+typedef struct {
+    const conv_geom *g;
+    const float *X;
+    float *Y;
+    int32_t *arg;
+    int is_max;
+    const float *G; /* backward */
+    float *gx;
+} pool_job;
+
+static void pool_fwd_range(void *a, int64_t begin, int64_t end);
+static void pool_bwd_range(void *a, int64_t begin, int64_t end);
+
+static int64_t pool_grain(const conv_geom *g) {
+    int64_t per_plane = g->OH * g->OW * g->KH * g->KW;
+    return per_plane >= 32768 ? 1 : 32768 / (per_plane ? per_plane : 1);
+}
+
 static nc_status pool_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
     if (!nc__expect_f32(n, 0)) return NC_ERR_DTYPE;
     int64_t kh = n->p.i[4], kw = n->p.i[5];
@@ -377,8 +426,20 @@ static nc_status pool_fwd(nc_node *n) {
         if (!arg) return NC_ERR_OOM;
         n->saved = arg;
     }
+    pool_job j = {&g, X, Y, arg, is_max, NULL, NULL};
+    nc__parallel_for(x->ctx, g.N * g.C, pool_grain(&g), pool_fwd_range, &j);
+    return NC_OK;
+}
+
+static void pool_fwd_range(void *a, int64_t begin, int64_t end) {
+    const pool_job *j = (const pool_job *)a;
+    conv_geom g = *j->g;
+    const float *X = j->X;
+    float *Y = j->Y;
+    int32_t *arg = j->arg;
+    int is_max = j->is_max;
     float inv = 1.0f / (float)(g.KH * g.KW);
-    for (int64_t plane = 0; plane < g.N * g.C; plane++) {
+    for (int64_t plane = begin; plane < end; plane++) {
         const float *xp = X + plane * g.H * g.W;
         for (int64_t oy = 0; oy < g.OH; oy++)
             for (int64_t ox = 0; ox < g.OW; ox++) {
@@ -404,7 +465,6 @@ static nc_status pool_fwd(nc_node *n) {
                 }
             }
     }
-    return NC_OK;
 }
 
 static void pool_bwd(nc_node *n) {
@@ -414,15 +474,24 @@ static void pool_bwd(nc_node *n) {
     conv_geom g = geom(n, n->p.i[4], n->p.i[5], 0);
     const float *G = (const float *)n->out->grad->data;
     float *gx = (float *)gt->data;
-    if (n->op->kind == POOL_MAX) {
-        const int32_t *arg = (const int32_t *)n->saved;
-        int64_t per_plane = g.OH * g.OW;
-        for (int64_t o = 0, total = nc_numel(n->out); o < total; o++)
-            gx[(o / per_plane) * g.H * g.W + arg[o]] += G[o];
+    pool_job j = {&g, NULL, NULL, (int32_t *)n->saved, n->op->kind == POOL_MAX, G, gx};
+    nc__parallel_for(x->ctx, g.N * g.C, pool_grain(&g), pool_bwd_range, &j);
+}
+
+/* planes [begin, end): each plane's input grad has one writer */
+static void pool_bwd_range(void *a, int64_t begin, int64_t end) {
+    const pool_job *j = (const pool_job *)a;
+    conv_geom g = *j->g;
+    const float *G = j->G;
+    float *gx = j->gx;
+    int64_t per_plane = g.OH * g.OW;
+    if (j->is_max) {
+        for (int64_t o = begin * per_plane; o < end * per_plane; o++)
+            gx[(o / per_plane) * g.H * g.W + j->arg[o]] += G[o];
         return;
     }
     float inv = 1.0f / (float)(g.KH * g.KW);
-    for (int64_t plane = 0; plane < g.N * g.C; plane++) {
+    for (int64_t plane = begin; plane < end; plane++) {
         float *gp = gx + plane * g.H * g.W;
         for (int64_t oy = 0; oy < g.OH; oy++)
             for (int64_t ox = 0; ox < g.OW; ox++) {

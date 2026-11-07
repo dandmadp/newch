@@ -1137,6 +1137,85 @@ static void test_threads(void) {
     free(r[1]);
 }
 
+/* Elementwise ops split large tensors into chunks across threads: forward values and
+ * gradients must be bit-identical for 1 and 4 threads (sizes cross several chunk edges). */
+enum { EW_N = 100003, EW_OPS = 21 };
+static void ew_run(int threads, float *out) {
+    nc_ctx *ctx = nc_init(&(nc_config){.seed = 7, .threads = threads});
+    nc_tensor *x = nc_parameter(ctx, nc_randn(ctx, 2.0f, 1, SHAPE(EW_N)), 1, SHAPE(EW_N));
+    nc_tensor *b = nc_parameter(ctx, nc_randn(ctx, 1.0f, 1, SHAPE(EW_N)), 1, SHAPE(EW_N));
+    nc_tensor *w = nc_randn(ctx, 1.0f, 1, SHAPE(EW_N));
+    nc_tensor *pos = nc_add_scalar(nc_sigmoid(x), 0.25f);
+    nc_tensor *ys[EW_OPS] = {
+        nc_neg(x), nc_exp(x), nc_log(pos), nc_sqrt(pos), nc_relu(x), nc_sigmoid(x), nc_tanh(x),
+        nc_scale(x, 0.3f), nc_add_scalar(x, 2.0f), nc_pow_scalar(pos, 1.5f), nc_leaky_relu(x, 0.1f), nc_relu6(x),
+        nc_hardsigmoid(x), nc_hardswish(x), nc_silu(x), nc_gelu(x, 0), nc_gelu(x, 1),
+        nc_add(x, b), nc_sub(x, b), nc_mul(x, b), nc_div(x, nc_add_scalar(nc_sigmoid(b), 0.5f))};
+    nc_tensor *loss = NULL;
+    for (int i = 0; i < EW_OPS; i++) {
+        memcpy(out + (size_t)i * EW_N, nc_data_f32(ys[i]), sizeof(float) * EW_N);
+        nc_tensor *term = nc_sum(nc_mul(ys[i], w), NC_ALL_AXES, 0);
+        loss = loss ? nc_add(loss, term) : term;
+    }
+    CHECK(nc_backward(loss) == NC_OK);
+    memcpy(out + (size_t)EW_OPS * EW_N, nc_data_f32(nc_grad(x)), sizeof(float) * EW_N);
+    memcpy(out + (size_t)(EW_OPS + 1) * EW_N, nc_data_f32(nc_grad(b)), sizeof(float) * EW_N);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
+/* Conv (im2col/col2im by channel ranges, depthwise by planes) and pooling (by planes) */
+enum { CV_OUT = 4 * 8 * 40 * 40 + 4 * 16 * 40 * 40 * 2 + 4 * 16 * 20 * 20 * 2, CV_GRADS = 4 * 16 * 40 * 40 + 8 * 16 * 9 + 16 * 9 + 16 * 8 * 9 };
+static void conv_run(int threads, float *out) {
+    nc_ctx *ctx = nc_init(&(nc_config){.seed = 3, .threads = threads});
+    nc_tensor *x = nc_parameter(ctx, nc_randn(ctx, 1.0f, 4, SHAPE(4, 16, 40, 40)), 4, SHAPE(4, 16, 40, 40));
+    nc_tensor *w = nc_parameter(ctx, nc_randn(ctx, 0.2f, 4, SHAPE(8, 16, 3, 3)), 4, SHAPE(8, 16, 3, 3));
+    nc_tensor *wd = nc_parameter(ctx, nc_randn(ctx, 0.2f, 4, SHAPE(16, 1, 3, 3)), 4, SHAPE(16, 1, 3, 3));
+    nc_tensor *wg = nc_parameter(ctx, nc_randn(ctx, 0.2f, 4, SHAPE(16, 8, 3, 3)), 4, SHAPE(16, 8, 3, 3));
+    nc_tensor *ys[5] = {nc_conv2d(x, w, NULL, 1, 1, 1, 1), nc_conv2d_ex(x, wd, NULL, 1, 1, 1, 1, 1, 1, 16),
+                        nc_conv2d_ex(x, wg, NULL, 1, 1, 1, 1, 1, 1, 2), nc_max_pool2d(x, 2, 2, 2, 2, 0, 0),
+                        nc_avg_pool2d(x, 3, 3, 2, 2, 1, 1)};
+    nc_tensor *loss = NULL;
+    size_t at = 0;
+    for (int i = 0; i < 5; i++) {
+        int64_t n = nc_numel(ys[i]);
+        memcpy(out + at, nc_data_f32(ys[i]), sizeof(float) * (size_t)n);
+        at += (size_t)n;
+        nc_tensor *term = nc_sum(nc_mul(ys[i], nc_randn(ctx, 1.0f, 4, nc_shape(ys[i]))), NC_ALL_AXES, 0);
+        loss = loss ? nc_add(loss, term) : term;
+    }
+    CHECK(at == CV_OUT);
+    CHECK(nc_backward(loss) == NC_OK);
+    nc_tensor *ps[4] = {x, w, wd, wg};
+    for (int i = 0; i < 4; i++) {
+        int64_t n = nc_numel(ps[i]);
+        memcpy(out + at, nc_data_f32(nc_grad(ps[i])), sizeof(float) * (size_t)n);
+        at += (size_t)n;
+    }
+    CHECK(at == CV_OUT + CV_GRADS);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
+static void test_threads_elementwise(void) {
+    {
+        size_t n = CV_OUT + CV_GRADS;
+        float *r1 = (float *)malloc(sizeof(float) * n), *r4 = (float *)malloc(sizeof(float) * n);
+        conv_run(1, r1);
+        conv_run(4, r4);
+        CHECK(memcmp(r1, r4, sizeof(float) * n) == 0);
+        free(r1);
+        free(r4);
+    }
+    size_t n = (size_t)(EW_OPS + 2) * EW_N;
+    float *r1 = (float *)malloc(sizeof(float) * n), *r4 = (float *)malloc(sizeof(float) * n);
+    ew_run(1, r1);
+    ew_run(4, r4);
+    CHECK(memcmp(r1, r4, sizeof(float) * n) == 0);
+    free(r1);
+    free(r4);
+}
+
 static void test_arena_trim(void) {
     nc_ctx *ctx = new_ctx();
     nc_randn(ctx, 1.0f, 2, SHAPE(1024, 1024)); /* 4 MiB: forces extra chunks */
@@ -1327,6 +1406,7 @@ int main(void) {
         {"int8", test_int8},
         {"save_load", test_save_load},
         {"threads", test_threads},
+        {"threads_elementwise", test_threads_elementwise},
         {"arena_trim", test_arena_trim},
         {"optim_extras", test_optim_extras},
         {"registry", test_registry},
