@@ -37,8 +37,8 @@ extern "C" {
 #endif
 
 #define NC_VERSION_MAJOR 0
-#define NC_VERSION_MINOR 3
-#define NC_VERSION_PATCH 1
+#define NC_VERSION_MINOR 4
+#define NC_VERSION_PATCH 0
 
 #define NC_MAX_DIMS 6
 #define NC_ALL_AXES (-128) /* reduce over every axis */

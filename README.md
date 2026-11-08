@@ -1,5 +1,7 @@
 # newch
 
+**사용법 안내: <https://dandmadp.github.io/newch/>**
+
 저사양 기기에서도 **학습**까지 할 수 있는 작은 머신러닝 라이브러리입니다. 엔진은 C11이고, Python에서는
 PyTorch 스타일의 텐서·autograd·모듈을 쓰며, 짧은 학습 루프 `fit()`을 함께 제공합니다. Python 의존성은 없습니다
 (numpy가 있으면 사용합니다). 싱글보드 컴퓨터는 호환 대상 중 하나입니다.
@@ -184,8 +186,8 @@ nc_free_ctx(ctx);
 - **연산은 데이터로 기술:** 모든 연산이 `nc_op_def`(infer/view/forward/backward)로 등록되고 `nc__apply()`를 거칩니다
 - **커널 디스패치:** 레퍼런스 테이블에서 시작해 CPU가 지원하는 계층(NEON, AVX2)이 항목별로 덮어씁니다.
   `test_kernel_parity`가 모든 계층을 레퍼런스와 비교합니다
-- **스레드:** 큰 GEMM만 행 또는 열 단위로 나눠 병렬 실행합니다. 출력 원소 하나는 스레드 하나가 계산하므로 결과가 스레드 수와
-  무관하게 비트 단위로 같습니다
+- **스레드:** 큰 GEMM(행·열 타일 단위), 원소별 연산(16원소 정렬 청크), 합성곱 변환과 풀링(채널·평면 단위)을 나눠 병렬
+  실행합니다. 출력 원소 하나는 스레드 하나가 계산하므로 결과가 스레드 수와 무관하게 비트 단위로 같습니다
 
 ## 디렉터리
 
@@ -201,6 +203,7 @@ newch/                     Python 패키지 (tensor, net/{functional,init}, opti
 tests/                     Python 테스트
 examples/                  train_spiral.c, mnist_cnn.py (Keras식), mnist_torch_style.py (PyTorch식)
 docs/                      PROGRESS.md (작업 요약), FORMAT.md (가중치 파일 포맷)
+guide/, mkdocs.yml         사용법 안내 사이트 (GitHub Pages, 예제는 tools/check_docs.py가 실행해 검사)
 tools/build.py             zig cc 기반 멀티 타깃 빌드
-.github/workflows/ci.yml   CI (Windows/Linux/macOS, QEMU ARM·RISC-V, 휠)
+.github/workflows/         ci.yml (Windows/Linux/macOS, QEMU ARM·RISC-V, 휠), docs.yml (안내 사이트 검사·배포)
 ```

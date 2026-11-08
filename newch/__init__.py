@@ -22,7 +22,7 @@ from .tensor import (Context, NcError, Tensor, argmax, cat, default_context, exp
                      randn, release, save_tensors, set_default_context, sigmoid, sqrt, stack, step_end, tanh, tensor,
                      uint8, zeros)
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 __all__ = [
     "Context", "Model", "Module", "NcError", "Sequential", "Tensor", "argmax", "callbacks", "cat", "data",

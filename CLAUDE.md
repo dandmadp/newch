@@ -71,7 +71,7 @@ filtered pipeline once hid a failing test that then got pushed.
 
 - PyPI has `newch` 0.3.0 (uploaded by the user). Released versions can never be re-uploaded: any fix ships as a new
   version (bump all three version locations). The user runs `twine upload` themselves (`docs/PUBLISHING.md`).
-- 0.3.1 (branch `torch-style-models`, not pushed yet): PyTorch-style model code (`newch.net` package with
+- 0.4.0 (branch `torch-style-models`; 0.3.1 was never released and is folded into 0.4.0): PyTorch-style model code (`newch.net` package with
   `functional`/`init`), new ops (nll_loss, compare, cat, to_dtype, i32 sum), backward memory release (-48% reserved), inference memory
   release, optimizer/scheduler `state_dict` with nested `save_tensors` checkpoints, `uint8` data dtype,
   transformer blocks (batched matmul, layer_norm, masked_fill, SDPA, MultiheadAttention, TransformerEncoder),
@@ -79,6 +79,9 @@ filtered pipeline once hid a failing test that then got pushed.
   int->float promotion, grouped/depthwise/dilated conv, threaded elementwise/im2col/pooling, RNN/LSTM/GRU,
   lower Python call overhead, and the dedupe cleanup listed at the top of `docs/PROGRESS.md` (torch style is the
   base; Keras reduced to `fit()`; `newch.ml` removed; NN functions only in `F`; one save path).
+- User guide site: `guide/*.md` + `mkdocs.yml`, published to https://dandmadp.github.io/newch/ by
+  `.github/workflows/docs.yml` on pushes to main. Its ```python examples run in CI (`tools/check_docs.py`);
+  update the guide and `guide/changelog.md` with API changes.
 - API surface is frozen at this level: do not add more library-mirroring APIs without discussing it first.
 - Decided (2026-11-06): stage-3 scope grows, but GPU backends and large-model-only features (f16/bf16, KV cache,
   LLM-scale) go to an optional module in this repo (`engine/src/ext/` -> separate `nc_ext` library, Python
