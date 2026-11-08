@@ -48,6 +48,9 @@ class Optimizer:
         self._p = factory(self._ctx._p, L.ptr_array(p.ptr for p in params), len(params), self._opts(self._hyper))
         if not self._p:
             self._ctx.raise_error()
+        # the C constructors read 0 as "default" (beta1 0 -> 0.9, eps 0 -> 1e-8, alpha 0 -> 0.99);
+        # torch takes 0 literally, so set the exact values
+        lib.nc_optim_set_opts(self._p, self._opts(self._hyper))
         self.gradient_accumulation_steps = gradient_accumulation_steps
         if gradient_accumulation_steps is not None:
             if int(gradient_accumulation_steps) < 1:

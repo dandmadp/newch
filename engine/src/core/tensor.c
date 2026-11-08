@@ -98,11 +98,21 @@ static int check_shape(nc_ctx *ctx, int ndim, const int64_t *shape) {
         nc__error(ctx, NC_ERR_SHAPE, "ndim %d out of range [0, %d]", ndim, NC_MAX_DIMS);
         return 0;
     }
+    /* the element count times the largest dtype size must fit in int64 / size_t: a product that
+     * wrapped around would allocate a tiny buffer for a huge shape */
+    const int64_t limit = INT64_MAX / 8;
+    int64_t n = 1;
     for (int i = 0; i < ndim; i++) {
         if (shape[i] < 0) {
             nc__error(ctx, NC_ERR_SHAPE, "negative dimension %lld", (long long)shape[i]);
             return 0;
         }
+        if (shape[i] && n > limit / shape[i]) {
+            char sb[160];
+            nc__error(ctx, NC_ERR_SHAPE, "shape %s has too many elements", nc__shape_str(ndim, shape, sb, sizeof sb));
+            return 0;
+        }
+        n *= shape[i];
     }
     return 1;
 }

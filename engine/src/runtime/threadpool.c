@@ -179,6 +179,31 @@ void nc__parallel_for(nc_ctx *ctx, int64_t n, int64_t grain, nc_range_fn fn, voi
     MUTEX_UNLOCK(&p->mu);
 }
 
+/* Elementwise loops: chunks start at multiples of NC_EW_BLOCK elements, so each element sits at
+ * the same offset from a vector boundary for any thread count and only the global end can be a
+ * scalar tail. SIMD bodies and scalar tails may round differently (FMA vs mul + add), so this is
+ * what keeps elementwise results bit-identical across thread counts. */
+enum { NC_EW_BLOCK = 16 };
+
+typedef struct {
+    nc_range_fn fn;
+    void *arg;
+    int64_t n;
+} ew_job;
+
+static void ew_blocks(void *arg, int64_t b, int64_t e) {
+    const ew_job *j = (const ew_job *)arg;
+    int64_t lo = b * NC_EW_BLOCK, hi = e * NC_EW_BLOCK < j->n ? e * NC_EW_BLOCK : j->n;
+    j->fn(j->arg, lo, hi);
+}
+
+void nc__parallel_for_elems(nc_ctx *ctx, int64_t n, int64_t grain, nc_range_fn fn, void *arg) {
+    if (n <= 0) return;
+    ew_job j = {fn, arg, n};
+    int64_t g = grain / NC_EW_BLOCK;
+    nc__parallel_for(ctx, (n + NC_EW_BLOCK - 1) / NC_EW_BLOCK, g < 1 ? 1 : g, ew_blocks, &j);
+}
+
 /* ------------------------------------------------------------------------ */
 /* Parallel GEMM: split rows of C (or columns when M is small).             */
 /* ------------------------------------------------------------------------ */

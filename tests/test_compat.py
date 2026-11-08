@@ -542,3 +542,25 @@ class TestContextLifetime(unittest.TestCase):
         del t
         gc.collect()
         self.assertEqual(closed, [True])
+
+
+class TestReviewFixes(Base):
+    def test_shape_overflow_is_an_error(self):
+        """Element counts that overflow int64 once wrapped to a tiny buffer for a huge shape (crash)."""
+        for shape in ((2 ** 33, 2 ** 31), (3, 2 ** 62), (2 ** 32, 2 ** 32, 3)):
+            with self.assertRaises(torch.NcError):
+                torch.zeros(*shape)
+        self.assertEqual(torch.zeros(0, 2 ** 40).shape, (0, 2 ** 40))
+
+    def test_zero_hyperparameters_are_literal(self):
+        """The C constructors read 0 as "use the default"; torch takes betas=(0, ...), alpha=0 literally."""
+        w = torch.parameter(torch.tensor([1.0]))
+        opt = torch.optim.Adam([w], betas=(0.0, 0.999), lr=0.1)
+        (w * 2.0).sum().backward()
+        opt.step()
+        self.assertEqual(opt.state_dict()["state"][0]["exp_avg"].tolist(), [2.0])
+        w2 = torch.parameter(torch.tensor([1.0]))
+        opt2 = torch.optim.RMSprop([w2], alpha=0.0, lr=0.1)
+        (w2 * 2.0).sum().backward()
+        opt2.step()
+        self.assertEqual(opt2.state_dict()["state"][0]["square_avg"].tolist(), [4.0])

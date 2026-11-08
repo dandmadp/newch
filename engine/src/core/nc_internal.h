@@ -206,6 +206,9 @@ void nc__detect_cpu(nc_cpu_info *info);
 typedef void (*nc_range_fn)(void *arg, int64_t begin, int64_t end);
 void nc__parallel_for(nc_ctx *ctx, int64_t n, int64_t grain, nc_range_fn fn, void *arg);
 void nc__pool_destroy(struct nc_pool *pool);
+/* parallel_for over n elements with chunk edges at multiples of 16 elements (SIMD-width aligned),
+ * for elementwise kernels whose vector body and scalar tail may round differently */
+void nc__parallel_for_elems(nc_ctx *ctx, int64_t n, int64_t grain, nc_range_fn fn, void *arg);
 
 /* GEMM entry point for ops: same contract as nc_kernels.gemm_f32, split
  * across threads when the problem is large enough. Results do not depend on

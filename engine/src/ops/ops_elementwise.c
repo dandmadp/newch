@@ -113,7 +113,7 @@ static nc_status binary_fwd(nc_node *n) {
         void (*f)(int64_t, const float *, const float *, float *) =
             kind == BIN_ADD ? k->add_f32 : kind == BIN_SUB ? k->sub_f32 : kind == BIN_MUL ? k->mul_f32 : k->div_f32;
         bin_job j = {f, (const float *)a->data, (const float *)b->data, (float *)o->data};
-        nc__parallel_for(o->ctx, nc_numel(o), NC_EW_GRAIN, bin_fwd_range, &j);
+        nc__parallel_for_elems(o->ctx, nc_numel(o), NC_EW_GRAIN, bin_fwd_range, &j);
         return NC_OK;
     }
     int64_t st[3][NC_MAX_DIMS];
@@ -149,7 +149,7 @@ static void binary_bwd(nc_node *n) {
             } else {
                 j = (flat_job){row_acc_div_b, 4, {g, (float *)a->data, (float *)b->data, (float *)gx->data}, NULL};
             }
-            nc__parallel_for(o->ctx, nc_numel(o), NC_EW_GRAIN, flat_range, &j);
+            nc__parallel_for_elems(o->ctx, nc_numel(o), NC_EW_GRAIN, flat_range, &j);
             continue;
         }
         int64_t st[4][NC_MAX_DIMS];
@@ -282,7 +282,7 @@ static nc_status unary_fwd(nc_node *n) {
     const float *x = nc__contig_f32(n->in[0]);
     if (!x) return NC_ERR_OOM;
     un_job j = {n->out->ctx->k, n->op->kind, n->p.f[0], x, NULL, NULL, (float *)n->out->data, NULL, NULL, NULL};
-    nc__parallel_for(n->out->ctx, nc_numel(n->out), NC_EW_GRAIN, unary_fwd_range, &j);
+    nc__parallel_for_elems(n->out->ctx, nc_numel(n->out), NC_EW_GRAIN, unary_fwd_range, &j);
     return NC_OK;
 }
 
@@ -361,7 +361,7 @@ static void unary_bwd(nc_node *n) {
     }
     un_job j = {in->ctx->k, kind, n->p.f[0], x, (const float *)n->out->data, (const float *)n->out->grad->data,
                 NULL, (float *)gt->data, tmp, tmp2};
-    nc__parallel_for(in->ctx, N, NC_EW_GRAIN, unary_bwd_range, &j);
+    nc__parallel_for_elems(in->ctx, N, NC_EW_GRAIN, unary_bwd_range, &j);
 }
 
 #define UNARY_OP(nm, KIND) \
