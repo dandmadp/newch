@@ -40,17 +40,18 @@ jobs:
       matrix:
         include:
           - target: aarch64-static
-            qemu: qemu-aarch64-static
+            qemu: qemu-aarch64
           - target: armv7-static
-            qemu: qemu-arm-static
+            qemu: qemu-arm
           - target: riscv64-static
-            qemu: qemu-riscv64-static
+            qemu: qemu-riscv64
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: sudo apt-get update && sudo apt-get install -y qemu-user-static
+      # qemu-user-static left the Ubuntu runner images (2026); qemu-user runs the static musl binaries too
+      - run: sudo apt-get update && sudo apt-get install -y qemu-user
       - run: pip install ziglang
       - run: python tools/build.py --target ${{ matrix.target }} --no-run
       - run: NC_DEBUG_POISON=1 ${{ matrix.qemu }} ./build/${{ matrix.target }}/nc_tests
