@@ -9,11 +9,11 @@ from ctypes import POINTER, Structure, c_char_p, c_float, c_int, c_int64, c_size
 from pathlib import Path
 
 ALL_AXES = -128
-F32, I32, I8 = 0, 1, 3
-DTYPE_NAMES = {F32: "float32", I32: "int32", I8: "int8"}
-DTYPE_CODES = {"float32": F32, "int32": I32, "int8": I8}
-DTYPE_SIZE = {"float32": 4, "int32": 4, "int8": 1}
-ARRAY_CODE = {"float32": "f", "int32": "i", "int8": "b"}
+F32, I32, I8, U8 = 0, 1, 3, 4
+DTYPE_NAMES = {F32: "float32", I32: "int32", I8: "int8", U8: "uint8"}
+DTYPE_CODES = {"float32": F32, "int32": I32, "int8": I8, "uint8": U8}
+DTYPE_SIZE = {"float32": 4, "int32": 4, "int8": 1, "uint8": 1}
+ARRAY_CODE = {"float32": "f", "int32": "i", "int8": "b", "uint8": "B"}
 
 
 class Config(Structure):
@@ -126,10 +126,15 @@ _SIGNATURES = {
     **{f"nc_{n}": (P, [P, c_float]) for n in ("scale", "add_scalar", "pow_scalar")},
     **{f"nc_{n}": (P, [P, c_int, c_int]) for n in ("sum", "mean", "max", "transpose")},
     "nc_argmax": (P, [P, c_int]),
+    "nc_nll_loss": (P, [P, P, c_int]),
+    "nc_compare": (P, [P, P, c_int]),
+    "nc_cat": (P, [c_int, POINTER(c_void_p), c_int]),
+    "nc_to_dtype": (P, [P, c_int]),
     **{f"nc_{n}": (P, [P]) for n in ("relu6", "hardsigmoid", "hardswish", "silu")},
     "nc_leaky_relu": (P, [P, c_float]),
     "nc_gelu": (P, [P, c_int]),
     "nc_conv2d": (P, [P, P, P, c_int, c_int, c_int, c_int]),
+    "nc_conv2d_ex": (P, [P, P, P, c_int, c_int, c_int, c_int, c_int, c_int, c_int]),
     "nc_max_pool2d": (P, [P, c_int, c_int, c_int, c_int, c_int, c_int]),
     "nc_avg_pool2d": (P, [P, c_int, c_int, c_int, c_int, c_int, c_int]),
     "nc_dropout": (P, [P, c_float]),
@@ -141,6 +146,8 @@ _SIGNATURES = {
     "nc_reshape": (P, [P, c_int, I64P]),
     # autograd
     "nc_backward": (c_int, [P]),
+    "nc_backward_ex": (c_int, [P, c_int, POINTER(c_void_p), c_int]),
+    "nc_release_temp": (None, [P]),
     "nc_zero_grad": (None, [P]),
     "nc_clear_grad": (None, [P]),
     # optimizers
@@ -153,7 +160,15 @@ _SIGNATURES = {
     "nc_optim_clear_grad": (None, [P]),
     "nc_rmsprop": (P, [P, POINTER(c_void_p), c_int, OptimOpts, c_int]),
     "nc_optim_step": (None, [P]),
+    "nc_optim_free": (None, [P]),
+    "nc_layer_norm": (P, [P, c_int, P, P, c_float]),
+    "nc_masked_fill": (P, [P, P, c_float]),
+    "nc_slice": (P, [P, c_int, c_int64, c_int64, c_int64]),
     "nc_optim_set_lr": (None, [P, c_float]),
+    "nc_optim_state": (c_void_p, [P, c_int, c_int]),
+    "nc_optim_get_step": (c_int64, [P]),
+    "nc_optim_set_step": (None, [P, c_int64]),
+    "nc_optim_set_opts": (None, [P, OptimOpts]),
 }
 
 for _name, (_res, _args) in _SIGNATURES.items():

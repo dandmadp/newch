@@ -1,0 +1,57 @@
+site_name: newch
+site_description: 저사양 기기에서도 학습까지 하는 작은 머신러닝 라이브러리 (PyTorch 스타일, C 엔진)
+site_url: https://dandmadp.github.io/newch/
+repo_url: https://github.com/dandmadp/newch
+repo_name: dandmadp/newch
+edit_uri: edit/main/guide/
+docs_dir: guide
+site_dir: build/site
+copyright: Apache-2.0
+
+theme:
+  name: material
+  language: ko
+  features:
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.highlight
+    - content.code.copy
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: teal
+      toggle:
+        icon: material/weather-night
+        name: 어두운 테마
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: teal
+      toggle:
+        icon: material/weather-sunny
+        name: 밝은 테마
+
+plugins:
+  - search:
+      lang: [ko, en]
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
+
+nav:
+  - 소개: index.md
+  - 시작하기: quickstart.md
+  - 사용법:
+      - 텐서: tensors.md
+      - 메모리 모델: memory.md
+      - 모델 만들기: models.md
+      - 학습: training.md
+      - 데이터: data.md
+      - 배포와 추론: deploy.md
+  - PyTorch와 다른 점: pytorch.md
+  - 변경 기록: changelog.md

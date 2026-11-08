@@ -1,10 +1,16 @@
-"""Keras-style training callbacks."""
+"""Callbacks for fit(): History, EarlyStopping, ModelCheckpoint, LambdaCallback.
+
+Learning-rate changes go through nc.optim.lr_scheduler; step a scheduler from
+a LambdaCallback, e.g. ``LambdaCallback(on_epoch_end=lambda e, logs: sched.step(logs["val_loss"]))``.
+"""
 
 from __future__ import annotations
 
-import ctypes
 import math
 import warnings
+
+
+__all__ = ["Callback", "EarlyStopping", "History", "LambdaCallback", "ModelCheckpoint"]
 
 
 class Callback:
@@ -50,22 +56,16 @@ def _value(cb, logs: dict):
     return value
 
 
-def _optimizer(model):
-    opt = getattr(model, "optimizer", None)
-    if opt is None:
-        raise RuntimeError(f"{type(model).__name__} has no optimizer yet; compile() it first")
-    return opt
-
-
 def _weights(model) -> list:
-    return [p._flat() for p in model.parameters()]
+    """Copies of every parameter and buffer (BatchNorm running stats too, as Keras restores
+    non-trainable weights): restoring only the parameters would pair the best weights with
+    the last epoch's normalization statistics."""
+    return [t._flat() for t in model.state_dict().values()]
 
 
 def _set_weights(model, saved: list) -> None:
-    from ._lib import lib
-
-    for p, buf in zip(model.parameters(), saved):
-        ctypes.memmove(lib.nc_data_f32(p.ptr), buf.buffer_info()[0], len(buf) * buf.itemsize)
+    for t, buf in zip(model.state_dict().values(), saved):
+        t.copy_(buf)
 
 
 class EarlyStopping(Callback):
@@ -144,69 +144,12 @@ class LambdaCallback(Callback):
     def on_train_end(self, logs): self._call("train_end", logs)
 
 
-class LearningRateScheduler(Callback):
-    """Before each epoch, sets the learning rate to ``schedule(epoch, current_lr)``."""
-
-    def __init__(self, schedule, verbose: int = 0):
-        self.schedule, self.verbose = schedule, verbose
-
-    def on_epoch_begin(self, epoch, logs):
-        opt = _optimizer(self.model)
-        opt.lr = float(self.schedule(epoch, opt.lr))
-        if self.verbose:
-            print(f"epoch {epoch + 1}: lr = {opt.lr:.6g}")
-
-
-class ReduceLROnPlateau(Callback):
-    """Scales the learning rate by ``factor`` when ``monitor`` stalls for ``patience`` epochs.
-
-    After a reduction, ``cooldown`` epochs pass before the counter runs again; the rate never
-    goes below ``min_lr``.
-    """
-
-    def __init__(self, monitor: str = "val_loss", factor: float = 0.1, patience: int = 10, verbose: int = 0,
-                 mode: str = "auto", min_delta: float = 1e-4, cooldown: int = 0, min_lr: float = 0.0):
-        if not 0.0 < factor < 1.0:
-            raise ValueError(f"factor must be in (0, 1) so the rate goes down, got {factor}")
-        self.monitor, self.factor, self.patience, self.verbose = monitor, factor, patience, verbose
-        self.mode = _mode(monitor, mode)
-        self.min_delta, self.cooldown, self.min_lr = min_delta, cooldown, min_lr
-
-    def _better(self, a, b):
-        return a < b - self.min_delta if self.mode == "min" else a > b + self.min_delta
-
-    def on_train_begin(self, logs):
-        self.best = math.inf if self.mode == "min" else -math.inf
-        self.wait = 0
-        self.cooldown_counter = 0
-
-    def on_epoch_end(self, epoch, logs):
-        current = _value(self, logs)
-        if current is None:
-            return
-        if self.cooldown_counter > 0:
-            self.cooldown_counter -= 1
-            self.wait = 0
-        if self._better(current, self.best):
-            self.best, self.wait = current, 0
-        elif self.cooldown_counter <= 0:
-            self.wait += 1
-            if self.wait >= self.patience:
-                opt = _optimizer(self.model)
-                if opt.lr > self.min_lr:
-                    opt.lr = max(opt.lr * self.factor, self.min_lr)
-                    if self.verbose:
-                        print(f"epoch {epoch + 1}: {self.monitor} stalled, lr -> {opt.lr:.6g}")
-                    self.cooldown_counter = self.cooldown
-                    self.wait = 0
-
-
 class ModelCheckpoint(Callback):
     """Writes the weights (NCW1 file) after every epoch, or only when ``monitor`` improves.
 
     ``filepath`` may use ``{epoch}`` and any log name, e.g. ``"w-{epoch:02d}-{val_loss:.3f}.ncw"``.
     Only weights can be saved, so pass ``save_weights_only=True``; rebuild the model in code and
-    call ``load_weights()`` to restore it.
+    restore with ``model.load_state_dict(nc.load_tensors(path))``.
     """
 
     def __init__(self, filepath, monitor: str = "val_loss", verbose: int = 0, save_best_only: bool = False,
@@ -235,7 +178,9 @@ class ModelCheckpoint(Callback):
             if not (current < self.best if self.mode == "min" else current > self.best):
                 return
             self.best = current
+        from .tensor import save_tensors
+
         path = self.filepath.format(epoch=epoch + 1, **logs)
-        self.model.save_weights(path)
+        save_tensors(self.model.state_dict(), path)
         if self.verbose:
             print(f"epoch {epoch + 1}: weights -> {path}")

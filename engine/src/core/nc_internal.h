@@ -23,7 +23,10 @@ enum {
     /* grad buffer is kept for reuse but counts as absent (nc_clear_grad):
      * nc_grad() returns NULL and optimizers skip the tensor until backward
      * writes a fresh gradient into it */
-    NC_TF_GRAD_CLEARED = 1u << 3
+    NC_TF_GRAD_CLEARED = 1u << 3,
+    /* a recorded node uses this data (as input or output): backward needs it,
+     * so nc_release_temp leaves it alone. Set on the data owner. */
+    NC_TF_ON_TAPE = 1u << 4
 };
 
 typedef struct nc_node nc_node;
@@ -38,6 +41,7 @@ struct nc_tensor {
     void *data;                  /* points at logical element 0 */
     nc_tensor *grad;             /* contiguous, same logical shape */
     nc_node *node;               /* op that produced this tensor (NULL = leaf) */
+    nc_tensor *owner;            /* views: the tensor whose data this aliases (NULL = owns it) */
     const char *name;
 };
 
@@ -82,6 +86,7 @@ struct nc_node {
     void *saved; /* op-private data, arena-allocated */
     nc_node *prev; /* tape: previously recorded node */
     uint32_t mark;
+    int released; /* backward freed this node's output data: it cannot run again */
 };
 
 /* Every op, in one list. Used to declare op defs and build the registry. */
@@ -96,7 +101,8 @@ struct nc_node {
     X(reshape) X(transpose) X(contiguous) X(detach) X(index_select)            \
     X(log_softmax) X(softmax) X(cross_entropy)                                 \
     X(conv2d) X(max_pool2d) X(avg_pool2d) X(dropout) X(batch_norm)             \
-    X(linear_int8)
+    X(linear_int8) X(nll_loss) X(compare) X(cat) X(to_dtype)                   \
+    X(bmm) X(layer_norm) X(masked_fill) X(slice)
 
 #define NC_DECLARE_OP(name) extern const nc_op_def nc_op_##name;
 NC_OP_LIST(NC_DECLARE_OP)
@@ -139,6 +145,25 @@ struct nc_ctx {
     int persistent_depth;
     int grad_enabled;
     nc_node *tape;
+
+    /* Step-arena reuse within a step: blocks freed during backward go on this
+     * list and are handed out again (best fit) before bumping. */
+    struct nc_free_blk *free_list;
+    /* Large step allocations (>= chunk_bytes / 4) live in their own blocks so
+     * that freeing one makes it reusable whole; freed and step-ended blocks
+     * wait in a size-keyed cache (counted as reserved) until reused or trimmed. */
+    struct nc_large *large_live;
+    struct nc_large *large_cache;
+    size_t large_live_bytes, large_cache_bytes;
+    /* cap on live + cached large bytes: the largest live total seen in this
+     * or the previous step, so reserved memory follows the real peak */
+    size_t large_peak, large_prev_peak;
+    /* Backward temporaries of the node being processed (freed after it). */
+    void *bwd_tmp[64];
+    size_t bwd_tmp_size[64];
+    int bwd_tmp_n;
+    int bwd_logging; /* 1 while a node's backward runs */
+    int grad_alloc;  /* 1 while allocating a gradient buffer (not a temporary) */
     uint32_t mark_epoch;
 
     nc_status status;
@@ -157,6 +182,9 @@ struct nc_ctx {
 };
 
 void *nc__arena_alloc(nc_ctx *ctx, size_t bytes);
+/* Returns a step-arena block for reuse within the step. `bytes` must be the
+ * size it was allocated with. */
+void nc__arena_free(nc_ctx *ctx, void *p, size_t bytes);
 void *nc__persistent_alloc(nc_ctx *ctx, size_t bytes);
 void nc__persistent_free(nc_ctx *ctx, void *p);
 /* Allocates in the arena or persistently, following ctx->persistent_depth. */
@@ -178,6 +206,9 @@ void nc__detect_cpu(nc_cpu_info *info);
 typedef void (*nc_range_fn)(void *arg, int64_t begin, int64_t end);
 void nc__parallel_for(nc_ctx *ctx, int64_t n, int64_t grain, nc_range_fn fn, void *arg);
 void nc__pool_destroy(struct nc_pool *pool);
+/* parallel_for over n elements with chunk edges at multiples of 16 elements (SIMD-width aligned),
+ * for elementwise kernels whose vector body and scalar tail may round differently */
+void nc__parallel_for_elems(nc_ctx *ctx, int64_t n, int64_t grain, nc_range_fn fn, void *arg);
 
 /* GEMM entry point for ops: same contract as nc_kernels.gemm_f32, split
  * across threads when the problem is large enough. Results do not depend on

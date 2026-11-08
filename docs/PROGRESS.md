@@ -1,6 +1,28 @@
 # newch 작업 요약
 
-> 기준일: 2026-11-02 · 버전 0.3.0 (PyPI에는 0.2.0까지 공개, 0.3.0은 업로드 전) · C 엔진 약 4,900줄, Python 패키지 약 3,200줄, 테스트 약 1,800줄
+> 기준일: 2026-11-08 · 버전 0.4.0 (PyPI에는 0.3.0까지 공개; 0.3.1은 공개하지 않고 0.4.0에 포함) · C 엔진 약 6,500줄, Python 패키지 약 4,300줄, 테스트 약 4,000줄 · 사용법 안내: https://dandmadp.github.io/newch/
+
+## 0.3.1 정리: 한 가지 일에 한 가지 방법
+
+0.3.0까지 torch·Keras·scikit-learn·numpy의 API를 함께 따라 하면서 같은 일을 하는 길이 여러 개 생겼습니다.
+0.3.1은 **torch식을 기본**으로 두고, Keras는 `fit()` 학습 루프 하나로 줄였습니다. 공개 API를 지우는 변경이라
+0.3.0 코드는 아래처럼 바꿔야 합니다.
+
+| 0.3.0 | 0.3.1 |
+|---|---|
+| `nc.relu`, `nc.conv2d`, `nc.cross_entropy` 등 신경망 함수 18개 (`F`와 중복) | `import newch.net.functional as F` 후 `F.relu` 등. `nc.*`에는 텐서·수학(`exp`, `sigmoid`, `tanh` 등)·형태 함수만 |
+| `compile("adam")` = Keras 기본값(eps 1e-7), `optim.Adam()` = torch 기본값 | 이름은 `nc.optim`의 같은 클래스를 그 기본값으로 만듦. compile 기본 optimizer는 `"adam"` |
+| `nc.optim._KerasRMSprop`, `Optimizer.learning_rate` | `nc.optim.RMSprop`, `Optimizer.lr` |
+| 콜백 `LearningRateScheduler`, `ReduceLROnPlateau` | `nc.optim.lr_scheduler.*` (새로 `ReduceLROnPlateau` 추가), fit에서는 `LambdaCallback`으로 step |
+| `model.save_weights(p)` / `model.load_weights(p)` | `nc.save_tensors(model.state_dict(), p)` / `model.load_state_dict(nc.load_tensors(p))` |
+| `compile(loss="mean_squared_error")` | `loss="mse"` |
+| `compile(loss_weights=...)` 인수 | 삭제 (원래 지원하지 않아 에러만 냈음) |
+| `newch.ml` (scikit-learn식 7종 + 지표) | 삭제. scikit-learn을 쓰고 `np.asarray(tensor)`로 주고받기 |
+| `nc.rand(..., low=a, high=b)`, `nc.randn(..., std=s)` | torch와 같은 `rand(*size)` / `randn(*size)`만. `nc.rand(...) * (b - a) + a`, `nc.randn(...) * s` |
+| `tensor.zero_grad()` | 삭제 (torch 텐서에 없음). `model.zero_grad()` / `optimizer.zero_grad()` |
+| `nc.optim.get(...)` | 내부 함수로 바꿈. `compile("adam")` 또는 `nc.optim.Adam(...)` |
+
+결과: Python 패키지 약 3,740줄 → 약 3,000줄, 최상위 공개 이름 60개 → 42개(이후 `uint8` 추가), 콜백 7개 → 5개.
 
 ## 1. 목표
 
@@ -12,8 +34,8 @@
 | 출처 | 가져온 것 | 버린 것 |
 |---|---|---|
 | PyTorch | 즉시 실행, 테이프 기반 autograd, `Module`, `state_dict`, `DataLoader` | 수천 개의 연산자, CUDA |
-| Keras | `compile` → `fit` 고수준 API, 콜백, `save_weights` | 멀티 백엔드 |
-| scikit-learn | `fit`/`predict`/`transform` 인터페이스, 전처리·선형 회귀·k-means·지표 (`newch.ml`) | 수백 개의 알고리즘 전부 |
+| Keras | `fit` 한 가지 학습 루프와 콜백 몇 개 (0.3.1부터 얇게 축소) | 멀티 백엔드, 콜백 체계 전체, 문자열 기본값 표 |
+| scikit-learn | (0.3.0의 `newch.ml`은 0.3.1에서 제거: 핵심 밖이고 순수 Python 구현이라 느림) | 전부 |
 | TensorFlow | 학습한 모델을 어디서나 실행 (가중치 파일, 정적 바이너리, int8) | 분산 학습, 서빙 |
 | XLA | 연산 융합, 정적 메모리 계획 *(예정, 훅만 준비)* | LLVM 코드 생성 |
 | numpy | `axis=` 별칭, `np.asarray(tensor)` 연동 | 전체 ndarray API |
@@ -27,15 +49,14 @@
 
 ```
 ┌──────────────────────────────────────────────────────────────┐
-│ L5 고수준     Keras식 Model.compile/fit/evaluate/predict, 콜백 │  ✅ Python
-│              DataLoader 스트리밍, save/load_weights, quantize_ │  ✅ Python
-│              sklearn식 newch.ml (전처리, 선형 회귀, k-means)  │  ✅ Python
+│ L5 고수준     Model.compile/fit/evaluate/predict, 콜백 4개      │  ✅ Python
+│              DataLoader 스트리밍, state_dict 저장, quantize_   │  ✅ Python
 ├──────────────────────────────────────────────────────────────┤
 │ L4 라이브러리  net(Linear, Conv2d, Pool, BatchNorm, Dropout,    │  ✅ C + Python
 │              Embedding, 활성화 10종), optim(SGD, Adam, AdamW, │
 │              그래디언트 누적, 클리핑), 학습률 스케줄러          │
 ├──────────────────────────────────────────────────────────────┤
-│ L3 즉시 실행   텐서, 연산 레지스트리(41개), autograd, gradcheck  │  ✅ C
+│ L3 즉시 실행   텐서, 연산 레지스트리(45개), autograd, gradcheck  │  ✅ C
 ├──────────────────────────────────────────────────────────────┤
 │ L2 컴파일러    추적 → IR → 융합, 메모리 계획                    │  ⏳ (ctx->trace 훅)
 ├──────────────────────────────────────────────────────────────┤
@@ -58,10 +79,9 @@ newch/
 │   ├── tensor.py             Tensor, Context, 생성·함수형 연산, 텐서 파일
 │   ├── net.py                Module, 레이어, Model, Sequential, 양자화
 │   ├── data.py               Dataset, TensorDataset, FileArray, DataLoader
-│   ├── ml.py                 scikit-learn식 전처리, 선형 회귀, k-means, 지표
 │   └── optim.py, training.py, callbacks.py
 ├── tests/                    Python 테스트 (test_python.py, test_features.py)
-├── examples/                 train_spiral.c, mnist_cnn.py
+├── examples/                 train_spiral.c, mnist_cnn.py (Keras식), mnist_torch_style.py (PyTorch식)
 ├── docs/                     PROGRESS.md, FORMAT.md
 ├── tools/build.py            zig cc 기반 멀티 타깃 빌드
 ├── pyproject.toml, setup.py  pip 설치 (빌드 시 zig로 엔진 컴파일)
@@ -74,12 +94,15 @@ newch/
 | 결정 | 이유 | 대가 |
 |---|---|---|
 | **엔진은 C11** | 어떤 CPU·OS에도 컴파일러가 있고, 런타임 의존성이 없습니다 | 메모리 관리를 직접 설계해야 합니다 |
-| **메모리 = 영구 풀 + 스텝 아레나** | 활성값은 아레나에 두고 `step_end()`로 O(1) 일괄 해제합니다. 학습 중 메모리가 스텝마다 일정합니다 | 스텝 안에서는 중간값을 해제하지 않으므로, 최대 메모리가 배치 크기에 비례합니다 |
+| **메모리 = 영구 풀 + 스텝 아레나** | 활성값은 아레나에 두고 `step_end()`로 O(1) 일괄 해제합니다. 학습 중 메모리가 스텝마다 일정합니다 | 최대 메모리가 배치 크기에 비례합니다 |
+| **역전파 중 해제** | 노드의 역전파가 끝나면 그 노드의 임시값, 출력 그래디언트, (아무도 쥐고 있지 않으면) 활성값을 아레나에 돌려주고 같은 스텝 안에서 재사용합니다. Python은 지금 참조 중인 텐서 목록을 넘겨서 그 텐서는 지키고, 해제된 그래프로 두 번째 역전파를 하면 에러가 납니다 (PyTorch의 `retain_graph`와 같음) | 중간 텐서의 `.grad`는 역전파 뒤 None (PyTorch와 같음). 블록 반환·재할당 때문에 스텝이 2~7% 느려집니다 |
+| **큰 블록은 따로, 캐시에 예산** | 256KB 이상 할당은 청크 밖의 개별 블록으로 두고, 해제·스텝 종료 시 크기별 캐시에 넣어 다음 스텝이 재사용합니다. 캐시는 "직전 스텝의 최대 사용량"을 넘지 않게 오래된 것부터 OS에 돌려줍니다 | 캐시가 없으면 매 스텝 OS 할당과 페이지 폴트가 생기고, 예산이 없으면 한 스텝에 쓰인 모든 크기의 합이 남습니다 |
+| **추론 중 해제** | 기록되지 않는 연산(no_grad 등)은 끝나자마자 자기 임시 버퍼와 저장값을 돌려주고, Python은 no_grad에서 만든 임시 텐서를 아무도 참조하지 않게 되면 `nc_release_temp`로 돌려줍니다. 테이프가 쓰는 데이터(뷰면 데이터 주인)는 `ON_TAPE` 표시로 지킵니다 | 학습 모드(그래디언트 켜짐)의 순전파는 그대로 역전파 끝까지 남습니다 |
 | **영구 텐서는 항상 데이터를 소유** (영구 모드에서는 뷰를 만들지 않음) | 영구 텐서 하나를 해제해도 다른 텐서가 망가지지 않으므로, Python이 GC 시점에 안전하게 해제할 수 있습니다 | 영구 모드의 reshape 등은 복사합니다 |
 | **에러 = 첫 에러 유지 + NULL 전파** | C에서도 순전파 전체를 마지막에 한 번만 확인하면 됩니다. 연산은 절대 abort하지 않습니다 | 첫 에러 이후의 연산은 모두 NULL이 됩니다 (`nc_clear_error`로 복구) |
 | **연산을 데이터로 기술** (`nc_op_def`) | 모든 연산이 `nc__apply()` 하나를 거치므로, 나중에 컴파일러가 같은 정보로 그래프를 분석할 수 있습니다 | 연산마다 정형화된 코드를 써야 합니다 |
 | **계층형 커널 디스패치** | 레퍼런스에서 시작해 CPU가 지원하는 계층(NEON, AVX2)이 항목별로 덮어씁니다. AVX2는 함수 단위 target 속성이라 기본 빌드는 모든 x86-64에서 돕니다 | 커널 테이블을 관리해야 합니다 |
-| **병렬화는 GEMM 단위** | 출력 원소 하나를 스레드 하나가 계산하므로 결과가 스레드 수와 무관하게 비트 단위로 같습니다. 작은 GEMM(약 200만 곱셈 미만)은 직렬로 실행합니다 | 원소별 연산은 아직 단일 스레드입니다 |
+| **병렬화는 GEMM 단위** | 출력 원소 하나를 스레드 하나가 계산하므로 결과가 스레드 수와 무관하게 비트 단위로 같습니다. 작은 GEMM(약 200만 곱셈 미만)은 직렬로 실행합니다 | 원소별 연산(단항 전부, 같은 모양의 이항 연산과 그 역전파), sum/mean 역전파, im2col/col2im(채널 단위), depthwise conv와 풀링(평면 단위)도 3만 원소 이상이면 같은 규칙으로 나눔. 브로드캐스트 역전파처럼 여러 원소가 한 곳에 누적되는 경우는 직렬 |
 | **합성곱 = im2col + GEMM, 역전파 때 im2col 재계산** | GEMM 최적화를 그대로 재사용합니다. 샘플별 열 버퍼를 저장하지 않아 메모리가 작습니다 | 역전파에서 im2col을 한 번 더 계산합니다 |
 | **Python은 ctypes만** | 저사양 기기에 빌드 도구나 무거운 의존성을 요구하지 않습니다 | 호출당 약 1µs 오버헤드 |
 | **스트리밍 데이터 = mmap 파일** (`FileArray`) | RAM보다 큰 데이터셋도 배치 하나만큼의 메모리로 학습합니다 | 데이터를 원시 이진 파일로 한 번 변환해야 합니다 |
@@ -88,32 +111,40 @@ newch/
 ## 4. 구현된 기능
 
 ### C 엔진
-- **텐서:** f32 / i32 / i8, 최대 6차원, stride 뷰, numpy식 브로드캐스팅
-- **연산 41개** (미분 가능한 연산은 전부 gradcheck 통과)
+- **텐서:** f32 / i32 / i8 / u8, 최대 6차원, stride 뷰, numpy식 브로드캐스팅
+- **연산 53개** (미분 가능한 연산은 전부 gradcheck 통과)
   - 원소별: `add sub mul div neg exp log sqrt relu sigmoid tanh scale add_scalar pow_scalar dropout`
   - 활성화: `leaky_relu relu6 hardsigmoid hardswish silu gelu gelu_tanh` (PyTorch 정의, 꺾이는 점의 그래디언트도 PyTorch 규칙)
-  - 선형대수: `matmul`(전치 뷰는 복사 없이 처리), `linear`(fused `x @ Wᵀ + b`)
-  - 합성곱·풀링: `conv2d`(stride, padding), `max_pool2d`, `avg_pool2d`
+  - 선형대수: `matmul`(전치 뷰는 복사 없이 처리), 배치 `bmm`(`[..., M, K] @ [..., K, N]`, 배치 차원 브로드캐스트, 작은 행렬은 배치 단위로 스레드에 나눔, 결과는 스레드 수와 무관), `linear`(fused `x @ Wᵀ + b`)
+  - 트랜스포머: `layer_norm`(마지막 k개 축, 편향 분산), `masked_fill`(정수 마스크 브로드캐스트, `-inf` 가능)
+  - 비교: `compare`(eq/ne/lt/le/gt/ge, 브로드캐스팅, f32·i32 혼합, 결과 i32 0/1), i32 `sum`(개수 세기)
+  - 결합·변환: `cat`(입력 6개까지, Python `cat`은 더 많으면 나눠 호출), `to_dtype`(f32↔i32↔i8, 정수로 바꾸면 그래디언트 끊김)
+  - 합성곱·풀링: `conv2d`(stride, padding, dilation, groups; depthwise는 im2col 없는 SIMD·멀티스레드 전용 커널), `max_pool2d`, `avg_pool2d`
   - 정규화: `batch_norm` (학습: 배치 통계 + 이동 평균 갱신, 평가: 이동 평균 사용)
   - 축소: `sum mean max argmax`
-  - shape: `reshape transpose contiguous detach index_select`
-  - NN: `log_softmax softmax cross_entropy`, 합성 `mse_loss`
+  - shape: `reshape transpose slice contiguous detach index_select` (`slice`와 `reshape`는 stride로 표현되면 항상 뷰: ATen의 computeStride와 같은 규칙)
+  - NN: `log_softmax softmax cross_entropy nll_loss`, 합성 `mse_loss`
   - 양자화(추론): `nc_quantize_rows`(행별 대칭 int8), `linear_int8`(동적 양자화, int32 누적)
 - **autograd:** 테이프 기반 역전파, 손실 여러 개, 그래디언트 누적, no-grad, detach
+- **벡터 exp의 특수값:** `exp(-inf) = 0`(attention 마스크), float 범위 밖은 0 / `inf`, NaN은 NaN, `ln(FLT_MAX)` 근처까지 정확 (전에는 −88 아래가 1e-38, 88.38~88.72가 `inf`, NaN이 1e-38로 나왔음)
 - **커널:** 레퍼런스(K/N 캐시 블로킹), ARM NEON(4×8 GEMM, 전치 GEMM), **x86 AVX2+FMA**(4×16 GEMM, 전치 GEMM, int8 GEMM, 원소별). AVX2·NEON 모두 **벡터 exp/sigmoid/tanh/erf**(다항식 근사, libm 대비 상대 오차 1.4e-7 이하, erf는 절대 오차 5e-7 이하)를 가지며 sigmoid, tanh, exp, SiLU, GELU, softmax, cross_entropy가 이를 씁니다
 - **스레드 풀:** Windows/POSIX, 원자적 청크 분배(코어 속도가 달라도 균형), 중첩 호출은 자동 직렬화
-- **메모리:** `nc_release`(개별 해제), `nc_arena_trim`(남는 아레나를 OS에 반환), 기본 청크 1MB, 통계
+- **메모리:** `nc_release`(개별 해제), `nc_arena_trim`(남는 아레나를 OS에 반환), 기본 청크 1MB, 통계. `nc_backward_ex`(역전파 중 해제, `NC_BACKWARD_FREE_GRAPH` / `NC_BACKWARD_RETAIN`). MNIST CNN 배치 64 한 스텝: 최대 사용 22.7 → 14.5MiB, **실제 예약 29.4 → 15.2MiB (−48%)**. `nc_release_temp`와 기록 안 되는 연산의 임시 버퍼 즉시 해제로 **평가(no_grad, 배치 256)가 스텝 안에서 쌓이지 않음**: 5번 순전파 최대 323 → 25MiB, `examples/mnist_cnn.py` 전체 최대 65 → 25MiB, 속도 차이 없음
 - **저장/불러오기:** `nc_save` / `nc_load` (NCW1 포맷, UTF-8 경로, 이름 순서 무관, shape/dtype 검사)
+- **옵티마이저 체크포인트:** `nc_optim_state`(상태 버퍼 읽기/쓰기), `nc_optim_get_step`/`set_step`, `nc_optim_set_opts`. `nc_optim_free`로 옵티마이저 상태(파라미터의 최대 2배)를 바로 반납합니다. 전에는 컨텍스트가 닫힐 때까지 남아서 `compile()`을 반복하거나 옵티마이저를 새로 만들 때마다 메모리가 쌓였습니다
+- **u8 dtype:** 데이터 저장용(이미지 픽셀, 작은 라벨). `to_dtype`으로 변환(범위 밖은 0~255로 포화), 비교·인덱싱·reshape·저장 지원. 산술 연산은 f32로 바꾼 뒤
 - **공개 심볼만 노출:** `-fvisibility=hidden` + `NC_API`, 릴리스 공유 라이브러리 strip
 
 ### Python 패키지
 - **PyTorch식:** `Tensor`(연산자, `@`, 인덱싱, `.backward()`, `.copy_()`), `net.Module`(파라미터·버퍼 자동 탐색, `state_dict`, `load_state_dict`), `Linear`, `Conv2d`, `MaxPool2d`, `AvgPool2d`, `BatchNorm1d/2d`, `Dropout`, `Embedding`, 활성화, `Flatten`, 함수형 API(`conv2d`, `batch_norm`, `dropout`, …), `optim.SGD/Adam`, `no_grad()`
-- **Keras식:** `Sequential`, `compile`, `fit`(배열 / DataLoader 스트리밍 / FileArray 자동 스트리밍), `evaluate`, `predict`, `summary()`, `save_weights`/`load_weights`, `History`, `EarlyStopping`, `LambdaCallback`
+- **PyTorch 모델 코드 그대로:** `import newch as torch`, `import newch.net as nn`, `import newch.net.functional as F`로 바꾸면 `class Net(nn.Module)` + `super().__init__()`, `F.relu`/`F.log_softmax`/`F.nll_loss`, `torch.flatten`/`cat`/`stack`, `view`/`view_as`/`unsqueeze`/`squeeze`/`permute`, `eq`와 비교 연산자, `.float()`/`.to(device)`, `nn.ModuleList`/`ModuleDict`/`Identity`, `nn.CrossEntropyLoss`/`NLLLoss`/`MSELoss`, `model.apply()`, `register_buffer`, `nn.init.*`를 쓰는 일반적인 학습 스크립트가 돕니다 (`examples/mnist_torch_style.py`: 1 에포크 14초, 테스트 97.8%)
+- **`fit` 학습 루프:** `Sequential`, `compile`, `fit`(배열 / DataLoader 스트리밍 / FileArray 자동 스트리밍), `evaluate`, `predict`, `summary()`, `History`, `EarlyStopping`, `LambdaCallback`
 - **데이터:** `Dataset`, `TensorDataset`, `DataLoader`(shuffle, drop_last, generator), `FileArray`(mmap, `create()`로 한 행씩 기록)
 - **양자화:** `nc.quantize_(model)` → 모든 `Linear`를 `QuantizedLinear`로 교체
 - **저메모리 학습:** `gradient_accumulation_steps=n`(모든 옵티마이저, Keras 3과 같은 의미)으로 배치 B의 활성값 메모리로 배치 n·B처럼 학습합니다. `AdamW`, `net.utils.clip_grad_norm_`
-- **학습률·체크포인트:** `optim.lr_scheduler`(StepLR, ExponentialLR, CosineAnnealingLR, LambdaLR), 콜백 `LearningRateScheduler`, `ReduceLROnPlateau`, `ModelCheckpoint`(가중치만)
-- **고전 ML (`newch.ml`):** `StandardScaler`, `MinMaxScaler`, `train_test_split`, `LinearRegression`, `Ridge`, `KMeans`(k-means++), `accuracy_score`, `mean_squared_error`, `r2_score`. XᵀX·거리 계산은 엔진 GEMM으로, 호출마다 별도 컨텍스트를 써서 사용자의 스텝 아레나를 건드리지 않습니다
+- **학습률·체크포인트:** `optim.lr_scheduler`(StepLR, ExponentialLR, CosineAnnealingLR, LambdaLR), `ReduceLROnPlateau`(스케줄러), 콜백 `ModelCheckpoint`(가중치만). fit에서는 `LambdaCallback`으로 스케줄러를 step
+- **학습 재개:** `Optimizer.state_dict()`/`load_state_dict()`(PyTorch와 같은 구조, numpy로 바꾼 torch 상태도 읽음), 스케줄러 `state_dict()`. `nc.save_tensors`가 `{"model": ..., "optimizer": ..., "epoch": n}` 같은 중첩 체크포인트를 파일 하나에 저장. 재개한 학습은 끊지 않은 학습과 비트 단위로 같습니다 (SGD·Adam·AdamW·RMSprop 테스트). `examples/mnist_torch_style.py --resume`
+- **uint8 데이터:** `nc.uint8`. numpy uint8/int8 배열과 `array('B')`는 1바이트 그대로 텐서·`TensorDataset`·`FileArray`가 됩니다. MNIST를 uint8로 두면 디스크와 메모리가 188MB → 47MB. `cross_entropy`/`nll_loss`는 uint8 라벨을 받습니다
 - **numpy 연동:** `np.asarray(tensor)` (`__array__`, 항상 복사)
 - **메모리 안전:** 해제된 임시 텐서 접근 시 `NcError`. 영구 텐서는 마지막 참조가 사라지면 자동 해제되고, 뷰와 grad는 원본을 살려 둡니다
 - **설치:** `pip install .` → `py3-none-<플랫폼>` 휠 (Python 버전 무관)
@@ -121,7 +152,7 @@ newch/
 ## 5. 이름 규칙
 
 **원칙: 이름이 같으면 동작도 같아야 합니다.** 고치는 비용이 작으면 동작을 원본과 똑같이 맞추고, 의미가 원래 다르면 비슷하지만 다른 이름을 씁니다.
-지원하지 않는 경우(`padding="same"`, `dim≠0`인 `index_select` 등)는 **조용히 다르게 동작하지 않고 에러를 냅니다.**
+지원하지 않는 경우(`padding_mode="reflect"`, `dim≠0`인 `index_select` 등)는 **조용히 다르게 동작하지 않고 에러를 냅니다.**
 
 **인수 규칙:**
 - 위치 인수의 순서와 기본값은 원본과 같습니다. 그래서 `fit(x, y, 32, 10)`이나 `SGD(p, 0.1, 0.9, 0, 1e-4)`처럼 위치로 넘겨도 원본과 같은 뜻이 됩니다.
@@ -133,52 +164,70 @@ newch/
 | API | 원본 | 비고 |
 |---|---|---|
 | `net.Linear` | torch | weight `[out, in]`, `y = x @ Wᵀ + b`, 같은 초기화. `ctx`는 키워드 전용 |
-| `net.Conv2d`, `MaxPool2d`, `AvgPool2d` (+ 함수형) | torch | NCHW, 같은 초기화, torch와 같은 인수 순서. `dilation≠1`, `groups≠1`, `padding_mode≠"zeros"`, `ceil_mode`, `return_indices`, `count_include_pad=False`, `divisor_override`는 에러 |
+| `net.Conv2d`, `MaxPool2d`, `AvgPool2d` (+ 함수형) | torch | NCHW 또는 배치 없는 CHW, 같은 초기화(fan_in = C/groups·KH·KW), torch와 같은 인수 순서. Conv는 `dilation`, `groups`(depthwise = groups=C=OC는 im2col 없는 전용 커널), `padding="same"`/`"valid"`. `padding="same"`에 짝수 (dilated) 커널(torch는 한쪽을 더 채움), 풀링의 `dilation≠1`, `padding_mode≠"zeros"`, `ceil_mode`, `return_indices`, `count_include_pad=False`, `divisor_override`는 에러 |
 | `net.BatchNorm1d/2d` | torch | 버퍼 이름 `running_mean`, `running_var`, `num_batches_tracked`, 이동 분산은 불편 추정. `momentum=None`은 누적 평균. `track_running_stats=False`는 에러 |
 | `net.Dropout`, `nc.dropout` | torch | 역드롭아웃, eval 모드에서는 항등. `inplace=True`는 에러 |
 | `net.LeakyReLU`, `ReLU6`, `Hardsigmoid`, `Hardswish`, `SiLU`, `GELU(approximate)` + 함수형 `nc.leaky_relu` 등 | torch | 같은 정의와 인수. `inplace=True`는 에러 |
-| `net.Embedding` | torch | weight ~ N(0, 1). `padding_idx`, `max_norm`은 에러 |
+| `net.Embedding` | torch | weight ~ N(0, 1), 인덱스는 어떤 모양이든 `[*]` → `[*, dim]`. `padding_idx`, `max_norm`은 에러 |
 | `Module.zero_grad(set_to_none=True)`, `Optimizer.zero_grad(set_to_none=True)` | torch | 기본값은 grad를 None으로 (버퍼는 재사용해서 매 스텝 할당 없음). 옵티마이저는 grad가 None인 파라미터를 건너뜀 |
-| `cross_entropy(input, target, ..., reduction, label_smoothing)` | torch | `reduction`은 "mean"/"sum", `weight`, `ignore_index≠-100`, `reduction="none"`은 에러 |
+| `cross_entropy(input, target, ..., reduction, label_smoothing)` | torch | 입력 `[N, C]`, `[C]`, `[N, C, d1, ...]`, 타깃은 클래스 번호 또는 같은 모양의 float 확률 (`nll_loss`도 같은 모양 규칙). `reduction`은 "mean"/"sum", `weight`, `ignore_index≠-100`, `reduction="none"`은 에러 |
 | `mse_loss(input, target, reduction)` | torch | "mean"/"sum"/"none" |
 | `full(size, fill_value, *, dtype)`, `ones(*size, dtype)`, `zeros` | torch | dtype을 생략하면 값에서 정함 (정수 → int32) |
+| `rand(*size, dtype, requires_grad)`, `randn(*size, dtype, requires_grad)` | torch | U[0, 1), N(0, 1). float32만 (그 밖의 dtype은 에러). `generator`, `out`, `device` 인수 없음 |
+| `tensor`, `zeros`, `ones`, `full`, `rand`, `randn`의 `device=`·`requires_grad=`, `Tensor.device` | torch | device는 CPU만(`"cpu"`, `x.device`; 그 밖은 에러). `x.device`는 `"cpu"`와 같고 `.type`/`.index`가 있는 문자열 |
 | `state_dict`, `load_state_dict(strict)` | torch | 같은 키 규칙. torch `state_dict`를 numpy로 바꾸면 그대로 불러옵니다 |
-| `save_weights`, `load_weights` | Keras | 가중치만 저장 |
-| `Dataset`, `TensorDataset`, `DataLoader` | torch | 같은 인수 순서와 기본값, `collate_fn` 지원. `sampler`, `batch_sampler`, `num_workers≠0`, `pin_memory`는 에러. `generator`는 `random.Random` (키워드 전용) |
+| `state_dict` + `nc.save_tensors` / `nc.load_tensors` | torch | 저장 경로는 이 한 가지 (torch.save의 pickle 대신 텐서 파일) |
+| `Optimizer.state_dict()`, `load_state_dict()` | torch | 같은 구조 (`state` = {번호: {`exp_avg`, `exp_avg_sq`, `momentum_buffer`, `square_avg`, `step`}}, `param_groups` 1개). 상태 텐서는 실제 버퍼가 아니라 복사본. 파라미터마다 `step`이 다르거나 momentum이 0↔0 아님으로 바뀌면 에러. 불러오기는 모두 검사한 뒤에야 바꿈 |
+| `lr_scheduler.*.state_dict()`, `load_state_dict()` | torch | optimizer(와 LambdaLR의 함수)를 뺀 속성 전체 |
+| `uint8` (`nc.uint8`, `.to(nc.uint8)`) | torch | 저장·변환용. float→uint8은 자르고 범위 밖은 0/255로 포화 (torch는 정의되지 않은 wraparound). 산술은 `.float()` 후. `cross_entropy`/`nll_loss`는 uint8·int8 라벨을 int32로 넓혀서 받음 (torch는 int64만) |
+| `Dataset`, `TensorDataset`, `DataLoader` | torch | 같은 인수 순서와 기본값, `collate_fn` 지원. 기본 collate는 Tensor 샘플을 stack. `TensorDataset`/`FileArray`의 범위 밖 인덱스는 IndexError(그래서 `for row in ds`가 끝남), 1차원 데이터의 행은 숫자. `sampler`, `batch_sampler`, `num_workers≠0`, `pin_memory`는 에러. `generator`는 `random.Random` (키워드 전용) |
 | `Tensor.argmax(dim, keepdim)`, `size()`, `flatten()`, `.T`, `index_select(dim, index)` | torch | `dim=None`에 `keepdim=True`는 에러 |
-| `softmax(dim)`, `sum/mean/amax(dim)` | torch | numpy식 `axis=`도 허용. 함수형 `softmax`/`log_softmax`와 `net.Softmax`는 `dim=None`이면 torch의 암묵 규칙 + 경고, `Tensor.softmax(dim)`은 dim 필수 |
+| `Tensor[key]`, `iter(t)`, `int(t)` | torch | 정수, 슬라이스(step ≥ 1), `None`, `...`을 여러 축에 (`x[:, 0]`, `x[..., 1:3]`, 복사 없는 뷰) + 정수 리스트·numpy 배열·int32 텐서 하나(어떤 모양이든, 음수는 끝에서부터, numpy의 차원 배치 규칙). bool 마스크, 인덱스 리스트 둘 이상, 음수 step은 에러 |
+| `x / 0`, numpy와 섞은 연산 | torch | `inf`/`nan`. `ndarray + tensor`, `np.float32(2) * t`, `t > np.int64(1)`도 Tensor를 돌려줌 (`__array_priority__`) |
+| `softmax(dim)`, `log_softmax(dim)`, `sum/mean/amax(dim)` | torch | softmax는 모든 축 (마지막 축으로 옮겨 계산), 축소의 `dim`은 정수나 튜플(`sum((0, 2))`), 빈 축의 평균은 NaN(`cross_entropy`·`nll_loss`·`mse_loss`의 0행 평균도 NaN, 합은 0). numpy식 `axis=`도 허용. 함수형 `softmax`/`log_softmax`와 `net.Softmax`는 `dim=None`이면 torch의 암묵 규칙 + 경고, `Tensor.softmax(dim)`은 dim 필수 |
 | `manual_seed` | torch | RNG만 재시드 |
-| `optim.SGD`, `optim.Adam`, `optim.AdamW`, `optim.RMSprop` | torch | 같은 인수 순서, 기본값, 갱신식 (AdamW `weight_decay=0.01`, 분리된 감쇠). `dampening`, `nesterov`, `amsgrad`, `centered`, `maximize`는 에러 |
+| `optim.SGD`, `optim.Adam`, `optim.AdamW`, `optim.RMSprop` | torch | 같은 인수 순서, 기본값, 갱신식 (AdamW `weight_decay=0.01`, 분리된 감쇠), torch와 같은 인수 검사(음수 lr·eps·weight_decay·momentum·alpha, [0, 1) 밖의 beta는 ValueError), 중복 파라미터는 경고. `dampening`, `nesterov`, `amsgrad`, `centered`, `maximize`는 에러 |
 | `gradient_accumulation_steps` (옵티마이저 인자) | Keras 3 | n번째 `step()`마다 평균 그래디언트로 갱신. 그 사이 `zero_grad()`는 합을 유지 |
 | `net.utils.clip_grad_norm_` (`net.clip_grad_norm_`) | torch | 2-노름만 지원 (`norm_type≠2`는 에러), 클리핑 전 노름을 반환 |
 | `optim.lr_scheduler.StepLR`, `ExponentialLR`, `CosineAnnealingLR`, `LambdaLR` | torch | 파라미터 그룹 1개. Cosine은 닫힌 식(값은 torch와 같음). `last_epoch≠-1`은 에러 |
-| `Model.optimizer`, `Optimizer.learning_rate` | Keras | `learning_rate`는 `lr`과 같은 값 |
-| `Model.compile(optimizer="rmsprop", loss=None, loss_weights=None, metrics=None)` | Keras | 기본값 Keras와 같음. 이름으로 고르면 Keras 기본 하이퍼파라미터 ("rmsprop": lr 1e-3, rho 0.9, eps 1e-7 루트 안; "adam"/"adamw": eps 1e-7, adamw wd 0.004; "sgd": lr 0.01). `loss=None`이면 fit/evaluate에서 에러. `lr=`은 newch 확장 (키워드 전용) |
+| `Model.optimizer` | Keras | compile()이 만든 옵티마이저 |
+| `Model.compile(optimizer="adam", loss=None, metrics=None, *, lr=None)` | newch | 0.3.1부터 newch의 편의 함수 (Keras compile과 기본값이 다르므로 Keras 이름 규칙 대상에서 뺌). 이름("adam", "adamw", "sgd", "rmsprop")은 `nc.optim`의 같은 클래스를 그 기본값으로 만듦. `loss`는 "cross_entropy", "mse" 또는 함수·손실 모듈. loss 없이 fit/evaluate하면 에러 |
 | `Model.fit`, `evaluate`, `predict` | Keras | Keras 인수 순서 (`x, y, batch_size, epochs, verbose, callbacks, validation_split, validation_data, shuffle, ...`), `batch_size=None`은 32, `initial_epoch` 지원. `class_weight`, `sample_weight`, `steps_per_epoch`, `steps`, evaluate/predict의 `callbacks`는 에러 |
-| `LearningRateScheduler`, `ReduceLROnPlateau`, `ModelCheckpoint` | Keras | `ModelCheckpoint`는 가중치만 저장하므로 `save_weights_only=True`를 명시해야 함 (Keras 기본값 False는 에러), NCW1 파일, `save_freq="epoch"`만 |
+| `optim.lr_scheduler.ReduceLROnPlateau` | torch | `step(metric)`, threshold rel/abs, cooldown, min_lr, eps (torch와 같은 판정) |
+| `ModelCheckpoint` | Keras | `ModelCheckpoint`는 가중치만 저장하므로 `save_weights_only=True`를 명시해야 함 (Keras 기본값 False는 에러), NCW1 파일, `save_freq="epoch"`만 |
 | `EarlyStopping(monitor, min_delta, patience, verbose, mode, baseline, restore_best_weights, start_from_epoch)` | Keras | Keras와 같은 순서와 판정 규칙. 모니터 값이 없으면 경고 |
 | `LambdaCallback(on_epoch_begin, on_epoch_end, on_train_begin, on_train_end)` | Keras | 배치 단위 훅은 없음 |
-| `ml.StandardScaler`, `MinMaxScaler`, `train_test_split`, `accuracy_score`, `mean_squared_error`, `r2_score` | scikit-learn | `copy=False`, `clip=True`, `stratify`는 에러. 결과 타입은 입력을 따름 (numpy→numpy, Tensor→Tensor, 그 외 리스트) |
-| `ml.LinearRegression`, `ml.Ridge` | scikit-learn | 정규방정식(float32 누적, float64 풀이). 열이 선형 종속이면 `LinearRegression`은 에러 (sklearn은 최소 노름 해) |
-| `ml.KMeans` | scikit-learn | 같은 알고리즘(greedy k-means++, Lloyd, 분산 대비 tol, 빈 클러스터 재배치). 난수열은 달라서 같은 시드라도 결과가 다를 수 있음 |
 | `Tensor.__array__` | numpy | 항상 복사 (`copy=False`는 에러) |
+| `nc.net.functional` (`F.relu`, `F.nll_loss`, …) | torch.nn.functional | 같은 이름과 인수(첫 인수 이름도 `input`). `inplace=True`, `weight`, `ignore_index≠-100`은 에러 |
+| `nc.net.init` (`uniform_`, `normal_`, `constant_`, `zeros_`, `ones_`, `xavier_*`, `kaiming_*`, `calculate_gain`) | torch.nn.init | 같은 분포와 공식. 난수는 newch RNG라 같은 시드라도 값은 다름 |
+| `nn.ModuleList`, `ModuleDict`, `Identity`, `CrossEntropyLoss`, `NLLLoss`, `MSELoss` | torch | 손실 모듈은 함수형과 같은 인수 규칙 |
+| `matmul` / `@` (3차원 이상) | torch | 배치 차원 브로드캐스트. 1차원 피연산자는 에러 |
+| `F.layer_norm`, `nn.LayerNorm(normalized_shape, eps, elementwise_affine, bias)` | torch | 같은 정의와 초기화(가중치 1, 편향 0) |
+| `Tensor.masked_fill(mask, value)` | torch | 마스크는 정수 0/1 텐서 (bool dtype이 없음: `a > b` 같은 비교 결과를 그대로 씀). float 마스크는 에러 |
+| `F.scaled_dot_product_attention(query, key, value, attn_mask, dropout_p, is_causal, scale)` | torch | 정수 `attn_mask`는 0이 아닌 곳만 볼 수 있음(torch bool의 True), float 마스크는 더함. `enable_gqa`는 에러 |
+| `nn.MultiheadAttention(embed_dim, num_heads, dropout, bias, ..., batch_first)` | torch | 파라미터 이름·모양(`in_proj_weight` [3E, E], `out_proj`)과 초기화가 같아 torch state_dict가 그대로 들어감. 마스크도 torch 규칙: 정수 `attn_mask`/`key_padding_mask`는 0이 아닌 곳을 막음, float은 더함. `kdim`/`vdim`≠embed_dim, `add_bias_kv`, `add_zero_attn`은 에러 |
+| `nn.TransformerEncoderLayer`, `nn.TransformerEncoder` | torch | 같은 인수, 하위 모듈 이름, post-norm/`norm_first`. Encoder는 torch처럼 `copy.deepcopy`로 층을 복제 |
+| `nn.RNN`, `nn.LSTM`, `nn.GRU`, `nn.RNNCell`, `nn.LSTMCell`, `nn.GRUCell` | torch | 같은 인수(`num_layers`, `nonlinearity`, `bias`, `batch_first`, `dropout`, `bidirectional`), 파라미터 이름·모양(`weight_ih_l0`, `..._reverse`), 게이트 순서(LSTM i,f,g,o / GRU r,z,n), 초기화 U(±1/√H), 공식, 반환값(`output, h_n` / `output, (h_n, c_n)`), 배치 없는 입력. 기존 연산의 조합(입력 투영은 층·방향마다 GEMM 한 번, 시점마다 `h @ W_hhᵀ`). LSTM `proj_size`는 에러 |
+| `copy.deepcopy(module)` | torch | 영구 텐서는 새 영구 텐서로, 파라미터는 파라미터로 복사. grad는 복사하지 않음 |
+| `Module.apply`, `named_modules`, `named_children`, `register_buffer`, `register_parameter`, `to`, `cpu` | torch | `to`는 CPU 장치만 (그 밖은 에러), dtype 변경은 에러. `register_buffer(persistent=False)`는 에러 |
+| `Tensor.view`, `view_as`, `unsqueeze`, `squeeze`, `permute`, `dim`, `to`, `float`, `int`, `cpu` | torch | `view`는 절대 복사하지 않음: 연속이 아니면 에러 (torch와 같음), `persistent()` 안에서도 에러. `permute`는 전치 뷰를 이어 붙인 뷰 |
+| `eq`/`ne`/`lt`/`le`/`gt`/`ge`와 비교 연산자 | torch | 결과 dtype만 int32 (위의 라이브러리 규칙). 텐서는 여전히 해시 가능 (dict 키로 사용 가능) |
+| `nc.cat`, `nc.stack`, `nc.flatten`, `nc.argmax`, `nc.nll_loss` | torch | |
 
-**라이브러리 전체 규칙:** 정수 데이터는 int32가 됩니다 (torch는 int64). 엔진에 int64가 없기 때문입니다.
+**라이브러리 전체 규칙:** 정수 데이터는 int32가 됩니다 (torch는 int64). numpy uint8/int8은 그대로 1바이트입니다. 엔진에 int64가 없기 때문입니다. 같은 이유로 `.long()`도 int32입니다. 엔진은 float32로 계산하므로 정수 텐서 산술은 torch의 승격 규칙 중 float이 되는 경우만 됩니다 (`int / 2`, `int * 0.5`, `int + float 텐서`, `uint8 / 255`). 결과가 정수여야 하는 `int + 1`, `int * int`, `-int`, `int @ int`는 `.float()`를 안내하는 에러입니다. bool dtype이 없어서 비교 결과(`eq`, `==` 등)는 int32 0/1입니다 (`.sum().item()`은 torch처럼 정수).
 
 ### 의미가 달라서 다른 이름을 쓴 것
 
 | 원본 이름 | newch 이름 | 이유 |
 |---|---|---|
-| `torch.nn` | **`nc.net`** | PyTorch에 없는 Keras식 `Model`까지 들어 있습니다 |
+| `torch.nn` | **`nc.net`** | PyTorch에 없는 Keras식 `Model`까지 들어 있습니다 (`import newch.net as nn`으로 쓰면 됩니다) |
 | `torch.nn.Parameter(tensor)` | **`nc.parameter(init)`** | 클래스가 아니라 함수이고, shape 튜플도 받습니다 |
 | `Tensor.max(dim)` (값+인덱스) | **`Tensor.amax(dim)`** | 값만 반환 = torch `amax` |
-| `Tensor.view()` (절대 복사 안 함) | **`reshape()`만 제공** | 필요하면 복사합니다 |
 | `Tensor.T` (3차원 이상) | **`Tensor.mT`** | 마지막 두 축 교환 = torch `mT` |
 | Keras `"sparse_categorical_crossentropy"` | **`"cross_entropy"`만** | Keras 기본은 확률 입력, 우리는 로짓 입력 |
-| `torch.save` / `torch.load` (pickle, 임의 객체) | **`nc.save_tensors` / `nc.load_tensors`** | 텐서 딕셔너리만 다룹니다 |
+| `torch.save` / `torch.load` (pickle, 임의 객체) | **`nc.save_tensors` / `nc.load_tensors`** | 텐서와 그것을 담은 dict·list·tuple·숫자·문자열·None만 다룹니다 (pickle 없음: 파일을 열어도 코드가 실행되지 않음) |
 | `torch.ao.quantization.quantize_dynamic` (사본 반환) | **`nc.quantize_(model)`** | 제자리 변경입니다. 끝의 `_`는 torch의 in-place 표기 관례를 따랐습니다 |
 | `numpy.memmap` | **`newch.data.FileArray`** | 읽기 전용, 행 단위 배치 읽기에 맞춘 다른 API입니다 |
-| `sklearn.preprocessing`, `.linear_model`, `.cluster`, `.metrics`, `.model_selection` | **`newch.ml`** (한 모듈) | 필요한 것만 모았으므로 하위 모듈로 나누지 않았습니다 |
 
 ### newch에만 있는 개념
 
@@ -189,7 +238,7 @@ newch/
 | 지적된 약점 | 조치 | 확인 |
 |---|---|---|
 | Conv/Pool 없음 | `conv2d`, `max_pool2d`, `avg_pool2d` + 레이어 | gradcheck, MNIST 98.1% |
-| 저장/불러오기 없음 | NCW1 포맷, `state_dict`, `save/load_weights`, torch 가중치 가져오기 | 저장 후 예측 완전 일치 |
+| 저장/불러오기 없음 | NCW1 포맷, `state_dict`, `save_tensors`/`load_tensors`, torch 가중치 가져오기 | 저장 후 예측 완전 일치 |
 | Dropout, BatchNorm 없음 | 연산 + 레이어 + 버퍼 | gradcheck(학습/평가), 이동 통계 값 검사 |
 | 단일 스레드, 캐시 블로킹 없음, x86 SIMD 없음 | 스레드 풀 + 병렬 GEMM, K/N 블로킹, AVX2/FMA 커널 | 아래 성능 표, 스레드 1개/4개 결과 비트 일치 |
 | 데이터셋 전체를 메모리에 올림 | `FileArray` + `DataLoader` 스트리밍, `fit(loader)` | MNIST 60,000장 스트리밍 학습 |
@@ -255,10 +304,10 @@ newch/
 
 | 항목 | 결과 |
 |---|---|
-| C 테스트 | **21개 테스트 통과** (활성화 7종 gradcheck와 알려진 값, 벡터 exp/sigmoid/tanh/erf와 libm 비교, AdamW, RMSprop, 그래디언트 누적, 클리핑, grad None 처리 추가. 스레드 결정성 테스트가 열 분할 GEMM 경로를 실제로 거치도록 수정) — 기존: 연산별 gradcheck 40여 건, 합성곱·풀링·배치 정규화, 드롭아웃 통계, int8 정확도와 커널 일치, 저장/불러오기와 에러, 스레드 결정성, 아레나 축소, 학습 2종 등) |
-| Python 테스트 | **54개 통과** (`test_extras.py` 26개: 활성화 레이어 값과 그래디언트, 인수 순서·기본값 호환 10개 포함, AdamW, 누적=큰 배치 동일성, 클리핑, 스케줄러, Keras 콜백, numpy 연동, `newch.ml` 전체 / 기존 17개 + CNN 학습, 레이어 shape와 모드, BN 버퍼, 저장 후 예측 일치, strict/불일치 에러, torch 형식 state_dict, 양자화, FileArray 스트리밍 fit, 일반 Dataset 묶음, GC 자동 해제, 스레드/trim) |
+| C 테스트 | **27개 테스트 통과** (`nc_load`가 텐서보다 큰 데이터 바이트 수를 거부(전에는 힙 버퍼 오버플로) / 원소별 연산 21종·conv 3종·풀링 2종의 값과 그래디언트가 스레드 1개/4개에서 비트 일치(청크 경계를 여러 번 넘는 크기) / conv gradcheck 4종(groups, depthwise+dilation+stride+bias, 채널 배수 depthwise, dilation)과 depthwise 전용 커널 = 채널별 im2col 경로, 잘못된 groups·dilation 에러 / slice gradcheck(전치 뷰 위 step·오프셋과 strided reshape 뷰) / 빈 축의 mean·cross_entropy·nll_loss가 NaN, 합은 0 / 배치 행렬곱 gradcheck 4종(브로드캐스트·2D@3D·`q @ kᵀ` 전치 뷰)과 값·스레드 수 무관 비트 일치, layer_norm gradcheck 3종(가중치·2축·strided 입력), masked_fill gradcheck와 `-inf` → softmax 0, 벡터 exp/sigmoid/tanh 특수값(±inf, NaN, 범위 경계)이 libm과 같음 / 옵티마이저 상태 복사 후 SGD·Adam·RMSprop 계속 학습이 비트 일치, momentum 전환 에러, `nc_optim_free` 후 영구 메모리 원상태, u8 변환·포화·strided 뷰·index_select, 알 수 없는 dtype 에러 추가 / 추론 해제: 같은 결과·최대 메모리 1/3·테이프와 뷰는 보호, 역전파 해제 3모드의 그래디언트 비트 일치·최대 메모리 감소·재역전파 에러, nll_loss·cat·to_dtype gradcheck, 비교 연산과 i32 sum, 활성화 7종 gradcheck와 알려진 값, 벡터 exp/sigmoid/tanh/erf와 libm 비교, AdamW, RMSprop, 그래디언트 누적, 클리핑, grad None 처리 추가. 스레드 결정성 테스트가 열 분할 GEMM 경로를 실제로 거치도록 수정) — 기존: 연산별 gradcheck 40여 건, 합성곱·풀링·배치 정규화, 드롭아웃 통계, int8 정확도와 커널 일치, 저장/불러오기와 에러, 스레드 결정성, 아레나 축소, 학습 2종 등) |
+| Python 테스트 | **138개 통과** (손상·조작된 체크포인트 13종이 `NcError`(전에는 shape보다 작은 데이터에서 세그폴트), `tensor_from_bytes` 길이 검사, EarlyStopping이 BN 버퍼까지 복원, 생성 함수의 `device`/`requires_grad`와 `Tensor.device`, 버린 Context가 엔진 메모리와 워커 스레드를 해제 / `test_rnn.py` 6개: torch 공식을 옮긴 numpy 기준과 RNN(tanh/relu, 2층)·LSTM(1층, 2층 양방향)·GRU(양방향, 2층 bias 없음 batch_first)의 출력·h_n·c_n과 모든 파라미터·입력의 방향 미분, 이름·모양·배치 없는 입력·에러, 셀을 시점마다 돌린 결과 = 층, 층 사이 dropout, LSTM이 12스텝 기억 과제 95% 이상 / grouped conv 3개: numpy로 옮긴 torch conv2d와 값·방향 미분 비교 6종, 모듈 인수·`padding="same"`·에러, MobileNet식 depthwise-separable 블록이 토이 과제 90% 이상 학습 / `test_compat.py` 추가 10개: numpy와 비교한 인덱싱 18종의 값과 그래디언트, 정수·슬라이스가 복사 없는 뷰, 인덱싱 에러, persistent 복사, 모든 축 softmax/log_softmax 값과 그래디언트, 정수 승격과 정수끼리 에러 후 엔진 에러 해제, 확률 타깃(스무딩·그래디언트·one-hot 일치), 배치 없는·K차원 cross_entropy/nll_loss / `test_compat.py` 22개: 음수·다차원 인덱스와 그래디언트, bool 마스크 에러, 반복과 `int()`, `x / 0`, 여러 축 축소와 그래디언트, 빈 평균 NaN, dtype 에러, 왼쪽 numpy 연산이 autograd 유지, numpy 비교, numpy 스칼라·리스트 속 텐서의 dtype 추론, Embedding 다차원 인덱스, 배치 없는 conv/pool, Dataset 범위와 반복, Tensor 샘플 collate, 옵티마이저 인수 검사·불러오기 검사·중복 경고 / `test_transformer.py` 12개: torch 알고리즘을 옮긴 numpy 기준과 비교해 배치 행렬곱과 그래디언트, layer_norm, masked_fill, SDPA(정수·float·causal 마스크), MultiheadAttention(자기·교차 attention, 두 마스크, head별 가중치, batch_first, 배치 없는 입력, 수치 미분), TransformerEncoderLayer(post/pre-norm), Encoder 복제의 독립성, deepcopy, 작은 트랜스포머가 개수 비교 과제 90% 이상 학습 / API 표면 2개: torch 시그니처(`F.linear(input=)`, `rand(requires_grad=)`, `low`/`std` 거부, `Tensor.zero_grad` 없음)·`__all__`에 내부 이름 없음 / `test_checkpoint.py` 12개: 4가지 옵티마이저의 저장→새 모델에 불러오기→재개가 끊지 않은 학습과 비트 일치, torch 구조, 복사본, 하이퍼파라미터 복원, 잘못된 상태는 아무것도 바꾸지 않고 에러, numpy 상태, 스케줄러, 중첩 저장(정수 키·튜플·None·inf·경로 충돌), uint8 텐서·numpy·FileArray 학습·fit / 추론 메모리 3개: 반복 순전파가 쌓이지 않음·참조 중인 텐서와 뷰 유지·no_grad 텐서를 나중에 학습에 써도 안전 / 0.3.1: `newch.ml` 테스트 7개 제거, `ReduceLROnPlateau` 스케줄러 1개 추가 / 역전파 메모리 3개: 해제해도 그래디언트 동일·참조 중인 출력 유지·`retain_graph` / `test_torch_style.py` 10개: PyTorch 예제 구조 그대로 CNN 학습 90% 이상, 텐서 메서드, 컨테이너, 손실 모듈, nn.init, 장치 이동 / `test_extras.py` 26개: 활성화 레이어 값과 그래디언트, 인수 순서·기본값 호환 10개 포함, AdamW, 누적=큰 배치 동일성, 클리핑, 스케줄러, Keras 콜백, numpy 연동, `newch.ml` 전체 / 기존 17개 + CNN 학습, 레이어 shape와 모드, BN 버퍼, 저장 후 예측 일치, strict/불일치 에러, torch 형식 state_dict, 양자화, FileArray 스트리밍 fit, 일반 Dataset 묶음, GC 자동 해제, 스레드/trim) |
 | 디버그 빌드 | `-O0` + UBSan 통과 |
-| 실제 데이터 | MNIST CNN 1 에포크 18초, 테스트 98.13%, int8 후 98.13% |
+| 실제 데이터 | MNIST CNN(uint8 파일) 1 에포크 18.5초, 테스트 98.28%, int8 후 98.29%, 최대 25.3MiB. torch식 예제 1 에포크 → `--resume`으로 2 에포크 98.35% |
 | 패키징 | 휠 빌드 → 별도 venv 설치(numpy 없음) → 학습 성공 |
 | 크로스 컴파일 | x86_64 Windows/Linux, aarch64(gnu/musl/v8.2), armv7(gnu/musl), riscv64(gnu/musl). 경고 0 |
 | CI (GitHub Actions) | Windows, Ubuntu, macOS(Apple Silicon)에서 C·Python 테스트, QEMU aarch64·armv7·riscv64, CMake+gcc, 휠 빌드. 모든 테스트는 해제 메모리 덮어쓰기 모드(`NC_DEBUG_POISON=1`)로 실행 |
@@ -287,19 +336,19 @@ python examples/mnist_cnn.py            # MNIST 다운로드 → 스트리밍 �
 
 ## 10. 알려진 제약
 
-- **스텝 안에서는 메모리를 해제하지 않습니다.** 최대 메모리가 배치 크기에 비례합니다 (MNIST CNN, 평가 배치 256에서 아레나 최대 65MB). 저메모리 기기에서는 배치를 줄이세요. 근본 해결은 그래프 컴파일러의 메모리 계획입니다
-- dtype: f32(연산), i32(라벨·인덱스), i8(양자화 가중치). f16, int64 없음
-- `matmul`의 두 번째 피연산자는 2차원만, `softmax` 계열은 마지막 축만, `index_select`는 축 0만
-- Conv2d: dilation, groups, `padding="same"` 없음. 양자화는 `Linear`만
-- 원소별 연산과 im2col은 단일 스레드입니다
+- **학습 순전파의 메모리는 배치 크기에 비례합니다.** 역전파 중 해제로 학습 스텝의 실제 메모리는 절반 가까이 줄었고 no_grad 순전파는 다 쓴 활성값을 바로 돌려주지만, 그래디언트를 켠 순전파는 역전파까지 모든 활성값이 남습니다. 저메모리 기기에서는 배치를 줄이거나 `gradient_accumulation_steps`를 쓰세요. 순전파 중 재사용은 그래프 컴파일러의 메모리 계획 단계에서 다룹니다
+- dtype: f32(연산), i32(라벨·인덱스), i8(양자화 가중치), u8(데이터 저장). f16, int64 없음
+- `matmul`은 1차원 피연산자를 받지 않음, `index_select`는 축 0만, 인덱스 대입(`x[i] = v`)은 없음
+- 트랜스포머: 디코더(`TransformerDecoder`, `nn.Transformer`), KV 캐시, f16은 없음. attention은 점수 행렬 [L, S]를 그대로 만들므로 메모리가 시퀀스 길이의 제곱에 비례함
+- Conv2d: `padding="same"`은 홀수 (dilated) 커널만, `padding_mode`는 zeros만. 양자화는 `Linear`만
+- 브로드캐스트 이항 연산, 축소 forward, softmax/layer_norm, max 역전파는 단일 스레드입니다
 - 벡터 exp/erf는 근사이므로 결과가 레퍼런스(libm) 빌드와 마지막 비트에서 다를 수 있습니다 (`force_reference=True`면 libm)
 - `predict()`는 numpy 입력이면 ndarray, 아니면 리스트를 반환합니다
-- 옵티마이저 상태는 저장하지 않습니다 (Keras `save_weights`와 같음)
+- 옵티마이저는 파라미터 그룹이 1개이고 `step` 수를 옵티마이저 하나에 하나만 셉니다 (torch는 파라미터마다)
 
 ## 11. 다음 단계 후보
 
-1. **scikit-learn식 고전 ML 확장:** `LogisticRegression`(유일한 최적해라 sklearn과 같은 결과를 낼 수 있음), 결정 트리, `Pipeline`
+1. **방향성 토론 후 결정** (메모리 예산 학습, C 파일 하나로 내보내기, 기기 위 지속 학습 등)
 2. **그래프 컴파일러:** 추적 → IR → 원소별 연산 융합, 정적 메모리 계획 (스텝 내 메모리 재사용)
 3. **ARM 실측:** 오렌지파이에서 `aarch64-static/nc_tests` 실행, NEON int8(dotprod) 커널
 4. **원소별 연산·im2col 병렬화, RISC-V RVV 커널**
-5. **옵티마이저 상태 저장**(학습 재개, 전원이 끊기기 쉬운 보드에 유용)

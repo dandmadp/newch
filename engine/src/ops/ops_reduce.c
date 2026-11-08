@@ -27,9 +27,10 @@ static red_dims get_dims(const nc_node *n) {
 
 static nc_status reduce_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape) {
     nc_tensor *x = n->in[0];
-    if (!nc__expect_f32(n, 0)) return NC_ERR_DTYPE;
+    int int_sum = n->op->kind == RED_SUM && x->dtype == NC_I32; /* counting, e.g. sum of eq() */
+    if (!int_sum && !nc__expect_f32(n, 0)) return NC_ERR_DTYPE;
     int axis = (int)n->p.i[0], keep = (int)n->p.i[1];
-    *dt = n->op->kind == RED_ARGMAX ? NC_I32 : NC_F32;
+    *dt = (n->op->kind == RED_ARGMAX || int_sum) ? NC_I32 : NC_F32;
     if (axis == NC_ALL_AXES) {
         if (nc_numel(x) == 0 && n->op->kind >= RED_MAX) {
             nc__error(x->ctx, NC_ERR_SHAPE, "%s: reduction of an empty tensor", n->op->name);
@@ -59,6 +60,19 @@ static nc_status reduce_infer(nc_node *n, nc_dtype *dt, int *nd, int64_t *shape)
 static nc_status reduce_fwd(nc_node *n) {
     const nc_kernels *k = n->out->ctx->k;
     red_dims d = get_dims(n);
+    if (n->in[0]->dtype == NC_I32) { /* integer sum, accumulated in 64 bits */
+        int32_t *buf = (int32_t *)nc__arena_alloc(n->out->ctx, (size_t)(nc_numel(n->in[0]) + 1) * sizeof(int32_t));
+        if (!buf) return NC_ERR_OOM;
+        nc__copy_strided(n->in[0], buf);
+        int32_t *y = (int32_t *)n->out->data;
+        for (int64_t o = 0; o < d.outer; o++)
+            for (int64_t i = 0; i < d.inner; i++) {
+                int64_t s = 0;
+                for (int64_t r = 0; r < d.R; r++) s += buf[(o * d.R + r) * d.inner + i];
+                y[o * d.inner + i] = (int32_t)s;
+            }
+        return NC_OK;
+    }
     const float *x = nc__contig_f32(n->in[0]);
     if (!x) return NC_ERR_OOM;
     int kind = n->op->kind;
@@ -66,6 +80,10 @@ static nc_status reduce_fwd(nc_node *n) {
     if (kind == RED_SUM || kind == RED_MEAN) {
         float *y = (float *)n->out->data;
         float scale = kind == RED_MEAN ? 1.0f / (float)(d.R ? d.R : 1) : 1.0f;
+        if (kind == RED_MEAN && d.R == 0) { /* mean of nothing is 0/0, as in torch and numpy */
+            for (int64_t i = 0; i < d.outer * d.inner; i++) y[i] = NAN;
+            return NC_OK;
+        }
         if (d.inner == 1) {
             for (int64_t o = 0; o < d.outer; o++) y[o] = scale * k->sum_f32(d.R, x + o * d.R);
             return NC_OK;
@@ -97,6 +115,33 @@ static nc_status reduce_fwd(nc_node *n) {
     return NC_OK;
 }
 
+/* sum / mean backward: every input row (o, r) gets the output row o; rows split across threads,
+ * one writer per element. inner == 1 (e.g. a full reduction) fills runs instead of calling a
+ * kernel per element. */
+typedef struct {
+    const nc_kernels *k;
+    const red_dims *d;
+    float scale;
+    const float *g;
+    float *gi;
+} red_bwd_job;
+
+static void red_bwd_rows(void *arg, int64_t begin, int64_t end) {
+    const red_bwd_job *j = (const red_bwd_job *)arg;
+    int64_t R = j->d->R, inner = j->d->inner;
+    for (int64_t row = begin; row < end;) {
+        int64_t o = row / R, stop = (o + 1) * R < end ? (o + 1) * R : end;
+        const float *gs = j->g + o * inner;
+        if (inner == 1) {
+            float v = j->scale * gs[0], *p = j->gi;
+            for (int64_t r = row; r < stop; r++) p[r] += v;
+        } else {
+            for (int64_t r = row; r < stop; r++) j->k->axpy_f32(inner, j->scale, gs, j->gi + r * inner);
+        }
+        row = stop;
+    }
+}
+
 static void reduce_bwd(nc_node *n) {
     nc_tensor *gt = nc__grad_buf(n->in[0]);
     if (!gt) return;
@@ -112,9 +157,9 @@ static void reduce_bwd(nc_node *n) {
         return;
     }
     float scale = n->op->kind == RED_MEAN ? 1.0f / (float)(d.R ? d.R : 1) : 1.0f;
-    for (int64_t o = 0; o < d.outer; o++)
-        for (int64_t r = 0; r < d.R; r++)
-            k->axpy_f32(d.inner, scale, g + o * d.inner, gi + (o * d.R + r) * d.inner);
+    red_bwd_job j = {k, &d, scale, g, gi};
+    int64_t grain = d.inner >= 32768 ? 1 : 32768 / (d.inner ? d.inner : 1);
+    nc__parallel_for(gt->ctx, d.outer * d.R, grain, red_bwd_rows, &j);
 }
 
 const nc_op_def nc_op_sum = {"sum", NC_OPF_REDUCTION, RED_SUM, reduce_infer, NULL, reduce_fwd, reduce_bwd};

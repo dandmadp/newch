@@ -141,6 +141,12 @@ nc_status nc_load(nc_ctx *ctx, const char *path, int n, const char *const *names
                       nc__dtype_name(t->dtype), nc__shape_str(t->ndim, t->shape, want, sizeof want));
             goto done;
         }
+        /* the byte count must be exactly the tensor's size: a larger one would overrun t->data */
+        if (bytes != (uint64_t)nc_numel(t) * nc__dtype_size(t->dtype)) {
+            nc__error(ctx, NC_ERR_ARG, "nc_load: '%s' in '%s' is corrupt (%llu data bytes for %s)", name, path,
+                      (unsigned long long)bytes, nc__dtype_name(t->dtype));
+            goto done;
+        }
         if (!nc_is_contiguous(t) || !get(f, t->data, (size_t)bytes)) {
             nc__error(ctx, NC_ERR_ARG, "nc_load: cannot read '%s' (truncated file or non-contiguous tensor)", name);
             goto done;

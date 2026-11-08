@@ -129,6 +129,15 @@ static void test_reduce_values(void) {
     CHECK_NEAR(nc_get(mx, SHAPE(0)), 5, 0);
     CHECK(nc_get_dtype(am) == NC_I32);
     CHECK_NEAR(nc_get(am, SHAPE(1)), 2, 0);
+    /* means over nothing are 0/0 = NaN (torch, numpy); sums are 0 */
+    nc_tensor *E = nc_zeros(ctx, NC_F32, 2, SHAPE(0, 3));
+    nc_tensor *lab = nc_zeros(ctx, NC_I32, 1, SHAPE(0));
+    CHECK(isnan(nc_item(nc_mean(E, NC_ALL_AXES, 0))));
+    CHECK(isnan(nc_get(nc_mean(E, 0, 0), SHAPE(2))));
+    CHECK_NEAR(nc_get(nc_sum(E, 0, 0), SHAPE(2)), 0, 0);
+    CHECK(isnan(nc_item(nc_cross_entropy(E, lab))));
+    CHECK(isnan(nc_item(nc_nll_loss(E, lab, 0))));
+    CHECK_NEAR(nc_item(nc_nll_loss(E, lab, 1)), 0, 0);
     CHECK(nc_ok(ctx));
     nc_free_ctx(ctx);
 }
@@ -202,6 +211,17 @@ static nc_tensor *f_matmul_3d(nc_tensor **x, nc_tensor *a) {
     (void)a;
     return nc_matmul(nc_reshape(x[0], 3, SHAPE(2, 2, 3)), x[1]);
 }
+static nc_tensor *f_bmm_t(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* q @ k^T as attention writes it: a transposed batched view */
+    return nc_matmul(x[0], nc_transpose(x[1], 1, 2));
+}
+static nc_tensor *f_ln(nc_tensor **x, nc_tensor *a) { (void)a; return nc_layer_norm(x[0], 1, x[1], x[2], 1e-5f); }
+static nc_tensor *f_ln2(nc_tensor **x, nc_tensor *a) { (void)a; return nc_layer_norm(x[0], 2, NULL, NULL, 1e-5f); }
+static nc_tensor *f_ln_t(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* strided input, bias only */
+    return nc_layer_norm(nc_transpose(x[0], 0, 1), 1, NULL, x[1], 1e-5f);
+}
+static nc_tensor *f_mfill(nc_tensor **x, nc_tensor *a) { return nc_masked_fill(nc_transpose(x[0], 0, 1), a, 0.5f); }
 static nc_tensor *f_linear(nc_tensor **x, nc_tensor *a) { (void)a; return nc_linear_fn(x[0], x[1], x[2]); }
 static nc_tensor *f_linear_nb(nc_tensor **x, nc_tensor *a) { (void)a; return nc_linear_fn(x[0], x[1], NULL); }
 static nc_tensor *f_sum0(nc_tensor **x, nc_tensor *a) { (void)a; return nc_sum(x[0], 0, 0); }
@@ -221,9 +241,23 @@ static nc_tensor *f_contig(nc_tensor **x, nc_tensor *a) {
     return nc_reshape(nc_contiguous(nc_transpose(x[0], 0, 1)), 1, SHAPE(-1));
 }
 static nc_tensor *f_index(nc_tensor **x, nc_tensor *a) { return nc_index_select(x[0], a); }
+static nc_tensor *f_slice(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* steps and offsets on a transposed view, then a reshape that stays a strided view */
+    nc_tensor *v = nc_slice(nc_slice(nc_transpose(x[0], 0, 1), 1, 1, 3, 2), 0, 2, 2, 1);
+    nc_tensor *r = nc_reshape(v, 3, SHAPE(2, 3, 1));
+    return nc_mul(r, nc_reshape(nc_slice(x[0], 0, 0, 3, 2), 3, SHAPE(1, 3, 5)));
+}
 static nc_tensor *f_logsm(nc_tensor **x, nc_tensor *a) { (void)a; return nc_log_softmax(x[0]); }
 static nc_tensor *f_sm(nc_tensor **x, nc_tensor *a) { (void)a; return nc_softmax(x[0]); }
 static nc_tensor *f_ce(nc_tensor **x, nc_tensor *a) { return nc_cross_entropy(x[0], a); }
+static nc_tensor *f_nll(nc_tensor **x, nc_tensor *a) { return nc_nll_loss(nc_log_softmax(x[0]), a, 0); }
+static nc_tensor *f_nll_sum(nc_tensor **x, nc_tensor *a) { return nc_nll_loss(nc_log_softmax(x[0]), a, 1); }
+static nc_tensor *f_cat(nc_tensor **x, nc_tensor *a) {
+    (void)a;
+    nc_tensor *parts[3] = {x[0], nc_transpose(x[1], 0, 1), x[0]}; /* strided input too */
+    return nc_cat(3, parts, 1);
+}
+static nc_tensor *f_to_f32(nc_tensor **x, nc_tensor *a) { (void)a; return nc_to_dtype(x[0], NC_F32); }
 static nc_tensor *f_mse(nc_tensor **x, nc_tensor *a) { (void)a; return nc_mse_loss(x[0], x[1]); }
 static nc_tensor *f_mlp(nc_tensor **x, nc_tensor *a) {
     nc_tensor *h = nc_tanh(nc_add(nc_matmul(x[0], x[1]), x[2]));
@@ -315,6 +349,30 @@ static void test_gradcheck(void) {
     in[0] = gparam(ctx, 0, 2, SHAPE(4, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(3, 2));
     gradcheck_case(ctx, "matmul 3d", f_matmul_3d, NULL, 2, in);
 
+    in[0] = gparam(ctx, 0, 3, SHAPE(2, 3, 4)), in[1] = gparam(ctx, 0, 3, SHAPE(2, 4, 5));
+    gradcheck_case(ctx, "bmm", f_matmul, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(2, 1, 3, 4)), in[1] = gparam(ctx, 0, 3, SHAPE(3, 4, 2));
+    gradcheck_case(ctx, "bmm bcast", f_matmul, NULL, 2, in); /* both operands broadcast */
+    in[0] = gparam(ctx, 0, 2, SHAPE(3, 4)), in[1] = gparam(ctx, 0, 3, SHAPE(2, 4, 5));
+    gradcheck_case(ctx, "bmm 2d@3d", f_matmul, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 3, SHAPE(2, 3, 4)), in[1] = gparam(ctx, 0, 3, SHAPE(2, 5, 4));
+    gradcheck_case(ctx, "bmm q@kT", f_bmm_t, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 3, SHAPE(2, 3, 5)), in[1] = gparam(ctx, 1, 1, SHAPE(5));
+    in[2] = gparam(ctx, 0, 1, SHAPE(5));
+    gradcheck_case(ctx, "layer_norm", f_ln, NULL, 3, in);
+    in[0] = gparam(ctx, 0, 3, SHAPE(2, 3, 4));
+    gradcheck_case(ctx, "layer_norm 2d", f_ln2, NULL, 1, in);
+    in[0] = gparam(ctx, 0, 2, SHAPE(4, 3)), in[1] = gparam(ctx, 0, 1, SHAPE(4));
+    gradcheck_case(ctx, "layer_norm T", f_ln_t, NULL, 2, in);
+    {
+        int32_t mv[4] = {1, 0, 0, 1}; /* [4] broadcast over the rows of a [3, 4] view */
+        nc_persistent_begin(ctx);
+        nc_tensor *mask = nc_from_data(ctx, NC_I32, mv, 1, SHAPE(4));
+        nc_persistent_end(ctx);
+        in[0] = gparam(ctx, 0, 2, SHAPE(4, 3));
+        gradcheck_case(ctx, "masked_fill", f_mfill, mask, 1, in);
+    }
+
     in[0] = gparam(ctx, 0, 2, SHAPE(4, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(5, 3));
     in[2] = gparam(ctx, 0, 1, SHAPE(5));
     gradcheck_case(ctx, "linear", f_linear, NULL, 3, in);
@@ -330,6 +388,7 @@ static void test_gradcheck(void) {
     in[0] = gparam(ctx, 0, 2, SHAPE(2, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(3, 2));
     gradcheck_case(ctx, "transpose", f_transpose, NULL, 2, in);
     GC1("contiguous", f_contig, 0, 3, 4);
+    GC1("slice", f_slice, 0, 6, 5);
     GC1("log_softmax", f_logsm, 0, 3, 5);
     GC1("softmax", f_sm, 0, 3, 5);
 
@@ -347,6 +406,45 @@ static void test_gradcheck(void) {
     gradcheck_case(ctx, "index_select", f_index, ridx, 1, in);
     in[0] = gparam(ctx, 0, 2, SHAPE(3, 2)), in[1] = gparam(ctx, 0, 2, SHAPE(3, 2));
     gradcheck_case(ctx, "mse_loss", f_mse, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 2, SHAPE(4, 5));
+    gradcheck_case(ctx, "nll_loss", f_nll, labels, 1, in);
+    gradcheck_case(ctx, "nll_loss sum", f_nll_sum, labels, 1, in);
+    in[0] = gparam(ctx, 0, 2, SHAPE(2, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(4, 2));
+    gradcheck_case(ctx, "cat", f_cat, NULL, 2, in);
+    gradcheck_case(ctx, "to_dtype f32", f_to_f32, NULL, 1, in);
+    {
+        /* nll_loss(log_softmax) == cross_entropy */
+        nc_tensor *lg = gparam(ctx, 0, 2, SHAPE(4, 5));
+        CHECK_NEAR(nc_item(nc_nll_loss(nc_log_softmax(lg), labels, 0)), nc_item(nc_cross_entropy(lg, labels)), 1e-5);
+        /* compare: mixed f32 / i32 with broadcasting, then an integer sum */
+        float fv[4] = {1.0f, 2.0f, 3.5f, 4.0f};
+        int32_t iv[4] = {1, 0, 3, 4};
+        nc_tensor *f = nc_from_data(ctx, NC_F32, fv, 1, SHAPE(4)), *i = nc_from_data(ctx, NC_I32, iv, 1, SHAPE(4));
+        nc_tensor *eq = nc_compare(f, i, NC_CMP_EQ);
+        CHECK(eq && nc_get_dtype(eq) == NC_I32 && nc_data_i32(eq)[0] == 1 && nc_data_i32(eq)[2] == 0);
+        nc_tensor *cnt = nc_sum(eq, NC_ALL_AXES, 0);
+        CHECK(cnt && nc_get_dtype(cnt) == NC_I32 && nc_data_i32(cnt)[0] == 2);
+        nc_tensor *ge = nc_compare(nc_reshape(f, 2, SHAPE(4, 1)), i, NC_CMP_GE); /* [4, 4] */
+        CHECK(ge && nc_dim(ge, 0) == 4 && nc_data_i32(nc_sum(ge, NC_ALL_AXES, 0))[0] == 11); /* 2 + 2 + 3 + 4 */
+        /* to_dtype: truncation toward zero, int -> float, grad detached for ints */
+        float tv[3] = {-1.7f, 2.9f, 0.4f};
+        nc_tensor *ti = nc_to_dtype(nc_from_data(ctx, NC_F32, tv, 1, SHAPE(3)), NC_I32);
+        CHECK(ti && nc_data_i32(ti)[0] == -1 && nc_data_i32(ti)[1] == 2);
+        float big[4] = {3e9f, -3e9f, NAN, 300.0f};
+        nc_tensor *bt = nc_from_data(ctx, NC_F32, big, 1, SHAPE(4));
+        nc_tensor *b32 = nc_to_dtype(bt, NC_I32), *b8 = nc_to_dtype(bt, NC_I8);
+        CHECK(nc_data_i32(b32)[0] == INT32_MAX && nc_data_i32(b32)[1] == INT32_MIN && nc_data_i32(b32)[2] == 0);
+        CHECK(b8 && ((int8_t *)b8->data)[3] == 127 && ((int8_t *)b8->data)[1] == -128);
+        CHECK(!nc_requires_grad(nc_to_dtype(lg, NC_I32)));
+        CHECK_NEAR(nc_data_f32(nc_to_dtype(i, NC_F32))[3], 4.0, 0);
+        /* cat of int tensors and the input-count limit */
+        nc_tensor *two[2] = {i, i};
+        CHECK(nc_dim(nc_cat(2, two, 0), 0) == 8);
+        nc_tensor *seven[7] = {i, i, i, i, i, i, i};
+        CHECK(!nc_cat(7, seven, 0) && nc_status_code(ctx) == NC_ERR_ARG);
+        nc_clear_error(ctx);
+        nc_step_end(ctx);
+    }
 
     in[0] = gparam(ctx, 0, 2, SHAPE(4, 3)), in[1] = gparam(ctx, 0, 2, SHAPE(3, 6));
     in[2] = gparam(ctx, 0, 1, SHAPE(6)), in[3] = gparam(ctx, 0, 2, SHAPE(6, 5));
@@ -421,6 +519,241 @@ static void test_memory(void) {
     nc_full(ctx, 7.0f, 1, SHAPE(1024)); /* would overwrite c if it were in the arena */
     CHECK_NEAR(nc_get(c, SHAPE(3)), 2, 0);
     CHECK(nc_get_mem_stats(ctx).persistent_bytes > pers);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
+static void test_backward_release(void) {
+    nc_ctx *ctx = new_ctx();
+    nc_tensor *w1 = nc_parameter(ctx, nc_randn(ctx, 0.5f, 2, SHAPE(64, 32)), 2, SHAPE(64, 32));
+    nc_tensor *w2 = nc_parameter(ctx, nc_randn(ctx, 0.5f, 2, SHAPE(10, 64)), 2, SHAPE(10, 64));
+    int32_t lab[256];
+    for (int i = 0; i < 256; i++) lab[i] = i % 10;
+    nc_tensor *grads_ref[2] = {NULL, NULL};
+    size_t peak[3];
+    for (int mode = 0; mode < 3; mode++) { /* retain, default, free graph */
+        nc_zero_grad(w1), nc_zero_grad(w2);
+        nc_step_end(ctx);
+        nc_manual_seed(ctx, 5);
+        nc_reset_peak(ctx);
+        nc_tensor *x = nc_randn(ctx, 1.0f, 2, SHAPE(256, 32));
+        nc_tensor *y = nc_from_data(ctx, NC_I32, lab, 1, SHAPE(256));
+        nc_tensor *h = nc_relu(nc_linear_fn(x, w1, NULL));
+        nc_tensor *loss = nc_cross_entropy(nc_linear_fn(nc_tanh(h), w2, NULL), y);
+        int flags = mode == 0 ? NC_BACKWARD_RETAIN : mode == 1 ? 0 : NC_BACKWARD_FREE_GRAPH;
+        CHECK(nc_backward_ex(loss, flags, &h, 1) == NC_OK);
+        peak[mode] = nc_get_mem_stats(ctx).arena_peak_bytes;
+        if (mode == 0) {
+            grads_ref[0] = nc_from_data(ctx, NC_F32, nc_data_f32(nc_grad(w1)), 2, SHAPE(64, 32));
+            nc_persistent_begin(ctx);
+            grads_ref[0] = nc_contiguous(grads_ref[0]);
+            grads_ref[1] = nc_from_data(ctx, NC_F32, nc_data_f32(nc_grad(w2)), 2, SHAPE(10, 64));
+            nc_persistent_end(ctx);
+            CHECK(nc_grad(h) != NULL); /* retained intermediate grad */
+        } else {
+            /* same leaf grads whatever is released */
+            CHECK(memcmp(nc_data_f32(nc_grad(w1)), nc_data_f32(grads_ref[0]), 64 * 32 * 4) == 0);
+            CHECK(memcmp(nc_data_f32(nc_grad(w2)), nc_data_f32(grads_ref[1]), 10 * 64 * 4) == 0);
+            CHECK(nc_grad(h) == NULL); /* intermediate grads are released */
+            CHECK(nc_data_f32(h) != NULL && isfinite(nc_data_f32(h)[0])); /* kept tensor survives */
+            CHECK(isfinite(nc_item(loss)));                                /* so does the loss */
+        }
+        if (mode == 2) { /* a released graph cannot run backward again */
+            CHECK(nc_backward(loss) == NC_ERR_STATE);
+            nc_clear_error(ctx);
+        }
+    }
+    printf("    backward peak: retain %.0f KiB, default %.0f KiB, free graph %.0f KiB\n", peak[0] / 1024.0,
+           peak[1] / 1024.0, peak[2] / 1024.0);
+    CHECK(peak[1] < peak[0] && peak[2] < peak[1]);
+    nc_free_ctx(ctx);
+}
+
+static void test_inference_release(void) {
+    nc_ctx *ctx = new_ctx();
+    nc_tensor *w = nc_parameter(ctx, nc_randn(ctx, 0.1f, 4, SHAPE(16, 8, 3, 3)), 4, SHAPE(16, 8, 3, 3));
+    size_t peak[2];
+    float ref = 0;
+    for (int mode = 0; mode < 2; mode++) { /* 0: keep everything (grad on), 1: no_grad + release */
+        nc_step_end(ctx);
+        nc_manual_seed(ctx, 3);
+        nc_tensor *own = nc_randn(ctx, 1.0f, 4, SHAPE(32, 8, 28, 56));
+        nc_reset_peak(ctx);
+        int prev = nc_set_grad_enabled(ctx, mode == 0);
+        for (int layer = 0; layer < 4; layer++) {
+            nc_tensor *inp = nc_reshape(own, 4, SHAPE(32, 8, 28, 56)); /* a view of the previous output */
+            nc_tensor *c = nc_conv2d(inp, nc_reshape(w, 4, SHAPE(16, 8, 3, 3)), NULL, 1, 2, 1, 1);
+            nc_tensor *next = nc_relu(c); /* [32, 16, 28, 28] */
+            if (mode == 1) {
+                nc_release_temp(c);
+                nc_release_temp(own);
+            }
+            own = next;
+        }
+        nc_tensor *h = own;
+        float v = nc_item(nc_sum(h, NC_ALL_AXES, 0));
+        if (mode == 0) ref = v;
+        else CHECK_NEAR(v, ref, 1e-3 * fabs(ref)); /* same result */
+        nc_set_grad_enabled(ctx, prev);
+        peak[mode] = nc_get_mem_stats(ctx).arena_peak_bytes;
+    }
+    printf("    4-layer forward peak: grad on %.1f MiB, no_grad + release %.1f MiB\n", peak[0] / 1048576.0,
+           peak[1] / 1048576.0);
+    CHECK(peak[1] * 2 < peak[0]);
+
+    /* never released: tensors on the tape, and views */
+    nc_step_end(ctx);
+    nc_tensor *p = nc_parameter(ctx, nc_full(ctx, 2.0f, 1, SHAPE(4)), 1, SHAPE(4));
+    nc_tensor *a = nc_full(ctx, 3.0f, 1, SHAPE(4));
+    nc_tensor *av = nc_reshape(a, 2, SHAPE(2, 2));
+    nc_tensor *loss = nc_sum(nc_mul(nc_reshape(av, 1, SHAPE(4)), p), NC_ALL_AXES, 0);
+    nc_release_temp(a);  /* a's data is used by the recorded mul (through views): kept */
+    nc_release_temp(av); /* a view owns nothing */
+    CHECK(nc_data_f32(a) != NULL);
+    CHECK(nc_backward(loss) == NC_OK);
+    CHECK_NEAR(nc_data_f32(nc_grad(p))[0], 3.0, 0);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
+/* A copied optimizer state (buffers + step count) continues bit-identically. */
+static void test_optim_state(void) {
+    nc_ctx *ctx = new_ctx();
+    float wv[4] = {1.0f, -2.0f, 0.5f, 3.0f};
+    for (int kind = 0; kind < 3; kind++) { /* adam, sgd + momentum, rmsprop + momentum */
+        nc_optim_opts o = {.lr = 0.05f, .momentum = kind ? 0.9f : 0.0f, .weight_decay = 0.01f};
+        nc_tensor *a = nc_parameter(ctx, T(ctx, wv, 4), 1, SHAPE(4));
+        nc_tensor *b = nc_parameter(ctx, T(ctx, wv, 4), 1, SHAPE(4));
+        nc_optim *oa = kind == 0 ? nc_adam(ctx, &a, 1, o) : kind == 1 ? nc_sgd(ctx, &a, 1, o)
+                                                                       : nc_rmsprop(ctx, &a, 1, o, 0);
+        nc_optim *ob = kind == 0 ? nc_adam(ctx, &b, 1, o) : kind == 1 ? nc_sgd(ctx, &b, 1, o)
+                                                                       : nc_rmsprop(ctx, &b, 1, o, 0);
+        for (int s = 0; s < 5; s++) { /* train a only */
+            nc_optim_zero_grad(oa);
+            nc_backward(nc_sum(nc_mul(a, a), NC_ALL_AXES, 0));
+            nc_optim_step(oa);
+            nc_step_end(ctx);
+        }
+        CHECK(nc_optim_get_step(oa) == 5);
+        memcpy(nc_data_f32(b), nc_data_f32(a), sizeof wv);
+        for (int slot = 0; slot < 2; slot++) {
+            float *sa = nc_optim_state(oa, 0, slot), *sb = nc_optim_state(ob, 0, slot);
+            CHECK((sa == NULL) == (sb == NULL));
+            if (sa) memcpy(sb, sa, sizeof wv);
+        }
+        CHECK(nc_optim_state(oa, 0, 1) != NULL || kind == 1); /* SGD has no slot 1 */
+        CHECK(nc_optim_state(oa, 1, 0) == NULL);              /* out of range */
+        nc_optim_set_step(ob, nc_optim_get_step(oa));
+        for (int s = 0; s < 3; s++) { /* both continue the same way */
+            nc_optim *os[2] = {oa, ob};
+            nc_tensor *ps[2] = {a, b};
+            for (int k = 0; k < 2; k++) {
+                nc_optim_zero_grad(os[k]);
+                nc_backward(nc_sum(nc_mul(ps[k], ps[k]), NC_ALL_AXES, 0));
+                nc_optim_step(os[k]);
+            }
+            nc_step_end(ctx);
+        }
+        CHECK(memcmp(nc_data_f32(a), nc_data_f32(b), sizeof wv) == 0);
+        if (kind) { /* momentum buffer cannot appear or vanish */
+            o.momentum = 0.0f;
+            nc_optim_set_opts(oa, o);
+            CHECK(nc_status_code(ctx) == NC_ERR_ARG);
+            nc_clear_error(ctx);
+        }
+    }
+    nc_optim_set_step(NULL, 1);
+    /* nc_optim_free gives all of its state back */
+    nc_tensor *w = nc_parameter(ctx, T(ctx, wv, 4), 1, SHAPE(4));
+    size_t base = nc_get_mem_stats(ctx).persistent_bytes;
+    nc_optim_free(nc_adam(ctx, &w, 1, (nc_optim_opts){.lr = 0.1f}));
+    nc_optim_free(nc_sgd(ctx, &w, 1, (nc_optim_opts){.lr = 0.1f, .momentum = 0.9f}));
+    CHECK(nc_get_mem_stats(ctx).persistent_bytes == base);
+    nc_optim_free(NULL);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
+/* u8: storage dtype for raw data, converted with to_dtype */
+static void test_uint8(void) {
+    nc_ctx *ctx = new_ctx();
+    uint8_t px[4] = {0, 1, 128, 255};
+    nc_tensor *u = nc_from_data(ctx, NC_U8, px, 2, SHAPE(2, 2));
+    CHECK(u && nc_get_dtype(u) == NC_U8);
+    CHECK_NEAR(nc_item(nc_reshape(nc_index_select(nc_reshape(u, 1, SHAPE(4)),
+                                                  nc_from_data(ctx, NC_I32, (int32_t[]){3}, 1, SHAPE(1))),
+                                  0, NULL)),
+               255.0, 0);
+    nc_tensor *f = nc_to_dtype(nc_transpose(u, 0, 1), NC_F32); /* strided u8 view */
+    float want[4] = {0, 128, 1, 255};
+    for (int i = 0; i < 4; i++) CHECK_NEAR(nc_data_f32(f)[i], want[i], 0);
+    float fv[4] = {-3.0f, 0.4f, 254.6f, 1000.0f};
+    nc_tensor *back = nc_to_dtype(T(ctx, fv, 4), NC_U8); /* truncates, saturates to [0, 255] */
+    uint8_t got[4];
+    CHECK(nc_copy_to(back, got, sizeof got));
+    CHECK(got[0] == 0 && got[1] == 0 && got[2] == 254 && got[3] == 255);
+    nc_tensor *i8 = nc_to_dtype(u, NC_I8);
+    CHECK_NEAR(nc_get(i8, (int64_t[]){1, 1}), 127.0, 0);
+    CHECK(nc_empty(ctx, (nc_dtype)99, 1, SHAPE(2)) == NULL);
+    CHECK(nc_status_code(ctx) == NC_ERR_DTYPE);
+    nc_clear_error(ctx);
+    nc_free_ctx(ctx);
+}
+
+/* Transformer building blocks: values beyond the gradchecks */
+static void test_transformer_ops(void) {
+    nc_ctx *ctx = new_ctx();
+    /* batched matmul == one 2-D matmul per batch matrix, broadcast included */
+    nc_manual_seed(ctx, 5);
+    nc_tensor *a = nc_randn(ctx, 1.0f, 3, SHAPE(3, 4, 6)), *b = nc_randn(ctx, 1.0f, 3, SHAPE(1, 6, 5));
+    nc_tensor *c = nc_matmul(a, b);
+    CHECK(c && nc_ndim(c) == 3 && nc_shape(c)[0] == 3 && nc_shape(c)[2] == 5);
+    nc_tensor *b2 = nc_reshape(b, 2, SHAPE(6, 5));
+    for (int64_t i = 0; i < 3; i++) {
+        nc_tensor *ai = nc_reshape(nc_index_select(a, nc_from_data(ctx, NC_I32, (int32_t[]){(int32_t)i}, 1, SHAPE(1))),
+                                   2, SHAPE(4, 6));
+        nc_tensor *ci = nc_matmul(ai, b2);
+        for (int64_t r = 0; r < 4; r++)
+            for (int64_t k = 0; k < 5; k++)
+                CHECK_NEAR(nc_get(c, (int64_t[]){i, r, k}), nc_get(ci, (int64_t[]){r, k}), 1e-5);
+    }
+    CHECK(nc_matmul(a, nc_randn(ctx, 1.0f, 3, SHAPE(2, 6, 5))) == NULL); /* batch 3 vs 2 */
+    CHECK(nc_status_code(ctx) == NC_ERR_SHAPE);
+    nc_clear_error(ctx);
+
+    /* many small matrices run one per thread: same bits with 1 or many threads */
+    nc_ctx *one = nc_init(&(nc_config){.threads = 1});
+    float *res[2];
+    nc_ctx *cs[2] = {one, ctx};
+    for (int k = 0; k < 2; k++) {
+        nc_manual_seed(cs[k], 9);
+        nc_tensor *q = nc_randn(cs[k], 1.0f, 3, SHAPE(64, 16, 8)), *kk = nc_randn(cs[k], 1.0f, 3, SHAPE(64, 16, 8));
+        res[k] = nc_data_f32(nc_matmul(q, nc_transpose(kk, 1, 2)));
+    }
+    CHECK(memcmp(res[0], res[1], 64 * 16 * 16 * sizeof(float)) == 0);
+    nc_free_ctx(one);
+
+    /* layer_norm: zero mean, unit (biased) variance per row */
+    float lv[4] = {1.0f, 2.0f, 3.0f, 6.0f};
+    nc_tensor *ln = nc_layer_norm(T(ctx, lv, 1, 4), 1, NULL, NULL, 0.0f);
+    double m = 0, v = 0;
+    for (int i = 0; i < 4; i++) m += nc_data_f32(ln)[i] / 4.0;
+    for (int i = 0; i < 4; i++) v += (nc_data_f32(ln)[i] - m) * (nc_data_f32(ln)[i] - m) / 4.0;
+    CHECK_NEAR(m, 0.0, 1e-6);
+    CHECK_NEAR(v, 1.0, 1e-5);
+    CHECK(nc_layer_norm(T(ctx, lv, 1, 4), 1, T(ctx, lv, 3), NULL, 1e-5f) == NULL); /* weight of 3 for D = 4 */
+    nc_clear_error(ctx);
+
+    /* masked_fill with -inf, then softmax: masked entries become exactly 0, no NaN */
+    float sv[4] = {0.5f, 1.0f, -2.0f, 3.0f};
+    uint8_t keep_out[4] = {0, 1, 0, 1}; /* u8 masks work too */
+    nc_tensor *mk = nc_from_data(ctx, NC_U8, keep_out, 1, SHAPE(4));
+    nc_tensor *p = nc_softmax(nc_masked_fill(T(ctx, sv, 1, 4), mk, -INFINITY));
+    CHECK_NEAR(nc_data_f32(p)[1], 0.0, 0);
+    CHECK_NEAR(nc_data_f32(p)[3], 0.0, 0);
+    CHECK_NEAR(nc_data_f32(p)[0] + nc_data_f32(p)[2], 1.0, 1e-6);
+    CHECK(nc_masked_fill(T(ctx, sv, 4), nc_from_data(ctx, NC_I32, (int32_t[]){1, 0}, 1, SHAPE(2)), 0.0f) == NULL);
+    nc_clear_error(ctx);
     CHECK(nc_ok(ctx));
     nc_free_ctx(ctx);
 }
@@ -502,6 +835,23 @@ static void test_kernel_parity(void) {
         }
     }
     printf("    exp/sigmoid/tanh max rel err vs libm: %.2g %.2g %.2g\n", worst[0], worst[1], worst[2]);
+    /* special values as libm: exp(-inf) = 0 (attention masks), exp(+inf) = inf, NaN stays NaN,
+     * and beyond the clamp edges exp is 0 / inf (libm gives denormals there: < 1.2e-38 apart) */
+    {
+        float sx[9] = {-INFINITY, INFINITY, NAN, -87.5f, -95.0f, -120.0f, 88.5f, 100.0f, 88.7f}, s0[9], s1[9];
+        for (int f = 0; f < 3; f++) {
+            void (*rf)(int64_t, const float *, float *) =
+                f == 0 ? ref->exp_f32 : f == 1 ? ref->sigmoid_f32 : ref->tanh_f32;
+            void (*kf)(int64_t, const float *, float *) = f == 0 ? k->exp_f32 : f == 1 ? k->sigmoid_f32 : k->tanh_f32;
+            rf(9, sx, s0);
+            kf(9, sx, s1);
+            for (int i = 0; i < 9; i++) {
+                if (isnan(s0[i])) CHECK(isnan(s1[i]));
+                else if (isinf(s0[i])) CHECK(s1[i] == s0[i]);
+                else CHECK(fabsf(s0[i] - s1[i]) <= fmaxf(1.2e-38f, 1e-6f * fabsf(s0[i])));
+            }
+        }
+    }
     CHECK(worst[0] < 1e-6f && worst[1] < 1e-6f && worst[2] < 1e-5f);
     ref->erf_f32(NT, tx, r0);
     k->erf_f32(NT, tx, r1);
@@ -552,6 +902,22 @@ static nc_tensor *gdistinct(nc_ctx *ctx, int ndim, const int64_t *shape) {
 static nc_tensor *g_rm, *g_rv;
 static nc_tensor *f_conv(nc_tensor **x, nc_tensor *a) { (void)a; return nc_conv2d(x[0], x[1], x[2], 1, 1, 1, 1); }
 static nc_tensor *f_conv_s2(nc_tensor **x, nc_tensor *a) { (void)a; return nc_conv2d(x[0], x[1], NULL, 2, 2, 0, 0); }
+static nc_tensor *f_conv_g2(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* 2 groups of 2 -> 3 channels, stride 2, padding 1 */
+    return nc_conv2d_ex(x[0], x[1], x[2], 2, 1, 1, 1, 1, 1, 2);
+}
+static nc_tensor *f_conv_dw(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* depthwise (direct kernel), dilation 2, stride 2, bias */
+    return nc_conv2d_ex(x[0], x[1], x[2], 2, 1, 2, 1, 2, 1, 3);
+}
+static nc_tensor *f_conv_dwm(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* depthwise with channel multiplier 2 (grouped GEMM path) */
+    return nc_conv2d_ex(x[0], x[1], NULL, 1, 1, 1, 1, 1, 1, 2);
+}
+static nc_tensor *f_conv_dil(nc_tensor **x, nc_tensor *a) {
+    (void)a; /* plain conv with dilation (2, 3) */
+    return nc_conv2d_ex(x[0], x[1], NULL, 1, 1, 2, 1, 2, 3, 1);
+}
 static nc_tensor *f_maxpool(nc_tensor **x, nc_tensor *a) { (void)a; return nc_max_pool2d(x[0], 2, 2, 2, 2, 0, 0); }
 static nc_tensor *f_maxpool_p(nc_tensor **x, nc_tensor *a) { (void)a; return nc_max_pool2d(x[0], 3, 3, 1, 1, 1, 1); }
 static nc_tensor *f_avgpool(nc_tensor **x, nc_tensor *a) { (void)a; return nc_avg_pool2d(x[0], 3, 3, 2, 2, 1, 1); }
@@ -587,6 +953,43 @@ static void test_conv_pool_bn(void) {
     gradcheck_case(ctx, "conv2d", f_conv, NULL, 3, in);
     in[0] = gparam(ctx, 0, 4, SHAPE(1, 2, 6, 7)), in[1] = gparam(ctx, 0, 4, SHAPE(2, 2, 2, 3));
     gradcheck_case(ctx, "conv2d s2", f_conv_s2, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(2, 4, 5, 4)), in[1] = gparam(ctx, 0, 4, SHAPE(6, 2, 3, 2));
+    in[2] = gparam(ctx, 0, 1, SHAPE(6));
+    gradcheck_case(ctx, "conv2d groups", f_conv_g2, NULL, 3, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(2, 3, 7, 6)), in[1] = gparam(ctx, 0, 4, SHAPE(3, 1, 3, 3));
+    in[2] = gparam(ctx, 0, 1, SHAPE(3));
+    gradcheck_case(ctx, "conv2d depthwise", f_conv_dw, NULL, 3, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(1, 2, 4, 4)), in[1] = gparam(ctx, 0, 4, SHAPE(4, 1, 3, 3));
+    gradcheck_case(ctx, "conv2d dw x2", f_conv_dwm, NULL, 2, in);
+    in[0] = gparam(ctx, 0, 4, SHAPE(1, 2, 6, 7)), in[1] = gparam(ctx, 0, 4, SHAPE(2, 2, 3, 2));
+    gradcheck_case(ctx, "conv2d dilation", f_conv_dil, NULL, 2, in);
+    /* depthwise == grouped GEMM path on the same weights; bad groups are errors */
+    {
+        nc_manual_seed(ctx, 9);
+        nc_tensor *xx = nc_randn(ctx, 1.0f, 4, SHAPE(2, 4, 9, 8)), *ww = nc_randn(ctx, 1.0f, 4, SHAPE(4, 1, 3, 3));
+        nc_tensor *direct = nc_conv2d_ex(xx, ww, NULL, 2, 2, 1, 1, 2, 1, 4);
+        /* as 4 separate single-channel convs through the im2col path */
+        int64_t oh = nc_shape(direct)[2], ow = nc_shape(direct)[3];
+        double worst = 0;
+        for (int c = 0; c < 4; c++) {
+            nc_tensor *xc = nc_slice(xx, 1, c, 1, 1), *wc = nc_slice(ww, 0, c, 1, 1);
+            nc_tensor *yc = nc_conv2d_ex(xc, wc, NULL, 2, 2, 1, 1, 2, 1, 1);
+            for (int64_t s2 = 0; s2 < 2; s2++)
+                for (int64_t i = 0; i < oh; i++)
+                    for (int64_t j = 0; j < ow; j++) {
+                        double d = fabs(nc_get(yc, SHAPE(s2, 0, i, j)) - nc_get(direct, SHAPE(s2, c, i, j)));
+                        if (d > worst) worst = d;
+                    }
+        }
+        CHECK(worst < 1e-5);
+        CHECK(!nc_conv2d_ex(xx, ww, NULL, 1, 1, 0, 0, 1, 1, 3)); /* 4 channels into 3 groups */
+        CHECK(nc_status_code(ctx) == NC_ERR_SHAPE);
+        nc_clear_error(ctx);
+        CHECK(!nc_conv2d_ex(xx, ww, NULL, 1, 1, 0, 0, 0, 1, 4));
+        CHECK(nc_status_code(ctx) == NC_ERR_ARG);
+        nc_clear_error(ctx);
+        nc_step_end(ctx);
+    }
     in[0] = gdistinct(ctx, 4, SHAPE(2, 2, 4, 4));
     gradcheck_case(ctx, "max_pool2d", f_maxpool, NULL, 1, in);
     in[0] = gdistinct(ctx, 4, SHAPE(1, 2, 4, 5));
@@ -702,7 +1105,36 @@ static void test_save_load(void) {
     CHECK(nc_load(ctx, path, 1, missing, out) == NC_ERR_ARG);
     nc_clear_error(ctx);
     CHECK(nc_load(ctx, "does_not_exist.ncw", 1, names, out) == NC_ERR_ARG);
+    nc_clear_error(ctx);
     remove(path);
+    /* a file whose byte count exceeds the tensor must not overrun it */
+    {
+        FILE *f = fopen(path, "wb");
+        uint32_t hdr[2] = {1, 1}, len = 1, dt = NC_F32, nd = 1;
+        int64_t dim = 1;
+        uint64_t bytes = 64;
+        unsigned char junk[64];
+        memset(junk, 0x41, sizeof junk);
+        fwrite("NCW1", 1, 4, f);
+        fwrite(hdr, 4, 2, f);
+        fwrite(&len, 4, 1, f);
+        fwrite("w", 1, 1, f);
+        fwrite(&dt, 4, 1, f);
+        fwrite(&nd, 4, 1, f);
+        fwrite(&dim, 8, 1, f);
+        fwrite(&bytes, 8, 1, f);
+        fwrite(junk, 1, sizeof junk, f);
+        fclose(f);
+        nc_persistent_begin(ctx);
+        nc_tensor *one = nc_zeros(ctx, NC_F32, 1, SHAPE(1));
+        nc_persistent_end(ctx);
+        const char *wn[1] = {"w"};
+        CHECK(nc_load(ctx, path, 1, wn, &one) == NC_ERR_ARG);
+        CHECK(strstr(nc_error(ctx), "corrupt") != NULL);
+        CHECK(nc_data_f32(one)[0] == 0.0f);
+        nc_clear_error(ctx);
+        remove(path);
+    }
     nc_free_ctx(ctx);
 }
 
@@ -732,6 +1164,85 @@ static void test_threads(void) {
     CHECK(memcmp(r[0], r[1], sizeof(float) * (M * N * 2 + 3 * SN)) == 0);
     free(r[0]);
     free(r[1]);
+}
+
+/* Elementwise ops split large tensors into chunks across threads: forward values and
+ * gradients must be bit-identical for 1 and 4 threads (sizes cross several chunk edges). */
+enum { EW_N = 100003, EW_OPS = 21 };
+static void ew_run(int threads, float *out) {
+    nc_ctx *ctx = nc_init(&(nc_config){.seed = 7, .threads = threads});
+    nc_tensor *x = nc_parameter(ctx, nc_randn(ctx, 2.0f, 1, SHAPE(EW_N)), 1, SHAPE(EW_N));
+    nc_tensor *b = nc_parameter(ctx, nc_randn(ctx, 1.0f, 1, SHAPE(EW_N)), 1, SHAPE(EW_N));
+    nc_tensor *w = nc_randn(ctx, 1.0f, 1, SHAPE(EW_N));
+    nc_tensor *pos = nc_add_scalar(nc_sigmoid(x), 0.25f);
+    nc_tensor *ys[EW_OPS] = {
+        nc_neg(x), nc_exp(x), nc_log(pos), nc_sqrt(pos), nc_relu(x), nc_sigmoid(x), nc_tanh(x),
+        nc_scale(x, 0.3f), nc_add_scalar(x, 2.0f), nc_pow_scalar(pos, 1.5f), nc_leaky_relu(x, 0.1f), nc_relu6(x),
+        nc_hardsigmoid(x), nc_hardswish(x), nc_silu(x), nc_gelu(x, 0), nc_gelu(x, 1),
+        nc_add(x, b), nc_sub(x, b), nc_mul(x, b), nc_div(x, nc_add_scalar(nc_sigmoid(b), 0.5f))};
+    nc_tensor *loss = NULL;
+    for (int i = 0; i < EW_OPS; i++) {
+        memcpy(out + (size_t)i * EW_N, nc_data_f32(ys[i]), sizeof(float) * EW_N);
+        nc_tensor *term = nc_sum(nc_mul(ys[i], w), NC_ALL_AXES, 0);
+        loss = loss ? nc_add(loss, term) : term;
+    }
+    CHECK(nc_backward(loss) == NC_OK);
+    memcpy(out + (size_t)EW_OPS * EW_N, nc_data_f32(nc_grad(x)), sizeof(float) * EW_N);
+    memcpy(out + (size_t)(EW_OPS + 1) * EW_N, nc_data_f32(nc_grad(b)), sizeof(float) * EW_N);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
+/* Conv (im2col/col2im by channel ranges, depthwise by planes) and pooling (by planes) */
+enum { CV_OUT = 4 * 8 * 40 * 40 + 4 * 16 * 40 * 40 * 2 + 4 * 16 * 20 * 20 * 2, CV_GRADS = 4 * 16 * 40 * 40 + 8 * 16 * 9 + 16 * 9 + 16 * 8 * 9 };
+static void conv_run(int threads, float *out) {
+    nc_ctx *ctx = nc_init(&(nc_config){.seed = 3, .threads = threads});
+    nc_tensor *x = nc_parameter(ctx, nc_randn(ctx, 1.0f, 4, SHAPE(4, 16, 40, 40)), 4, SHAPE(4, 16, 40, 40));
+    nc_tensor *w = nc_parameter(ctx, nc_randn(ctx, 0.2f, 4, SHAPE(8, 16, 3, 3)), 4, SHAPE(8, 16, 3, 3));
+    nc_tensor *wd = nc_parameter(ctx, nc_randn(ctx, 0.2f, 4, SHAPE(16, 1, 3, 3)), 4, SHAPE(16, 1, 3, 3));
+    nc_tensor *wg = nc_parameter(ctx, nc_randn(ctx, 0.2f, 4, SHAPE(16, 8, 3, 3)), 4, SHAPE(16, 8, 3, 3));
+    nc_tensor *ys[5] = {nc_conv2d(x, w, NULL, 1, 1, 1, 1), nc_conv2d_ex(x, wd, NULL, 1, 1, 1, 1, 1, 1, 16),
+                        nc_conv2d_ex(x, wg, NULL, 1, 1, 1, 1, 1, 1, 2), nc_max_pool2d(x, 2, 2, 2, 2, 0, 0),
+                        nc_avg_pool2d(x, 3, 3, 2, 2, 1, 1)};
+    nc_tensor *loss = NULL;
+    size_t at = 0;
+    for (int i = 0; i < 5; i++) {
+        int64_t n = nc_numel(ys[i]);
+        memcpy(out + at, nc_data_f32(ys[i]), sizeof(float) * (size_t)n);
+        at += (size_t)n;
+        nc_tensor *term = nc_sum(nc_mul(ys[i], nc_randn(ctx, 1.0f, 4, nc_shape(ys[i]))), NC_ALL_AXES, 0);
+        loss = loss ? nc_add(loss, term) : term;
+    }
+    CHECK(at == CV_OUT);
+    CHECK(nc_backward(loss) == NC_OK);
+    nc_tensor *ps[4] = {x, w, wd, wg};
+    for (int i = 0; i < 4; i++) {
+        int64_t n = nc_numel(ps[i]);
+        memcpy(out + at, nc_data_f32(nc_grad(ps[i])), sizeof(float) * (size_t)n);
+        at += (size_t)n;
+    }
+    CHECK(at == CV_OUT + CV_GRADS);
+    CHECK(nc_ok(ctx));
+    nc_free_ctx(ctx);
+}
+
+static void test_threads_elementwise(void) {
+    {
+        size_t n = CV_OUT + CV_GRADS;
+        float *r1 = (float *)malloc(sizeof(float) * n), *r4 = (float *)malloc(sizeof(float) * n);
+        conv_run(1, r1);
+        conv_run(4, r4);
+        CHECK(memcmp(r1, r4, sizeof(float) * n) == 0);
+        free(r1);
+        free(r4);
+    }
+    size_t n = (size_t)(EW_OPS + 2) * EW_N;
+    float *r1 = (float *)malloc(sizeof(float) * n), *r4 = (float *)malloc(sizeof(float) * n);
+    ew_run(1, r1);
+    ew_run(4, r4);
+    CHECK(memcmp(r1, r4, sizeof(float) * n) == 0);
+    free(r1);
+    free(r4);
 }
 
 static void test_arena_trim(void) {
@@ -913,12 +1424,18 @@ int main(void) {
         {"autograd_semantics", test_autograd_semantics},
         {"memory", test_memory},
         {"release", test_release},
+        {"backward_release", test_backward_release},
+        {"inference_release", test_inference_release},
+        {"optim_state", test_optim_state},
+        {"uint8", test_uint8},
+        {"transformer_ops", test_transformer_ops},
         {"kernel_parity", test_kernel_parity},
         {"conv_pool_bn", test_conv_pool_bn},
         {"dropout", test_dropout},
         {"int8", test_int8},
         {"save_load", test_save_load},
         {"threads", test_threads},
+        {"threads_elementwise", test_threads_elementwise},
         {"arena_trim", test_arena_trim},
         {"optim_extras", test_optim_extras},
         {"registry", test_registry},

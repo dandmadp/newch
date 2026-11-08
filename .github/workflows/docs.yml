@@ -1,0 +1,54 @@
+name: Docs
+
+# The user guide (guide/*.md) is built with MkDocs Material and published to GitHub Pages
+# (https://dandmadp.github.io/newch/). Every Python example in it runs first, so a guide that
+# no longer matches the library fails here. Pull requests check; pushes to main also deploy.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install ziglang numpy "mkdocs-material>=9.5,<10"
+      - name: Build the engine
+        run: python tools/build.py --lib-only
+      - name: Run the guide's examples
+        run: python tools/check_docs.py
+      - name: Build the site
+        env:
+          NO_MKDOCS_2_WARNING: "1"
+        run: mkdocs build --strict
+      - uses: actions/upload-pages-artifact@v3
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        with:
+          path: build/site
+
+  deploy:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

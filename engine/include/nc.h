@@ -37,7 +37,7 @@ extern "C" {
 #endif
 
 #define NC_VERSION_MAJOR 0
-#define NC_VERSION_MINOR 3
+#define NC_VERSION_MINOR 4
 #define NC_VERSION_PATCH 0
 
 #define NC_MAX_DIMS 6
@@ -48,6 +48,7 @@ typedef enum {
     NC_I32 = 1,
     NC_F16 = 2, /* reserved: storage format for later fp16 kernels */
     NC_I8 = 3,  /* quantized weights */
+    NC_U8 = 4,  /* compact raw data (images, small labels): 4x smaller than f32 */
     NC_DTYPE_COUNT
 } nc_dtype;
 
@@ -210,20 +211,23 @@ NC_API nc_tensor *nc_silu(nc_tensor *x);        /* x * sigmoid(x), a.k.a. swish 
  * approximate_tanh != 0 */
 NC_API nc_tensor *nc_gelu(nc_tensor *x, int approximate_tanh);
 
-/* Linear algebra. a: [..., M, K] (2-D for now), b: [K, N]. */
+/* Linear algebra. a [..., M, K] @ b [K, N], or batched a [..., M, K] @
+ * b [..., K, N] with broadcast batch dims (torch.matmul for 2-D+ operands). */
 NC_API nc_tensor *nc_matmul(nc_tensor *a, nc_tensor *b);
 /* y = x @ weight^T + bias. x [..., in], weight [out, in] (PyTorch layout),
  * bias [out] or NULL. Fused: one GEMM per pass, no transposed copies. */
 NC_API nc_tensor *nc_linear_fn(nc_tensor *x, nc_tensor *weight, nc_tensor *bias);
 
 /* Reductions. axis may be NC_ALL_AXES. */
-NC_API nc_tensor *nc_sum(nc_tensor *x, int axis, int keepdim);
+NC_API nc_tensor *nc_sum(nc_tensor *x, int axis, int keepdim); /* f32, or i32 -> i32 (no grad) */
 NC_API nc_tensor *nc_mean(nc_tensor *x, int axis, int keepdim);
 NC_API nc_tensor *nc_max(nc_tensor *x, int axis, int keepdim); /* grad to first argmax */
 
 /* Shape ops. reshape/transpose return views when possible. */
 NC_API nc_tensor *nc_reshape(nc_tensor *x, int ndim, const int64_t *shape); /* one dim may be -1 */
 NC_API nc_tensor *nc_transpose(nc_tensor *x, int axis0, int axis1);
+/* x[..., start : start + length*step : step, ...] along axis (step >= 1): a view, copied only in persistent mode */
+NC_API nc_tensor *nc_slice(nc_tensor *x, int axis, int64_t start, int64_t length, int64_t step);
 NC_API nc_tensor *nc_contiguous(nc_tensor *x);
 /* Rows of x along axis 0: x [N, ...], idx i32 [B] -> [B, ...].
  * Batch gathering and embedding lookup; grads scatter-add back into x. */
@@ -234,6 +238,10 @@ NC_API nc_tensor *nc_index_select(nc_tensor *x, nc_tensor *idx);
  * padded cells (PyTorch's count_include_pad=True). */
 NC_API nc_tensor *nc_conv2d(nc_tensor *x, nc_tensor *weight, nc_tensor *bias, int stride_h, int stride_w,
                      int pad_h, int pad_w);
+/* conv2d with dilation and groups (torch.nn.functional.conv2d): weight [OC, C/groups, KH, KW];
+ * depthwise (groups == C == OC) runs a direct per-plane kernel */
+NC_API nc_tensor *nc_conv2d_ex(nc_tensor *x, nc_tensor *weight, nc_tensor *bias, int stride_h, int stride_w,
+                               int pad_h, int pad_w, int dilation_h, int dilation_w, int groups);
 NC_API nc_tensor *nc_max_pool2d(nc_tensor *x, int k_h, int k_w, int stride_h, int stride_w, int pad_h, int pad_w);
 NC_API nc_tensor *nc_avg_pool2d(nc_tensor *x, int k_h, int k_w, int stride_h, int stride_w, int pad_h, int pad_w);
 
@@ -250,13 +258,33 @@ NC_API nc_tensor *nc_batch_norm(nc_tensor *x, nc_tensor *weight, nc_tensor *bias
 /* NN functional. */
 NC_API nc_tensor *nc_log_softmax(nc_tensor *x); /* over the last axis */
 NC_API nc_tensor *nc_softmax(nc_tensor *x);     /* over the last axis */
+/* Normalizes over the last `normalized_ndim` dims (biased variance, as
+ * torch.nn.functional.layer_norm). weight / bias may be NULL. */
+NC_API nc_tensor *nc_layer_norm(nc_tensor *x, int normalized_ndim, nc_tensor *weight, nc_tensor *bias, float eps);
+/* mask ? value : x, with an integer 0/1 mask broadcast onto x (value may be -inf). */
+NC_API nc_tensor *nc_masked_fill(nc_tensor *x, nc_tensor *mask, float value);
 /* logits: [N, C] f32, labels: [N] i32. Returns mean loss, shape []. */
 NC_API nc_tensor *nc_cross_entropy(nc_tensor *logits, nc_tensor *labels);
 NC_API nc_tensor *nc_mse_loss(nc_tensor *pred, nc_tensor *target);
+/* Negative log-likelihood of log-probabilities: logp [N, C] f32, labels [N]
+ * i32. sum = 0: mean over rows, 1: sum. Shape []. */
+NC_API nc_tensor *nc_nll_loss(nc_tensor *logp, nc_tensor *labels, int sum);
 
 /* Non-differentiable helpers. */
 NC_API nc_tensor *nc_argmax(nc_tensor *x, int axis); /* i32, axis removed */
 NC_API nc_tensor *nc_detach(nc_tensor *x);           /* shares data, no grad */
+
+/* Elementwise comparison with broadcasting; f32 or i32 inputs (mixed allowed,
+ * compared exactly). Result i32 0/1 (no bool dtype). */
+typedef enum { NC_CMP_EQ, NC_CMP_NE, NC_CMP_LT, NC_CMP_LE, NC_CMP_GT, NC_CMP_GE } nc_cmp;
+NC_API nc_tensor *nc_compare(nc_tensor *a, nc_tensor *b, nc_cmp op);
+/* Concatenates n tensors (1..6, same dtype, equal shapes except `axis`).
+ * Differentiable for f32. */
+NC_API nc_tensor *nc_cat(int n, nc_tensor *const *xs, int axis);
+/* Converts dtype (f32 <-> i32 <-> i8; float to int truncates toward zero,
+ * saturates out-of-range values and maps NaN to 0, the same on every CPU).
+ * Converting to an integer type detaches: integer tensors carry no grad. */
+NC_API nc_tensor *nc_to_dtype(nc_tensor *x, nc_dtype dt);
 
 /* ------------------------------------------------------------------------ */
 /* Quantization (inference only)                                             */
@@ -285,6 +313,26 @@ NC_API nc_status nc_load(nc_ctx *ctx, const char *path, int n, const char *const
 /* Backpropagates from a scalar (1-element) tensor. Gradients accumulate into
  * nc_grad() of every reachable tensor with requires_grad. */
 NC_API nc_status nc_backward(nc_tensor *loss);
+
+/* Backward with memory release. Always: backward temporaries and the grads of
+ * intermediate (non-leaf) tensors are returned to the step arena as soon as
+ * they are used, so nc_grad() of an intermediate is NULL afterwards (leaf
+ * grads are kept, as in PyTorch). nc_backward() does this too.
+ * NC_BACKWARD_FREE_GRAPH also releases forward activations once no remaining
+ * backward step needs them, except the loss and the tensors in `keep` (and
+ * anything sharing their data). A later backward through a released node
+ * fails with NC_ERR_STATE (PyTorch: retain_graph=False). NC_BACKWARD_RETAIN
+ * keeps everything (no release at all). */
+enum { NC_BACKWARD_FREE_GRAPH = 1, NC_BACKWARD_RETAIN = 2 };
+
+/* Gives a temporary tensor's data back to the step arena now (inference:
+ * an activation the caller is done with). Ignored for persistent tensors,
+ * views (they do not own data) and tensors a recorded op uses (backward
+ * needs them). The tensor must not be read afterwards; views of it must be
+ * dead too. Ops that are not recorded (no_grad, or no input requiring grad)
+ * already free their own scratch memory when they return. */
+NC_API void nc_release_temp(nc_tensor *t);
+NC_API nc_status nc_backward_ex(nc_tensor *loss, int flags, nc_tensor *const *keep, int n_keep);
 NC_API void nc_zero_grad(nc_tensor *t);
 /* Marks the grad as absent (torch's zero_grad(set_to_none=True)): nc_grad()
  * returns NULL and optimizers skip t until a backward reaches it again. The
@@ -338,7 +386,22 @@ NC_API void nc_optim_zero_grad(nc_optim *o);
 /* Like nc_optim_zero_grad but with nc_clear_grad (set_to_none semantics). */
 NC_API void nc_optim_clear_grad(nc_optim *o);
 NC_API void nc_optim_step(nc_optim *o);
+/* Frees the optimizer and its state now instead of at nc_free_ctx() (the
+ * parameters stay). */
+NC_API void nc_optim_free(nc_optim *o);
 NC_API void nc_optim_set_lr(nc_optim *o, float lr);
+/* Checkpoints. nc_optim_state returns state buffer `slot` of parameter
+ * `param` (numel(param) floats, readable and writable) or NULL if this
+ * optimizer keeps no such state: slot 0 = momentum buffer (SGD, RMSprop) or
+ * Adam's m, slot 1 = Adam's v or RMSprop's square average. */
+NC_API float *nc_optim_state(nc_optim *o, int param, int slot);
+/* Updates applied so far (Adam's bias correction counts them). Setting it
+ * also restarts a gradient-accumulation cycle. */
+NC_API int64_t nc_optim_get_step(const nc_optim *o);
+NC_API void nc_optim_set_step(nc_optim *o, int64_t t);
+/* Replaces every hyperparameter. momentum cannot switch between zero and
+ * non-zero (that decides whether a momentum buffer exists): NC_ERR_ARG. */
+NC_API void nc_optim_set_opts(nc_optim *o, nc_optim_opts opts);
 /* Update every `steps` calls of nc_optim_step with the averaged gradient
  * (Keras' gradient_accumulation_steps). zero_grad keeps the running sum
  * until the update. Large effective batch at small-batch memory. */

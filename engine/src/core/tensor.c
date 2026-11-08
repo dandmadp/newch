@@ -14,6 +14,7 @@ size_t nc__dtype_size(nc_dtype dt) {
     case NC_I32: return 4;
     case NC_F16: return 2;
     case NC_I8: return 1;
+    case NC_U8: return 1;
     default: return 0;
     }
 }
@@ -24,6 +25,7 @@ const char *nc__dtype_name(nc_dtype dt) {
     case NC_I32: return "i32";
     case NC_F16: return "f16";
     case NC_I8: return "i8";
+    case NC_U8: return "u8";
     default: return "?";
     }
 }
@@ -96,17 +98,31 @@ static int check_shape(nc_ctx *ctx, int ndim, const int64_t *shape) {
         nc__error(ctx, NC_ERR_SHAPE, "ndim %d out of range [0, %d]", ndim, NC_MAX_DIMS);
         return 0;
     }
+    /* the element count times the largest dtype size must fit in int64 / size_t: a product that
+     * wrapped around would allocate a tiny buffer for a huge shape */
+    const int64_t limit = INT64_MAX / 8;
+    int64_t n = 1;
     for (int i = 0; i < ndim; i++) {
         if (shape[i] < 0) {
             nc__error(ctx, NC_ERR_SHAPE, "negative dimension %lld", (long long)shape[i]);
             return 0;
         }
+        if (shape[i] && n > limit / shape[i]) {
+            char sb[160];
+            nc__error(ctx, NC_ERR_SHAPE, "shape %s has too many elements", nc__shape_str(ndim, shape, sb, sizeof sb));
+            return 0;
+        }
+        n *= shape[i];
     }
     return 1;
 }
 
 nc_tensor *nc__tensor_new(nc_ctx *ctx, nc_dtype dt, int ndim, const int64_t *shape, int persistent) {
     if (!ctx || !check_shape(ctx, ndim, shape)) return NULL;
+    if (nc__dtype_size(dt) == 0) {
+        nc__error(ctx, NC_ERR_DTYPE, "unknown dtype %d", (int)dt);
+        return NULL;
+    }
     nc_tensor *t = (nc_tensor *)nc__alloc(ctx, sizeof(nc_tensor), persistent);
     if (!t) return NULL;
     memset(t, 0, sizeof *t);
@@ -129,6 +145,7 @@ nc_tensor *nc__tensor_alias(const nc_tensor *src, int persistent) {
     t->grad = NULL;
     t->node = NULL;
     t->name = NULL;
+    t->owner = src->owner ? src->owner : (nc_tensor *)src;
     t->flags = persistent ? NC_TF_PERSISTENT : 0;
     return t;
 }
@@ -255,6 +272,8 @@ float nc_get(const nc_tensor *t, const int64_t *index) {
     for (int i = 0; i < t->ndim; i++) off += index[i] * t->stride[i];
     if (t->dtype == NC_F32) return ((const float *)t->data)[off];
     if (t->dtype == NC_I32) return (float)((const int32_t *)t->data)[off];
+    if (t->dtype == NC_I8) return (float)((const int8_t *)t->data)[off];
+    if (t->dtype == NC_U8) return (float)((const uint8_t *)t->data)[off];
     return NAN;
 }
 
@@ -360,7 +379,9 @@ nc_tensor *nc__grad_buf(nc_tensor *t) {
     }
     if (!t->grad) {
         int persistent = (t->flags & NC_TF_PERSISTENT) != 0;
+        t->ctx->grad_alloc = 1; /* not a backward temporary: it outlives the node */
         t->grad = nc__tensor_new(t->ctx, NC_F32, t->ndim, t->shape, persistent);
+        t->ctx->grad_alloc = 0;
         if (t->grad) memset(t->grad->data, 0, (size_t)nc_numel(t) * sizeof(float));
     }
     return t->grad;

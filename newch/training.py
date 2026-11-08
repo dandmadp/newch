@@ -28,7 +28,6 @@ from .tensor import (Context, Tensor, _is_numpy, cross_entropy, float32, int32, 
 LOSSES: dict[str, Callable] = {
     "cross_entropy": cross_entropy,
     "mse": mse_loss,
-    "mean_squared_error": mse_loss,
 }
 
 
@@ -61,7 +60,7 @@ def compile_model(model, optimizer, loss, metrics, lr) -> None:
     classification = loss_fn is cross_entropy
     if metrics and not classification:
         raise ValueError("'accuracy' needs a classification loss (cross_entropy)")
-    model._compiled = Compiled(params[0].ctx, optim.get(optimizer, params, lr), loss_fn, classification,
+    model._compiled = Compiled(params[0].ctx, optim._get(optimizer, params, lr), loss_fn, classification,
                                bool(metrics))
 
 
@@ -120,8 +119,10 @@ def _stream_batches(ctx: Context, loader, label_dtype: str | None):
             xb, yb = item[0], (item[1] if len(item) > 1 else None)
         if not isinstance(xb, Tensor):
             xb = tensor(xb, dtype=float32, ctx=ctx)
-        if yb is not None and (not isinstance(yb, Tensor) or (label_dtype and yb.dtype != label_dtype)):
-            yb = tensor(yb if not isinstance(yb, Tensor) else yb.tolist(), dtype=label_dtype, ctx=ctx)
+        if yb is not None and not isinstance(yb, Tensor):
+            yb = tensor(yb, dtype=label_dtype, ctx=ctx)
+        elif yb is not None and label_dtype and yb.dtype != label_dtype:
+            yb = yb.to(label_dtype)
         yield xb, yb
 
 

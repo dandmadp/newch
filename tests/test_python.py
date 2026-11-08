@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import newch as nc  # noqa: E402
+import newch.net.functional as F  # noqa: E402
 
 try:
     import numpy as np
@@ -76,11 +77,13 @@ class TestTensor(Base):
         self.assertEqual(nc.net.Flatten()(b).shape, (4, 6))
         with self.assertRaises(NotImplementedError):
             b.T
-        with self.assertRaises(NotImplementedError):
-            a.softmax(dim=0)
+        col = a.softmax(dim=0).tolist()  # any dim (moved last and back)
+        self.assertAlmostEqual(col[0][0] + col[1][0], 1.0, places=6)
         with self.assertRaises(NotImplementedError):
             a.index_select(1, [0])
-        self.assertFalse(hasattr(a, "view"))
+        self.assertEqual(a.view(3, 2).shape, (3, 2))  # never copies, as in PyTorch ...
+        with self.assertRaises(RuntimeError):
+            a.T.view(6)  # ... so a non-contiguous tensor needs reshape()
         self.assertFalse(hasattr(a, "max"))
 
     def test_manual_seed_reseeds(self):
@@ -105,7 +108,6 @@ class TestTensor(Base):
         y = (x * x).sum() + (x * 3).sum()
         y.backward()
         self.assertEqual(x.grad.tolist(), [5, -1, 9])  # 2x + 3
-        x.zero_grad()
         with nc.no_grad():
             z = x * x
         self.assertFalse(z.requires_grad)
@@ -129,7 +131,7 @@ class TestTensor(Base):
         self.assertIn("broadcastable", str(cm.exception))
         self.assertEqual((nc.zeros(2) + 1).tolist(), [1, 1])  # context recovered
         with self.assertRaises(nc.NcError):
-            nc.cross_entropy(nc.zeros(2, 3), [0, 5])
+            F.cross_entropy(nc.zeros(2, 3), [0, 5])
 
     @unittest.skipIf(np is None, "numpy not installed")
     def test_numpy(self):
@@ -166,7 +168,7 @@ class TestModules(Base):
         for got, want in zip(lin(x).tolist(), manual.tolist()):
             for g, w in zip(got, want):
                 self.assertAlmostEqual(g, w, places=5)
-        self.assertEqual(nc.linear(x, lin.weight).shape, (5, 2))
+        self.assertEqual(F.linear(x, lin.weight).shape, (5, 2))
         self.assertIn("in_features=3", repr(lin))
 
     def test_embedding(self):
@@ -186,7 +188,7 @@ class TestModules(Base):
             X, Y = nc.tensor(xs), nc.tensor(ys)
         first = None
         for _ in range(200):
-            loss = nc.cross_entropy(model(X), Y)
+            loss = F.cross_entropy(model(X), Y)
             opt.zero_grad()
             loss.backward()
             opt.step()

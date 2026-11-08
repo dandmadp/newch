@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import newch as nc  # noqa: E402
+import newch.net.functional as F  # noqa: E402
 from newch import net  # noqa: E402
 from newch.data import DataLoader, FileArray, TensorDataset  # noqa: E402
 
@@ -72,8 +73,9 @@ class TestLayers(Base):
         drop = net.Dropout(0.5)
         drop.eval()
         self.assertIs(drop(x), x)  # identity in eval mode
+        self.assertEqual(net.Conv2d(3, 4, 3, padding="same")(x).shape, (2, 4, 9, 9))
         with self.assertRaises(NotImplementedError):
-            net.Conv2d(3, 4, 3, padding="same")
+            net.Conv2d(3, 4, 2, padding="same")  # torch pads one side more; newch pads both equally
 
     def test_batchnorm_buffers(self):
         bn = net.BatchNorm1d(2, momentum=1.0)
@@ -96,10 +98,10 @@ class TestSaveLoad(Base):
         model.eval()
         before = model.predict(xs)
         p = self.path("cnn.ncw")
-        model.save_weights(p)
+        nc.save_tensors(model.state_dict(), p)
         other = cnn()
         other.eval()
-        other.load_weights(p)
+        other.load_state_dict(nc.load_tensors(p))
         self.assertEqual(other.predict(xs), before)
         self.assertEqual(list(nc.load_tensors(p)), list(model.state_dict()))
         self.assertEqual(list(model.state_dict())[:2], ["0.weight", "0.bias"])  # torch naming
@@ -149,7 +151,7 @@ class TestQuantize(Base):
         self.assertLess(err / scale, 0.05)
         self.assertLess(after, before * 0.5)  # float weights freed, int8 kept
         p = self.path("q.ncw")
-        model.save_weights(p)
+        nc.save_tensors(model.state_dict(), p)
         self.assertEqual(nc.load_tensors(p)["0.weight"].dtype, nc.int8)
 
 
@@ -159,7 +161,7 @@ class TestData(Base):
         fx = FileArray.create(self.path("x.bin"), (row for row in xs), row_shape=(1, 8, 8))
         fy = FileArray.create(self.path("y.bin"), ([y] for y in ys), row_shape=(), dtype=nc.int32)
         self.assertEqual(fx.shape, (300, 1, 8, 8))
-        self.assertEqual(fy[5], [ys[5]])
+        self.assertEqual(fy[5], ys[5])  # 1-D rows are numbers, as in numpy
         loader = DataLoader(TensorDataset(fx, fy), batch_size=50, shuffle=True)
         self.assertEqual(len(loader), 6)
         xb, yb = next(iter(loader))
@@ -227,7 +229,7 @@ class TestMemory(Base):
             added = p + [10.0, 20.0, 30.0]          # list operand temporary
             prod = p * nc.tensor([2.0, 2.0, 2.0])
             rsub = [1.0, 1.0, 1.0] - p
-            mse = nc.mse_loss(p, [1.0, 2.0, 5.0])
+            mse = F.mse_loss(p, [1.0, 2.0, 5.0])
         nc.step_end()
         self.assertEqual(copy.tolist(), base_values)
         self.assertEqual(added.tolist(), [11.0, 22.0, 33.0])

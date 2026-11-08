@@ -41,16 +41,22 @@ filtered pipeline once hid a failing test that then got pushed.
   gradcheck case in `engine/tests/test_main.c`.
 - `engine/src/kernels/`: `ref/` (truth), `neon/`, `x86/` (AVX2 via per-function `target` attributes). Ops call
   `ctx->k` or `nc__gemm()` (threaded), never ISA code directly. `test_kernel_parity` compares tiers to ref.
-- `newch/`: `tensor.py` (Tensor, Context, functional, NCW1 files), `net.py` (Module, layers, Model, Sequential,
-  quantize_), `data.py` (DataLoader, FileArray), `training.py`, `optim.py` (optimizers, lr_scheduler), `callbacks.py`, `ml.py` (scikit-learn style; each call runs in a
-  private Context so it never touches the caller's step arena), `_lib.py` (ctypes
+- `newch/`: `tensor.py` (Tensor, Context, functional, NCW1 files), `net/` (package: `__init__.py` Module, layers,
+  containers, losses, Model, Sequential, quantize_; `functional.py` = torch.nn.functional; `init.py` = torch.nn.init), `data.py` (DataLoader, FileArray), `training.py`, `optim.py` (optimizers, lr_scheduler), `callbacks.py`, `_lib.py` (ctypes
   signatures; keep in sync with `nc.h`, including struct layouts like `nc_config`).
 - Docs: `docs/PROGRESS.md` (state, decisions, naming table, verification), `docs/FORMAT.md`, `docs/PUBLISHING.md`.
 
 ## Rules that are easy to break
 
 - **Memory model:** temporaries live in the step arena until `step_end()`; persistent tensors always own their
-  data (no persistent views), and the owning Python wrapper frees them in `__del__`.
+  data (no persistent views), and the owning Python wrapper frees them in `__del__`. Backward releases memory as
+  it goes (`nc_backward_ex`): node temporaries, intermediate grads, and activations nobody holds. Python passes
+  its live temporaries (`Context._live`, kept by `Tensor._from_ptr` / `_w` / `__del__`) so they survive. Arena
+  allocations >= chunk/4 are separate blocks with a budgeted cache (`ctx.c`). Backward ops must only allocate
+  through `nc__arena_alloc` (logged and freed after the node) or `nc__grad_buf` (kept). Ops that are not recorded
+  free their forward scratch on return; under `no_grad()` Python calls `nc_release_temp` when a temporary's last
+  wrapper dies (`Tensor._free`). Data a recorded node uses is flagged `NC_TF_ON_TAPE` on its owner (views carry
+  `owner`) and is never released early.
 - **Never pass `make_tensor().ptr` straight into a C call.** CPython drops the temporary after `.ptr` is read,
   before the call runs; a persistent temporary is then freed (use-after-free). Bind it to a name first. Tests run
   with `NC_DEBUG_POISON=1` so this shows up on every platform.
@@ -63,13 +69,23 @@ filtered pipeline once hid a failing test that then got pushed.
 
 ## Status (2026-11-02)
 
-- **0.3.0 committed locally, not yet pushed or uploaded.** Adds: argument order/defaults aligned with
-  torch/Keras/sklearn (unsupported args raise), AdamW/RMSprop, gradient accumulation, clip_grad_norm_, LR
-  schedulers, Keras callbacks, `newch.ml` (scikit-learn style), 7 activations, AVX2/NEON vector exp/sigmoid/
-  tanh/erf kernels. Activation comparison is in `docs/PROGRESS.md` §7 (`tools/bench_act.py`).
-- PyPI has `newch` 0.2.0 (Windows x86-64 wheel + sdist; https://pypi.org/project/newch/). Released versions
-  can never be re-uploaded: any fix ships as a new version (bump all three version locations). The user runs
-  `twine upload` themselves (`docs/PUBLISHING.md`).
-- NEON vector kernels are compiled but only verified under QEMU in CI, not on a real board.
-- Next candidates: LogisticRegression, optimizer state save/resume, manylinux/macOS wheels, graph compiler
-  (memory planning inside a step), parallel elementwise ops. See `docs/PROGRESS.md` §11.
+- PyPI has `newch` 0.3.0 (uploaded by the user). Released versions can never be re-uploaded: any fix ships as a new
+  version (bump all three version locations). The user runs `twine upload` themselves (`docs/PUBLISHING.md`).
+- 0.4.0 (branch `torch-style-models`; 0.3.1 was never released and is folded into 0.4.0): PyTorch-style model code (`newch.net` package with
+  `functional`/`init`), new ops (nll_loss, compare, cat, to_dtype, i32 sum), backward memory release (-48% reserved), inference memory
+  release, optimizer/scheduler `state_dict` with nested `save_tensors` checkpoints, `uint8` data dtype,
+  transformer blocks (batched matmul, layer_norm, masked_fill, SDPA, MultiheadAttention, TransformerEncoder),
+  stage-3 work (2026-11-08): slice view op + strided reshape views, numpy-style multi-axis indexing, softmax any dim,
+  int->float promotion, grouped/depthwise/dilated conv, threaded elementwise/im2col/pooling, RNN/LSTM/GRU,
+  lower Python call overhead, and the dedupe cleanup listed at the top of `docs/PROGRESS.md` (torch style is the
+  base; Keras reduced to `fit()`; `newch.ml` removed; NN functions only in `F`; one save path).
+- User guide site: `guide/*.md` + `mkdocs.yml`, published to https://dandmadp.github.io/newch/ by
+  `.github/workflows/docs.yml` on pushes to main. Its ```python examples run in CI (`tools/check_docs.py`);
+  update the guide and `guide/changelog.md` with API changes.
+- API surface is frozen at this level: do not add more library-mirroring APIs without discussing it first.
+- Decided (2026-11-06): stage-3 scope grows, but GPU backends and large-model-only features (f16/bf16, KV cache,
+  LLM-scale) go to an optional module in this repo (`engine/src/ext/` -> separate `nc_ext` library, Python
+  `newch.ext`, loaded only on import) so the core stays small. Ops that also help small devices (transformer
+  blocks, depthwise conv) stay in the core. The ext module does not exist yet; create it with the first GPU work.
+- The project direction (memory-budget training, single-file C export, on-device learning) is still to be
+  discussed with the user. NEON kernels are verified under QEMU in CI only, not on a real board.
